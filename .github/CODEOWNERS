@@ -1,0 +1,10 @@
+# Code owners for sandboxctl.
+#
+# These users are listed as required reviewers on every pull request — at
+# least one must approve before main can be merged into. GitHub's branch
+# ruleset references this file via "Require review from Code Owners".
+#
+# Order matters in CODEOWNERS: later patterns override earlier ones for the
+# same path. The catch-all `*` keeps coverage simple — every file goes
+# through Sam or Mahesh.
+*       @Sam123ben @mahesh-sangawar
