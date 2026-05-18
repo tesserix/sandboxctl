@@ -31,7 +31,7 @@ not yet ready (rootful mode, 6 GiB memory).
 ## Install
 
 ```sh
-git clone https://github.com/zendesk/sandboxctl.git
+git clone https://github.com/sam123ben/sandboxctl.git
 cd sandboxctl
 ./install.sh
 ```

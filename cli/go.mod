@@ -1,4 +1,4 @@
-module github.com/zendesk/sandboxctl/cli
+module github.com/sam123ben/sandboxctl/cli
 
 go 1.24.0
 
