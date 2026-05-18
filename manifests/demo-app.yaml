@@ -1,0 +1,62 @@
+# Demo app the sandbox serves at the demo-app hostname.
+#
+# Applied directly by sandboxctl (not via Argo CD) so the sandbox has a
+# working URL the moment `up` finishes — no Git sync wait. Argo CD is still
+# installed and reachable at the argocd hostname for its own demos.
+#
+# sandbox.sh rewrites `namespace: demo-app` to $DEMO_NS at install time, so
+# the actual namespace tracks the env override.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: demo-app
+  labels:
+    app: demo-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/sam123ben/reactjs-demo-app:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: demo-app
+spec:
+  selector:
+    app: demo-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

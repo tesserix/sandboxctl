@@ -1,0 +1,8 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+# Reachability from the Mac is provided by `kubectl port-forward` (managed
+# by the LaunchAgent installed in `up`), not by kind extraPortMappings.
+# That avoids the rootful-podman + gvproxy pitfall where extraPortMappings
+# get bound inside the podman VM but never published to the Mac.

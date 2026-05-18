@@ -1,0 +1,16 @@
+# Built binaries
+/bin/
+sandboxctl
+
+# Go build output
+/cli/sandboxctl
+*.test
+*.out
+
+# IDEs / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local state from running the tool
+.sandboxctl/

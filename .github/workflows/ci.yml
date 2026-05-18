@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bash:
+    name: bash syntax + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: |
+          bash -n sandbox.sh
+          bash -n install.sh
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          ignore_paths: cli
+
+  go:
+    name: go build + vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: cli/go.sum
+      - name: go vet
+        working-directory: cli
+        run: go vet ./...
+      - name: go build
+        working-directory: cli
+        run: go build -trimpath -ldflags "-s -w -X main.assetDir=/tmp" ./...
+
+  yaml:
+    name: kubeval manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install kubeconform
+        run: |
+          curl -sSLo kubeconform.tgz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tgz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+      - name: validate static manifests
+        run: |
+          kubeconform -strict -summary \
+            -ignore-missing-schemas \
+            manifests/
