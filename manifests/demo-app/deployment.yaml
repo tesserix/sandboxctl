@@ -1,21 +1,13 @@
-# Demo app the sandbox serves at the demo-app hostname.
+# Demo app deployed by Argo CD as the 'demo-app' Application.
 #
-# Applied directly by sandboxctl (not via Argo CD) so the sandbox has a
-# working URL the moment `up` finishes — no Git sync wait. Argo CD is still
-# installed and reachable at the argocd hostname for its own demos.
-#
-# sandbox.sh rewrites `namespace: demo-app` to $DEMO_NS at install time, so
-# the actual namespace tracks the env override.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: demo-app
----
+# No `namespace:` field anywhere — Argo CD applies these into the namespace
+# declared on the Application (Application.spec.destination.namespace),
+# which sandboxctl sets to $DEMO_NS. CreateNamespace=true on the Application
+# handles namespace creation on first sync.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: demo-app
-  namespace: demo-app
   labels:
     app: demo-app
 spec:
@@ -52,7 +44,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: demo-app
-  namespace: demo-app
+  labels:
+    app: demo-app
 spec:
   selector:
     app: demo-app

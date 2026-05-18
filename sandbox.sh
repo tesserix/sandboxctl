@@ -10,7 +10,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIND_CONFIG="${SCRIPT_DIR}/kind-config.yaml"
-DEMO_APP_MANIFEST="${SCRIPT_DIR}/manifests/demo-app.yaml"
 
 WILDCARD_TLS_SECRET="${WILDCARD_TLS_SECRET:-sandbox-wildcard-tls}"
 ROOT_CA_SECRET="${ROOT_CA_SECRET:-sandbox-root-ca}"
@@ -33,6 +32,13 @@ ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.29.2}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.35.0}"
 
 SANDBOX_DOMAIN="${SANDBOX_DOMAIN:-sandbox.app}"
+
+# Demo app source. Argo CD watches this repo + path and reconciles the
+# Deployment/Service/Namespace into the cluster. Override DEMO_APP_REPO_URL
+# to point at your fork if you want to tweak the demo without forking the
+# whole tool.
+DEMO_APP_REPO_URL="${DEMO_APP_REPO_URL:-https://github.com/tesserix/sandboxctl.git}"
+DEMO_APP_REPO_REVISION="${DEMO_APP_REPO_REVISION:-main}"
 ARGO_HOST="argo.${SANDBOX_DOMAIN}"
 KARGO_HOST="kargo.${SANDBOX_DOMAIN}"
 DEMO_HOST="demo-app.${SANDBOX_DOMAIN}"
@@ -362,13 +368,51 @@ install_kargo() {
 }
 
 install_demo_app() {
-  log "deploying demo app (ghcr.io/sam123ben/reactjs-demo-app:latest) → ${DEMO_HOST}"
-  # The static demo manifest creates the namespace + Deployment + Service.
-  # We sed in the dynamic namespace name in case the user overrode DEMO_NS.
-  sed "s|namespace: demo-app$|namespace: ${DEMO_NS}|; s|name: demo-app$|name: ${DEMO_NS}|" \
-    "$DEMO_APP_MANIFEST" | kc apply -f - >/dev/null
-  kc -n "$DEMO_NS" rollout status deploy/demo-app --timeout=180s >/dev/null
-  ok "demo app ready"
+  log "registering demo app with Argo CD (sync from ${DEMO_APP_REPO_URL}@${DEMO_APP_REPO_REVISION})"
+  # The demo app is deployed *only* via Argo CD so the UI shows GitOps in
+  # action. The Application points at this repo's manifests/demo-app
+  # directory; Argo clones, applies, and self-heals. CreateNamespace=true
+  # lets Argo own the demo namespace too.
+  kc apply -f - <<EOF >/dev/null
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: ${ARGOCD_NS}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: ${DEMO_APP_REPO_URL}
+    targetRevision: ${DEMO_APP_REPO_REVISION}
+    path: manifests/demo-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ${DEMO_NS}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+EOF
+
+  log "waiting for Argo CD to sync the demo app (Healthy)"
+  local i sync health
+  for ((i=1; i<=60; i++)); do
+    sync="$(kc -n "$ARGOCD_NS" get application demo-app -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+    health="$(kc -n "$ARGOCD_NS" get application demo-app -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
+    if [[ "$sync" == "Synced" && "$health" == "Healthy" ]]; then
+      ok "demo app synced and healthy (${sync}/${health})"
+      return 0
+    fi
+    sleep 3
+  done
+  warn "demo app did not become Healthy within 180s — check Argo CD UI at https://${ARGO_HOST}:${SANDBOX_HTTPS_PORT}"
+  warn "current state: sync=${sync:-unknown} health=${health:-unknown}"
 }
 
 helm_istio() {
