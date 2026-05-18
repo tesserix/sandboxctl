@@ -20,3 +20,4 @@ secrets.env
 *.pem
 *.key
 *-credentials.json
+/dist/

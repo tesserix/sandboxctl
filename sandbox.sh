@@ -118,8 +118,9 @@ ensure_runtime() {
   # Auto-heal podman if installed-but-unhealthy; only fall back to docker if
   # podman is genuinely absent. macOS docker daemon needs the GUI, so we
   # surface a clear error there rather than trying to start it.
-  local attempt
-  for attempt in 1 2; do
+  # shellcheck disable=SC2034  # _attempt is a sentinel loop variable
+  local _attempt
+  for _attempt in 1 2; do
     case "$SANDBOX_RUNTIME" in
       podman)
         if ! command -v podman >/dev/null 2>&1; then
@@ -491,8 +492,10 @@ install_hosts() {
     return
   fi
   prime_sudo
+  # /etc/hosts is world-readable, so the read doesn't need sudo. Only the
+  # final `install` does.
   local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
-  sudo grep -v "${SANDBOX_HOSTS_MARKER}" /etc/hosts > "$tmp" || true
+  grep -v "${SANDBOX_HOSTS_MARKER}" /etc/hosts > "$tmp" || true
   printf '127.0.0.1\t%s %s %s\t%s\n' "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
   sudo install -m 0644 "$tmp" /etc/hosts
   rm -f "$tmp"
@@ -504,7 +507,7 @@ uninstall_hosts() {
     prime_sudo
     log "removing sandboxctl entries from /etc/hosts"
     local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
-    sudo grep -v "${SANDBOX_HOSTS_MARKER}" /etc/hosts > "$tmp" || true
+    grep -v "${SANDBOX_HOSTS_MARKER}" /etc/hosts > "$tmp" || true
     sudo install -m 0644 "$tmp" /etc/hosts
     rm -f "$tmp"
   fi
