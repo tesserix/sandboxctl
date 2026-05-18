@@ -3,6 +3,9 @@ name: ci
 on:
   push:
     branches: [main]
+    # Tag pushes are handled by release.yml. Be explicit so a future change
+    # that broadens `branches` doesn't accidentally double-run CI on a tag.
+    tags-ignore: ['**']
   pull_request:
 
 jobs:
