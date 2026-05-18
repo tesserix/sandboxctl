@@ -44,6 +44,7 @@ var commands = []command{
 	{"argocd-ui", "print Argo CD URL + admin creds"},
 	{"kargo-ui", "print Kargo  URL + admin creds"},
 	{"tui", "live status dashboard (Bubble Tea)"},
+	{"version", "print sandboxctl version, commit, and build date"},
 }
 
 func usage() string {
