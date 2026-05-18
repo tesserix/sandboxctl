@@ -44,6 +44,11 @@ func known(sub string) bool {
 			return true
 		}
 	}
+	// Hidden subcommands consumed by sandbox.sh itself, not listed in usage.
+	switch sub {
+	case "secret":
+		return true
+	}
 	return false
 }
 
@@ -75,6 +80,9 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if sub == "secret" {
+		os.Exit(runSecret(os.Args[2:]))
 	}
 
 	os.Exit(runScript(os.Args[1:]...))

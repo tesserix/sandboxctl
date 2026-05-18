@@ -14,3 +14,9 @@ sandboxctl
 
 # Local state from running the tool
 .sandboxctl/
+
+# Defense in depth — never commit anything that looks like a secret
+secrets.env
+*.pem
+*.key
+*-credentials.json
