@@ -51,7 +51,16 @@ not yet ready (rootful mode, 6 GiB memory).
 ## Install
 
 ```sh
-git clone https://github.com/sam123ben/sandboxctl.git
+### Homebrew (recommended)
+
+```sh
+brew install tesserix/tap/sandboxctl
+```
+
+### From source
+
+```sh
+git clone https://github.com/tesserix/sandboxctl.git
 cd sandboxctl
 ./install.sh
 ```

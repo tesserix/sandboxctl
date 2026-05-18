@@ -10,7 +10,23 @@ import (
 // assetDir is injected at build time via:
 //   go build -ldflags "-X main.assetDir=/abs/path/to/sandboxctl"
 // It points at the directory containing sandbox.sh + manifests/.
-var assetDir = ""
+//
+// Packaged installs (e.g. Homebrew) leave assetDir empty at build time and
+// set $SANDBOXCTL_ASSETS at runtime to the install prefix instead. See
+// resolveAssetDir below.
+var (
+	assetDir = ""
+	version  = "dev"
+	commit   = "none"
+	date     = "unknown"
+)
+
+func resolveAssetDir() string {
+	if v := os.Getenv("SANDBOXCTL_ASSETS"); v != "" {
+		return v
+	}
+	return assetDir
+}
 
 type command struct{ name, desc string }
 
@@ -52,7 +68,7 @@ func known(sub string) bool {
 	return false
 }
 
-func scriptPath() string { return filepath.Join(assetDir, "sandbox.sh") }
+func scriptPath() string { return filepath.Join(resolveAssetDir(), "sandbox.sh") }
 
 func main() {
 	if len(os.Args) < 2 {
@@ -64,13 +80,16 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Print(usage())
 		return
+	case "--version", "-v", "version":
+		fmt.Printf("sandboxctl %s (commit %s, built %s)\n", version, commit, date)
+		return
 	}
 	if !known(sub) {
 		fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n\n%s", sub, usage())
 		os.Exit(2)
 	}
-	if assetDir == "" {
-		fmt.Fprintln(os.Stderr, "sandboxctl was built without assetDir; rebuild via ./install.sh")
+	if resolveAssetDir() == "" {
+		fmt.Fprintln(os.Stderr, "sandboxctl: cannot find runtime assets — set SANDBOXCTL_ASSETS or reinstall")
 		os.Exit(2)
 	}
 

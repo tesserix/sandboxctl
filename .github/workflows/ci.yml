@@ -22,7 +22,7 @@ jobs:
           ignore_paths: cli
 
   go:
-    name: go build + vet
+    name: go build + vet + smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,10 +35,21 @@ jobs:
         run: go vet ./...
       - name: go build
         working-directory: cli
-        run: go build -trimpath -ldflags "-s -w -X main.assetDir=/tmp" ./...
+        run: go build -trimpath -ldflags "-s -w -X main.assetDir=/tmp -X main.version=ci" -o /tmp/sandboxctl ./...
+      - name: smoke (version)
+        run: |
+          /tmp/sandboxctl version | grep -q "sandboxctl ci"
+      - name: smoke (secret rand)
+        run: |
+          out=$(/tmp/sandboxctl secret rand 16)
+          [[ ${#out} == 32 ]] || { echo "expected 32 hex chars, got: $out" >&2; exit 1; }
+      - name: smoke (secret bcrypt)
+        run: |
+          out=$(printf 'hunter2' | /tmp/sandboxctl secret bcrypt)
+          [[ "$out" == \$2a\$10\$* ]] || { echo "expected bcrypt hash, got: $out" >&2; exit 1; }
 
   yaml:
-    name: kubeval manifests
+    name: kubeconform manifests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +61,22 @@ jobs:
           sudo mv kubeconform /usr/local/bin/
       - name: validate static manifests
         run: |
-          kubeconform -strict -summary \
-            -ignore-missing-schemas \
-            manifests/
+          kubeconform -strict -summary -ignore-missing-schemas manifests/
+
+  goreleaser-check:
+    name: goreleaser check (no release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: cli/go.sum
+      - name: validate config + build snapshot
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: build --snapshot --clean --single-target

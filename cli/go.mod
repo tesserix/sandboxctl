@@ -1,4 +1,4 @@
-module github.com/sam123ben/sandboxctl/cli
+module github.com/tesserix/sandboxctl/cli
 
 go 1.25.0
 

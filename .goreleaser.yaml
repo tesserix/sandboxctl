@@ -1,0 +1,120 @@
+version: 2
+
+# sandboxctl is a Go CLI that drives a bundled bash script + manifests.
+# Releases ship the Go binary plus the script/manifests so the binary works
+# out of the box. The Homebrew formula (auto-generated below) wires
+# everything up — the binary's assetDir is set to the brew prefix at install
+# time so `sandboxctl up` finds sandbox.sh + manifests/.
+
+project_name: sandboxctl
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: sandboxctl
+    main: .
+    dir: ./cli
+    binary: sandboxctl
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      # assetDir is filled in at brew install time via a postinstall step in
+      # the generated formula. We just zero it here so the binary errors out
+      # cleanly if someone runs it standalone outside a packaged install.
+      - -s -w
+      - -X main.assetDir=
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{- if eq .Os "darwin" }}macOS{{- else }}{{ .Os }}{{ end }}_{{ .Arch }}
+    # Bundle the runtime assets next to the binary so the tarball is
+    # self-contained — extracting it gives you a working install once the
+    # formula's postinstall sets the assetDir.
+    files:
+      - sandbox.sh
+      - kind-config.yaml
+      - manifests/**/*
+      - install.sh
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+      - "Merge pull request"
+
+release:
+  github:
+    owner: tesserix
+    name: sandboxctl
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"
+  header: |
+    ## sandboxctl v{{ .Version }}
+
+    Local Kubernetes sandbox for macOS — kind + Argo CD + Kargo + Istio
+    ambient + wildcard TLS, fully self-managed.
+
+    ### Install via Homebrew
+
+    ```sh
+    brew install tesserix/tap/sandboxctl
+    ```
+  footer: |
+    ---
+    Full diff: https://github.com/tesserix/sandboxctl/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+brews:
+  - name: sandboxctl
+    repository:
+      owner: tesserix
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/tesserix/sandboxctl"
+    description: "One-command local Kubernetes sandbox for macOS (kind + Argo CD + Kargo + Istio)"
+    license: "MIT"
+    # The Go binary reads SANDBOXCTL_ASSETS at runtime to locate the
+    # bundled sandbox.sh + manifests/. We park them under libexec and wrap
+    # the binary with a tiny shim that exports the path.
+    install: |
+      libexec.install "sandboxctl" => "sandboxctl-bin"
+      libexec.install "sandbox.sh", "kind-config.yaml", "manifests"
+      (bin/"sandboxctl").write <<~EOS
+        #!/bin/bash
+        export SANDBOXCTL_ASSETS="#{libexec}"
+        exec "#{libexec}/sandboxctl-bin" "$@"
+      EOS
+      (bin/"sandboxctl").chmod 0755
+    test: |
+      assert_match "sandboxctl", shell_output("#{bin}/sandboxctl --help")
+      assert_match version.to_s, shell_output("#{bin}/sandboxctl version")
+    dependencies:
+      - name: kubectl
+      - name: kind
+      - name: helm
+      - name: podman
+        type: recommended
