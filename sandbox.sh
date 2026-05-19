@@ -1810,8 +1810,17 @@ slugify() {
 }
 
 cmd_build() {
-  # If a sandboxctl.yaml is found, use it (build order, contexts,
-  # aliases, deps). Otherwise auto-walk Dockerfiles.
+  # Manifest precedence:
+  #   1. existing sandboxctl.yaml/.yml at <target> or cwd → use as-is
+  #   2. no manifest but Dockerfile(s) exist → auto-generate one at
+  #      <target>/sandboxctl.yaml (parses each Dockerfile's COPY/ADD
+  #      sources and walks up to the smallest ancestor that resolves
+  #      them all — fixes the "go.sum: not found" class of build
+  #      failure where the Dockerfile lives nested but reads from the
+  #      repo root). The generated file is committed-friendly with a
+  #      header comment, so it lands in `git status` and can be edited.
+  #   3. no Dockerfiles at all → fall through to the legacy auto-walk
+  #      (which dies with a clear "no Dockerfile found" message).
   local target="${1:-.}" tag="${2:-latest}"
 
   _ensure_registry_reachable
@@ -1820,6 +1829,31 @@ cmd_build() {
   for candidate in "${target}/sandboxctl.yaml" "${target}/sandboxctl.yml" "$(pwd)/sandboxctl.yaml"; do
     [[ -f "$candidate" ]] && { manifest="$candidate"; break; }
   done
+
+  if [[ -z "$manifest" ]]; then
+    # Any Dockerfiles to autogen from? Use the same exclusions the
+    # legacy walker uses so coverage matches.
+    if find "$target" -type f -name Dockerfile \
+        -not -path '*/node_modules/*' \
+        -not -path '*/vendor/*' \
+        -not -path '*/dist/*' \
+        -not -path '*/.git/*' -print -quit 2>/dev/null | grep -q .; then
+      local sandboxctl_bin
+      sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
+      if [[ -n "$sandboxctl_bin" ]]; then
+        log "no sandboxctl.yaml under ${target} — auto-generating from Dockerfiles"
+        if manifest="$("$sandboxctl_bin" _autogen-manifest "$target")"; then
+          log "wrote $manifest"
+        else
+          warn "auto-generation failed — falling back to legacy auto-walk"
+          manifest=""
+        fi
+      else
+        warn "sandboxctl binary not on PATH — cannot auto-generate manifest, using legacy auto-walk"
+      fi
+    fi
+  fi
+
   if [[ -n "$manifest" ]]; then
     cmd_build_from_manifest "$manifest"
   else

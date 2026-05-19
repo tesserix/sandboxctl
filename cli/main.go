@@ -68,7 +68,7 @@ func known(sub string) bool {
 	}
 	// Hidden subcommands consumed by sandbox.sh itself, not listed in usage.
 	switch sub {
-	case "secret", "_parse-build-manifest":
+	case "secret", "_parse-build-manifest", "_autogen-manifest":
 		return true
 	}
 	return false
@@ -104,6 +104,9 @@ func main() {
 	}
 	if sub == "_parse-build-manifest" {
 		os.Exit(runParseBuildManifest(os.Args[2:]))
+	}
+	if sub == "_autogen-manifest" {
+		os.Exit(runAutogenManifest(os.Args[2:]))
 	}
 
 	if resolveAssetDir() == "" {
