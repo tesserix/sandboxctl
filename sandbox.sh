@@ -1919,6 +1919,44 @@ _emit_chart_entry() {
   printf 'helm\t%s\t%s\t%s\n' "$name" "$chart_dir" "$values"
 }
 
+# Emit a discover_app_charts-style entry for a single chart that the
+# caller pointed at explicitly (via --chart, the k8s/chart convention,
+# or the interactive prompt). Args:
+#   $1 target dir (relative paths in $2 resolve here)
+#   $2 chart path (absolute or relative to $1)
+#   $3 values-file override ("" = pick best)
+#   $4 chart-name override   ("" = read from Chart.yaml)
+_emit_explicit_chart_entry() {
+  local target="$1" chart_in="$2" values_in="$3" name_in="$4"
+  local chart_dir
+  if [[ "$chart_in" == /* ]]; then
+    chart_dir="$chart_in"
+  else
+    chart_dir="${target}/${chart_in}"
+  fi
+  [[ -d "$chart_dir" ]] || die "chart directory not found: $chart_dir"
+  chart_dir="$(cd "$chart_dir" && pwd)"
+  [[ -f "${chart_dir}/Chart.yaml" ]] || die "no Chart.yaml in $chart_dir"
+
+  local cname
+  if [[ -n "$name_in" ]]; then
+    cname="$name_in"
+  else
+    cname="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "${chart_dir}/Chart.yaml" | head -n1)"
+    [[ -n "$cname" ]] || die "Chart.yaml at ${chart_dir} has no readable name; pass --name to override"
+  fi
+
+  local vfile=""
+  if [[ -n "$values_in" ]]; then
+    [[ -f "${chart_dir}/${values_in}" ]] || die "values file not found in chart: ${values_in}"
+    vfile="$values_in"
+  elif [[ -f "${chart_dir}/values-sandbox.yaml" ]]; then vfile="values-sandbox.yaml"
+  elif [[ -f "${chart_dir}/values-local.yaml"   ]]; then vfile="values-local.yaml"
+  fi
+
+  printf 'helm\t%s\t%s\t%s\n' "$cname" "$chart_dir" "$vfile"
+}
+
 ensure_secrets_for_namespace() {
   # If $target/k8s/secrets.yaml exists, apply it into $namespace.
   # If only secrets.example.yaml exists, copy → secrets.yaml, ensure
@@ -2088,11 +2126,11 @@ sandboxctl deploy [path] [--env <name>]
                   [--no-build]
 
 Run from your product directory (one that contains your Dockerfile(s)
-and chart). With no flags, walks <path> (default: cwd) for every
-Chart.yaml and rendered-manifest directory and deploys each as its own
-Argo CD Application.
+and chart). Builds + pushes images, applies secrets, pushes the chart
+to the in-cluster Gitea, creates one Argo CD Application per chart,
+and routes a stable URL to each.
 
-Pipeline (per discovered chart):
+Pipeline (per chart):
   1. Build + push every Dockerfile listed in <path>/sandboxctl.yaml,
      or auto-walk Dockerfiles when no manifest exists. Skip with
      --no-build (useful when iterating only on chart edits).
@@ -2103,14 +2141,12 @@ Pipeline (per discovered chart):
      <chart>.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT} to the
      chart's primary Service.
 
-Auto-discovery:
-  <path>/chart/Chart.yaml                in-repo chart
-  <path>/helm/Chart.yaml                 in-repo chart
-  <path>/charts/<svc>/Chart.yaml         multi-service repo
-  any other Chart.yaml within depth 5    catch-all (e.g.
-                                         manifests/<svc>/chart/)
-  <path>/deploy/                         rendered manifests
-  <path>/k8s/                              (only when no chart found)
+Chart resolution order (no --chart):
+  1. <path>/k8s/chart/Chart.yaml         the recommended layout
+  2. Auto-discovery walks <path> for any Chart.yaml within depth 5
+     (skipping vendor / node_modules / dist / .git).
+  3. Interactive prompt asks for an absolute or relative chart path
+     when nothing is found.
 
 Override flags (skip auto-discovery and deploy a single chart):
   --chart <dir>     Path to a chart directory containing Chart.yaml.
@@ -2142,39 +2178,34 @@ EOF
 
   local entries
   if [[ -n "$chart_override" ]]; then
-    # Resolve --chart against $target if it's relative.
-    local chart_dir
-    if [[ "$chart_override" == /* ]]; then
-      chart_dir="$chart_override"
-    else
-      chart_dir="${target}/${chart_override}"
-    fi
-    [[ -d "$chart_dir" ]] || die "--chart: directory not found: $chart_dir"
-    chart_dir="$(cd "$chart_dir" && pwd)"
-    [[ -f "${chart_dir}/Chart.yaml" ]] || die "--chart: no Chart.yaml in $chart_dir"
-
-    local cname
-    if [[ -n "$name_override" ]]; then
-      cname="$name_override"
-    else
-      cname="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "${chart_dir}/Chart.yaml" | head -n1)"
-      [[ -n "$cname" ]] || die "--chart: Chart.yaml has no readable name; pass --name to override"
-    fi
-
-    local vfile=""
-    if [[ -n "$values_override" ]]; then
-      [[ -f "${chart_dir}/${values_override}" ]] || die "--values: not found in chart: $values_override"
-      vfile="$values_override"
-    elif [[ -f "${chart_dir}/values-sandbox.yaml" ]]; then vfile="values-sandbox.yaml"
-    elif [[ -f "${chart_dir}/values-local.yaml"   ]]; then vfile="values-local.yaml"
-    fi
-
-    entries="$(printf 'helm\t%s\t%s\t%s\n' "$cname" "$chart_dir" "$vfile")"
+    entries="$(_emit_explicit_chart_entry "$target" "$chart_override" "$values_override" "$name_override")" || return 1
   else
     [[ -z "$values_override" && -z "$name_override" ]] \
       || die "--values and --name require --chart"
-    entries="$(discover_app_charts "$target")" || \
-      die "no chart, deploy/, or k8s/ dir under ${target} — pass --chart <dir> to point at one explicitly"
+
+    # Convention: <target>/k8s/chart is the recommended layout — sandboxctl
+    # treats it as the implicit --chart when no flag is passed.
+    if [[ -f "${target}/k8s/chart/Chart.yaml" ]]; then
+      log "found chart at ${target}/k8s/chart (the recommended layout)"
+      entries="$(_emit_explicit_chart_entry "$target" "k8s/chart" "" "")" || return 1
+    elif entries="$(discover_app_charts "$target" 2>/dev/null)" && [[ -n "$entries" ]]; then
+      :
+    else
+      # No chart anywhere obvious — prompt the user for an absolute or
+      # relative path so they don't have to abort and re-run with --chart.
+      local prompt_path=""
+      if [[ -t 0 ]]; then
+        echo
+        echo "  No chart found at ${target}/k8s/chart (the default location)"
+        echo "  and auto-discovery turned up nothing under ${target}."
+        echo
+        printf '  Path to your Helm chart (absolute or relative to %s): ' "$target"
+        read -r prompt_path
+      fi
+      [[ -n "$prompt_path" ]] || \
+        die "no chart found under ${target} — pass --chart <dir> or place a chart at ${target}/k8s/chart"
+      entries="$(_emit_explicit_chart_entry "$target" "$prompt_path" "" "")" || return 1
+    fi
   fi
 
   log "discovered $(echo "$entries" | wc -l | tr -d ' ') app(s) under ${target}"
