@@ -32,12 +32,9 @@ CERT_MANAGER_CHART_VERSION="${CERT_MANAGER_CHART_VERSION:-v1.16.2}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.29.2}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.35.0}"
 
-# kagent: agentic-AI controller + UI. The chart's default LLM provider is
-# Ollama at host.docker.internal:11434. sandboxctl does NOT install Ollama
-# itself — the kagent UI is reachable either way; if the user wants the
-# agents to actually invoke an LLM, they install Ollama locally
-# (`brew install ollama && ollama serve && ollama pull llama3.2`) or set
-# KAGENT_OLLAMA_HOST to a remote endpoint.
+# kagent: chart defaults its LLM provider to Ollama at host.docker.internal.
+# sandboxctl does not install Ollama — the UI works either way; agents
+# need a reachable Ollama (or remote KAGENT_OLLAMA_HOST) to answer.
 KAGENT_NS="${KAGENT_NS:-kagent}"
 KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
 KAGENT_OLLAMA_HOST="${KAGENT_OLLAMA_HOST:-host.docker.internal:11434}"
@@ -45,10 +42,7 @@ KAGENT_OLLAMA_MODEL="${KAGENT_OLLAMA_MODEL:-llama3.2}"
 
 SANDBOX_DOMAIN="${SANDBOX_DOMAIN:-sandbox.app}"
 
-# Demo app source. Argo CD watches this repo + path and reconciles the
-# Deployment/Service/Namespace into the cluster. Override DEMO_APP_REPO_URL
-# to point at your fork if you want to tweak the demo without forking the
-# whole tool.
+# Demo app: Argo CD watches this repo + path. Override to point at a fork.
 DEMO_APP_REPO_URL="${DEMO_APP_REPO_URL:-https://github.com/tesserix/sandboxctl.git}"
 DEMO_APP_REPO_REVISION="${DEMO_APP_REPO_REVISION:-main}"
 ARGO_HOST="argo.${SANDBOX_DOMAIN}"
@@ -57,19 +51,14 @@ DEMO_HOST="demo-app.${SANDBOX_DOMAIN}"
 KAGENT_HOST="kagent.${SANDBOX_DOMAIN}"
 ROOT_CA_CN="${SANDBOX_DOMAIN} sandbox root CA"
 
-# Mac↔cluster routing: a LaunchAgent runs `kubectl port-forward` to the
-# istio-ingress Service. URLs use :8443 because binding :443 on macOS would
-# need sudo on every launchd start.
+# UI URLs use :8443 because binding :443 would need sudo on every launchd start.
 SANDBOX_HTTPS_PORT="${SANDBOX_HTTPS_PORT:-8443}"
 SANDBOX_HTTP_PORT="${SANDBOX_HTTP_PORT:-8080}"
 
-# Registry: a registry:2 Pod inside $REGISTRY_NS, accessed from the Mac via
-# a kubectl port-forward to host port $SANDBOX_REGISTRY_PORT. Image
-# references stay identical from both sides — `localhost:5050/img:tag`
-# pushes from the Mac and pulls from in-cluster Pods. The cluster's
-# containerd is configured (in kind-config.yaml) to forward
-# `localhost:5050` to the in-cluster Service. Default 5050 chosen to
-# avoid clashing with Docker Desktop's :5001 registry mirror.
+# Registry: registry:2 Pod, reachable as `localhost:$SANDBOX_REGISTRY_PORT`
+# from both Mac (via socat container on kind network) and in-cluster Pods
+# (via containerd hosts.toml mirror). Default 5050 dodges Docker Desktop's
+# :5001 mirror.
 SANDBOX_REGISTRY_PORT="${SANDBOX_REGISTRY_PORT:-5050}"
 SANDBOX_REGISTRY_STORAGE="${SANDBOX_REGISTRY_STORAGE:-12Gi}"
 SANDBOX_STATE_DIR="${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}"
@@ -79,18 +68,14 @@ SANDBOX_LAUNCHAGENT_LABEL="${SANDBOX_LAUNCHAGENT_LABEL:-io.github.sandboxctl.por
 SANDBOX_LAUNCHAGENT_PLIST="${SANDBOX_LAUNCHAGENT_DIR}/${SANDBOX_LAUNCHAGENT_LABEL}.plist"
 SANDBOX_PF_LOG="${SANDBOX_STATE_DIR}/portfwd.log"
 
-# Registry proxy — a socat container on the kind podman network that
-# forwards Mac:$SANDBOX_REGISTRY_PORT → kind-node:30050 → registry pod.
-# Replaces the previous kubectl port-forward, which couldn't keep up with
-# Docker's parallel layer uploads (16 concurrent streams stalled on
-# port-forward's stream serialisation).
+# socat container on kind network — bypass kubectl port-forward, which
+# stalls on Docker's 16-way parallel layer uploads.
 SANDBOX_REGISTRY_PROXY_CONTAINER="${SANDBOX_REGISTRY_PROXY_CONTAINER:-${CLUSTER_NAME}-registry-proxy}"
 SANDBOX_REGISTRY_PROXY_IMAGE="${SANDBOX_REGISTRY_PROXY_IMAGE:-docker.io/alpine/socat:latest}"
 SANDBOX_REGISTRY_NODEPORT="${SANDBOX_REGISTRY_NODEPORT:-30050}"
 SANDBOX_HOSTS_MARKER="# managed by sandboxctl (${SANDBOX_DOMAIN})"
 SANDBOX_SECRETS_FILE="${SANDBOX_STATE_DIR}/secrets.env"
 
-# Container runtime: podman (default — no Docker Desktop required) or docker.
 SANDBOX_RUNTIME="${SANDBOX_RUNTIME:-podman}"
 PODMAN_MACHINE_CPUS="${PODMAN_MACHINE_CPUS:-4}"
 PODMAN_MACHINE_MEMORY_MIB="${PODMAN_MACHINE_MEMORY_MIB:-6144}"
@@ -101,9 +86,7 @@ case "$SANDBOX_RUNTIME" in
   *) echo "ERROR: unsupported SANDBOX_RUNTIME=$SANDBOX_RUNTIME (use podman or docker)" >&2; exit 1 ;;
 esac
 
-# Per-install Kargo secrets. Generated on first `up` into $SANDBOX_SECRETS_FILE
-# (chmod 600) and reused on subsequent runs so the password sticks across
-# restarts. Set KARGO_TOKEN_SIGNING_KEY to pin the JWT signing key.
+# Per-install Kargo secrets — generated on first `up`, reused thereafter.
 KARGO_ADMIN_PASSWORD=""
 KARGO_ADMIN_PASSWORD_HASH=""
 KARGO_TOKEN_SIGNING_KEY="${KARGO_TOKEN_SIGNING_KEY:-}"
@@ -142,6 +125,24 @@ helm_uninstall_if_present() {
 
 require_tools() { need kind; need kubectl; need helm; ensure_runtime; }
 
+# ensure_tooling brew-installs developer tools that are commonly needed by
+# apps deployed onto the sandbox (Go, Node, mise for runtime versions,
+# fswatch for hot-reload). Skips anything already on PATH.
+ensure_tooling() {
+  command -v brew >/dev/null 2>&1 || { warn "brew unavailable — skipping dev tooling install"; return 0; }
+  local tool installed=()
+  for tool in go node mise fswatch; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      log "installing $tool via brew"
+      brew install "$tool" >/dev/null
+      installed+=("$tool")
+    fi
+  done
+  if (( ${#installed[@]} > 0 )); then
+    ok "installed: ${installed[*]}"
+  fi
+}
+
 runtime_fallback() {
   local reason="$1" other
   case "$SANDBOX_RUNTIME" in podman) other=docker ;; docker) other=podman ;; esac
@@ -153,10 +154,10 @@ runtime_fallback() {
 }
 
 ensure_runtime() {
-  # Auto-heal podman if installed-but-unhealthy; only fall back to docker if
-  # podman is genuinely absent. macOS docker daemon needs the GUI, so we
-  # surface a clear error there rather than trying to start it.
-  # shellcheck disable=SC2034  # _attempt is a sentinel loop variable
+  # Auto-heal podman if unhealthy; fall back to docker only if podman
+  # is missing. macOS docker daemon needs the GUI, so we don't try to
+  # start it ourselves.
+  # shellcheck disable=SC2034
   local _attempt
   for _attempt in 1 2; do
     case "$SANDBOX_RUNTIME" in
@@ -203,9 +204,8 @@ cluster_node_containers() {
 }
 
 cluster_uses_legacy_extra_port_mappings() {
-  # Pre-Istio kind-config.yaml mapped host :80/:443/:30080/:30443 via
-  # extraPortMappings. Those don't work on macOS+rootful podman; current
-  # config has none. Force a recreate if a stale binding is detected.
+  # Older configs bound :80/:443/:30080/:30443 on the kind container. Those
+  # don't work on macOS+rootful podman; force a recreate if detected.
   local cp
   cp="$("$SANDBOX_RUNTIME" inspect "${CLUSTER_NAME}-control-plane" \
     --format '{{json .HostConfig.PortBindings}}' 2>/dev/null || echo '{}')"
@@ -308,11 +308,9 @@ bring_up_cluster() {
 }
 
 configure_node_registry_mirror() {
-  # Tell containerd inside each kind node to forward `localhost:5050/*`
-  # pulls to the in-cluster registry Service. Uses the modern hosts.toml
-  # mechanism — the legacy containerdConfigPatches `mirrors` block in
-  # kind-config.yaml is incompatible with containerd v2.x (which
-  # kindest/node:v1.35.0 ships) and breaks the CRI plugin.
+  # hosts.toml mechanism (modern). The legacy `mirrors` block crashes
+  # containerd v2's CRI plugin with "mirrors cannot be set when
+  # config_path is provided" — see commit 4c68caa.
   local nodes node host_dir
   nodes="$("$SANDBOX_RUNTIME" ps --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME" --format '{{.Names}}')"
   [[ -n "$nodes" ]] || { warn "no kind nodes found to configure registry mirror"; return 0; }
@@ -345,10 +343,7 @@ install_cert_manager() {
 }
 
 install_pki() {
-  # PKI bootstrap (all generated inline so the CN tracks $SANDBOX_DOMAIN):
-  #
-  #   selfsigned-bootstrap → sandbox-root-ca → sandbox-ca → sandbox-wildcard
-  #
+  # selfsigned-bootstrap → sandbox-root-ca → sandbox-ca → sandbox-wildcard.
   # The wildcard secret lives in $ISTIO_INGRESS_NS so the gateway can mount
   # it via credentialName.
   log "installing local PKI (CA chain + *.${SANDBOX_DOMAIN} wildcard)"
@@ -427,10 +422,7 @@ install_kargo() {
 
 install_demo_app() {
   log "registering demo app with Argo CD (sync from ${DEMO_APP_REPO_URL}@${DEMO_APP_REPO_REVISION})"
-  # The demo app is deployed *only* via Argo CD so the UI shows GitOps in
-  # action. The Application points at this repo's manifests/demo-app
-  # directory; Argo clones, applies, and self-heals. CreateNamespace=true
-  # lets Argo own the demo namespace too.
+  # Deployed via Argo CD so the UI demonstrates GitOps end-to-end.
   kc apply -f - <<EOF >/dev/null
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -474,12 +466,9 @@ EOF
 }
 
 install_registry() {
-  # In-cluster Docker registry. Image references resolve to the same name
-  # ('localhost:5001/<image>') from both the Mac and in-cluster Pods:
-  #   - Mac push: a kubectl port-forward to this Service on host :5001 (added
-  #     to the LaunchAgent in install_portfwd).
-  #   - Cluster pull: kind's containerd is configured (kind-config.yaml) to
-  #     route 'localhost:5001' to this Service.
+  # Mac pushes via the socat proxy on $SANDBOX_REGISTRY_PORT; in-cluster
+  # Pods pull via the containerd hosts.toml mirror configured at cluster
+  # create. Image name is identical from both sides.
   log "installing in-cluster registry (ns: ${REGISTRY_NS}, host port: ${SANDBOX_REGISTRY_PORT}, storage: ${SANDBOX_REGISTRY_STORAGE})"
   kc create namespace "$REGISTRY_NS" --dry-run=client -o yaml | kc apply -f - >/dev/null
 
@@ -537,9 +526,8 @@ spec:
   type: NodePort
   selector: { app: registry }
   ports:
-    # nodePort fixed so the side-car socat proxy in install_registry_proxy
-    # can target a stable kind-node:port. Picked 30050 to keep symmetry
-    # with the host-side default 5050.
+    # nodePort fixed so install_registry_proxy can target a stable
+    # kind-node:port. 30050 mirrors the host-side default 5050.
     - { name: http, port: 5000, targetPort: http, nodePort: 30050 }
 ---
 # Tilt / Skaffold / etc. read this ConfigMap to discover the registry.
@@ -562,16 +550,11 @@ EOF
 }
 
 install_kagent() {
-  # kagent — agentic AI controller + UI. The chart configures the Ollama
-  # provider by default, but sandboxctl deliberately does NOT install or
-  # start Ollama on the user's Mac. The kagent UI comes up healthy
-  # regardless; if the user wants the agents to actually invoke an LLM,
-  # they install Ollama themselves (`brew install ollama && ollama serve
-  # && ollama pull llama3.2`) or set KAGENT_OLLAMA_HOST to a remote
-  # endpoint.
+  # The kagent UI works without an LLM. To actually answer queries, the
+  # && ollama pull llama3.2` or set KAGENT_OLLAMA_HOST to a remote endpoint.
   log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — provider: Ollama at ${KAGENT_OLLAMA_HOST}"
 
-  # CRDs ship as a separate chart and must land before the main chart.
+  # CRDs ship as a separate chart, must land first.
   helm upgrade --install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
     --namespace "$KAGENT_NS" --create-namespace \
     --version "$KAGENT_CHART_VERSION" \
@@ -630,8 +613,7 @@ install_istio_ambient() {
 
 install_routes() {
   log "applying Istio Gateway + VirtualServices for ${SANDBOX_DOMAIN}"
-  # Generated inline so the domain (and namespaces) follow $SANDBOX_DOMAIN /
-  # $DEMO_NS without anyone editing a static YAML.
+  # Generated inline so the domain follows $SANDBOX_DOMAIN without YAML edits.
   kc apply -f - <<EOF >/dev/null
 apiVersion: networking.istio.io/v1
 kind: Gateway
@@ -750,9 +732,7 @@ portfwd_running() {
   launchctl list 2>/dev/null | awk -v label="$SANDBOX_LAUNCHAGENT_LABEL" '$3==label {print $1}' | grep -qE '^[0-9]+$'
 }
 
-# Labels from prior sandboxctl versions. uninstall_portfwd unloads them too
-# so a fresh install isn't fighting a stale stuck listener that still owns
-# the port. Add to this list when the active label changes.
+# Old labels uninstall_portfwd cleans up so upgrades don't fight stale listeners.
 LEGACY_LAUNCHAGENT_LABELS=(
   com.zendesk.sandboxctl.portfwd
 )
@@ -795,20 +775,17 @@ uninstall_registry_portfwd() {
   pkill -f "port-forward.*svc/registry" >/dev/null 2>&1 || true
 }
 
-# port_listener_pid prints the PID listening on TCP 127.0.0.1:<port> on the
-# Mac, or empty if nothing is bound there. Uses lsof which is always present
-# on macOS. The trailing `|| true` is critical: lsof exits 1 when no socket
-# matches, which under `set -o pipefail` propagates through `| head -1` and
-# would kill the script via `set -e` at the next assignment site.
+# Trailing `|| true` is required: lsof exits 1 on no match, pipefail
+# propagates that through head, and set -e would kill the script at the
+# next assignment site.
 port_listener_pid() {
   local port="$1"
   lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
 }
 
-# Best-effort identity check — is the process bound to $1 something we can
-# safely kill (i.e. a sandboxctl-owned kubectl port-forward), vs a foreign
-# process we should refuse to touch? The legacy registry port-forward
-# pattern is also recognised so v1.3.0/1 leftovers get cleaned up cleanly.
+# Identity check — is the listener a sandboxctl-owned kubectl
+# port-forward we can safely kill? The legacy registry-portfwd pattern
+# is also recognised so v1.3.0/1 leftovers get cleaned up.
 port_listener_is_ours() {
   local port="$1" pid cmdline
   pid="$(port_listener_pid "$port")"
@@ -819,9 +796,8 @@ port_listener_is_ours() {
 }
 
 free_port_or_die() {
-  # Make sure $SANDBOX_HTTPS_PORT, $SANDBOX_HTTP_PORT are bindable. The
-  # registry port is owned by a podman socat container — uninstall_registry_portfwd
-  # already removed it before we got here.
+  # The registry port is bound by a podman socat container; that's
+  # already removed by uninstall_registry_portfwd before we get here.
   _check_port_or_die HTTP     "$SANDBOX_HTTP_PORT"
   _check_port_or_die HTTPS    "$SANDBOX_HTTPS_PORT"
   _check_registry_port_or_die "$SANDBOX_REGISTRY_PORT"
@@ -927,10 +903,9 @@ install_portfwd() {
 }
 
 install_registry_proxy() {
-  # Run a socat container on the kind podman network forwarding host
-  # :$SANDBOX_REGISTRY_PORT to the kind-node's NodePort on the registry
-  # Service. Real persistent TCP — handles Docker's 16 parallel layer
-  # uploads cleanly, unlike kubectl port-forward.
+  # socat container on the kind network: host:$SANDBOX_REGISTRY_PORT →
+  # kind-node:30050. Persistent TCP — handles Docker's parallel layer
+  # uploads, which kubectl port-forward stalls.
   local node_ip
   node_ip="$("$SANDBOX_RUNTIME" inspect "${CLUSTER_NAME}-control-plane" \
     --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
@@ -1005,11 +980,8 @@ untrust_root_ca() {
 # Per-install secrets (~/.sandboxctl/secrets.env)
 # ============================================================================
 
-# load_or_generate_secrets sets KARGO_ADMIN_PASSWORD / _HASH and
-# KARGO_TOKEN_SIGNING_KEY. On first run it generates random values, hashes
-# the password via the Go CLI's `secret bcrypt`, and writes everything to a
-# 0600 file the user owns. Subsequent runs just source the file so the
-# password stays the same across restarts.
+# Generates random Kargo password + JWT signing key on first run into
+# $SANDBOX_SECRETS_FILE (0600), reuses them thereafter.
 load_or_generate_secrets() {
   mkdir -p "$SANDBOX_STATE_DIR"
   if [[ -f "$SANDBOX_SECRETS_FILE" ]]; then
@@ -1085,10 +1057,8 @@ validate_urls() {
   local failed=0 host url code
   for host in "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$KAGENT_HOST"; do
     url="https://${host}:${SANDBOX_HTTPS_PORT}/"
-    # -k: curl's bundle doesn't know our local CA; the browser does after
-    # trust_root_ca. Browsers send SNI from the URL host — curl too, since
-    # /etc/hosts maps the host to 127.0.0.1.
-    # --retry can print one code per attempt; tail -c 3 keeps the final.
+    # -k: curl's bundle doesn't know our local CA (browser does post-trust).
+    # tail -c 3: --retry prints one code per attempt; we want the final one.
     code="$(curl -sk -o /dev/null -w '%{http_code}' \
       --max-time 8 --retry 8 --retry-delay 2 --retry-connrefused \
       "$url" 2>/dev/null | tail -c 3 || echo 000)"
@@ -1177,6 +1147,7 @@ start_sudo_keepalive() {
 
 cmd_up() {
   require_tools
+  ensure_tooling
 
   if up_needs_sudo; then
     log "sudo required for /etc/hosts + System keychain — prompting once now"
@@ -1387,37 +1358,22 @@ cmd_kargo_ui() {
 
 # ----- Build + push (registry) -----
 
-# Pick a builder: docker if available (typical), else `podman build`.
 detect_builder() {
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    echo docker
-  elif command -v podman >/dev/null 2>&1; then
-    echo podman
-  else
-    die "neither docker nor podman is available — install one to build images"
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then echo docker
+  elif command -v podman >/dev/null 2>&1; then echo podman
+  else die "neither docker nor podman is available — install one to build images"
   fi
 }
 
-# Pick a pusher: ALWAYS podman.
-#
-# On Macs running Docker Desktop, `docker push` runs inside Docker
-# Desktop's own VM. That VM has its own loopback — `[::1]:5050` resolves
-# to Docker Desktop's VM, not your Mac. The push hangs forever with all
-# layers stuck at "Waiting" because the daemon can't reach the registry.
-# podman publishes ports through gvproxy on the Mac directly, so a
-# `podman push localhost:5050/img` actually reaches the socat proxy.
-# podman is a hard prerequisite of sandboxctl anyway — it runs the kind
-# cluster — so this never adds a dependency.
+# Always podman: docker push from Docker Desktop's VM can't reach the
+# Mac's gvproxy port-forward (different loopback) — the push hangs with
+# layers stuck at "Waiting".
 detect_pusher() {
-  if command -v podman >/dev/null 2>&1; then
-    echo podman
-  else
-    die "podman is required for pushing images (sandboxctl runs kind via podman, so it should already be installed — try 'sandboxctl setup-podman')"
-  fi
+  command -v podman >/dev/null 2>&1 && { echo podman; return; }
+  die "podman is required for pushing — try 'sandboxctl setup-podman'"
 }
 
-# Cross-builder build → push helper.
-# $1 image, $2 dockerfile, $3 context, $4+ extra build args (e.g. -t alias)
+# build_and_push <image> <dockerfile> <context> [extra build args]
 build_and_push() {
   local image="$1" dockerfile="$2" context="$3"; shift 3
   local builder pusher
@@ -1428,12 +1384,8 @@ build_and_push() {
   "$builder" build -t "$image" "$@" -f "$dockerfile" "$context" || \
     die "build failed for ${image}"
 
-  # If builder ≠ pusher, hand the image off to the pusher's local store.
-  # We pipe `docker save` (a flat OCI/Docker tarball) into `podman load`.
-  # Works on every podman build — unlike `podman pull docker-daemon:`,
-  # which needs the containers/image library compiled with daemon support
-  # AND access to the docker socket, neither of which podman on macOS has
-  # (podman lives in its own VM, separate from Docker Desktop's).
+  # docker save | podman load is the universal handoff — `podman pull
+  # docker-daemon:` needs daemon-socket access podman's VM doesn't have.
   if [[ "$builder" != "$pusher" ]]; then
     log "transferring ${image} from ${builder} to ${pusher} for push"
     "$builder" save "$image" 2>/dev/null | "$pusher" load 2>&1 | tail -3 || \
@@ -1451,13 +1403,8 @@ slugify() {
 }
 
 cmd_build() {
-  # Two modes:
-  #   1. If a sandboxctl.yaml exists in the target dir or at cwd, the
-  #      manifest defines image names, contexts, dependencies, and tags.
-  #      Used for repos with build-order requirements (e.g. one image
-  #      FROMs another) or non-trivial build contexts.
-  #   2. Otherwise the auto-walk: find every Dockerfile under target,
-  #      build each with its own dir as the context, tag and push.
+  # If a sandboxctl.yaml is found, use it (build order, contexts,
+  # aliases, deps). Otherwise auto-walk Dockerfiles.
   local target="${1:-.}" tag="${2:-latest}"
 
   if ! nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
@@ -1512,34 +1459,14 @@ cmd_build_auto_walk() {
 }
 
 cmd_build_from_manifest() {
-  # Read sandboxctl.yaml and orchestrate the build. Format:
-  #
-  #   images:
-  #     - name: agent-sdk
-  #       context: docker/agent-sdk     # build context, relative to repo root
-  #       dockerfile: Dockerfile        # optional; default <context>/Dockerfile
-  #       tag: latest                   # optional; default latest
-  #       aliases: [fiber-agent-sdk:latest]   # optional; extra local tags
-  #                                            # so other Dockerfiles' FROMs
-  #                                            # (e.g. FROM fiber-agent-sdk)
-  #                                            # find the image we just built.
-  #     - name: quality
-  #       context: docker/quality
-  #       depends_on: [agent-sdk]       # optional; build order hint, used
-  #                                      # to fail fast if a dep wasn't built
-  #
-  # Order in the YAML IS the build order — we don't topologically sort.
-  # depends_on only validates that the named dep was built earlier.
-  # Per-image `tag` defaults to 'latest' (handled inside the parser).
+  # YAML order IS the build order. depends_on validates the named dep
+  # was built earlier in the file (no topo sort). Schema lives in README.
   local manifest="$1"
   local sandboxctl_bin
   sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
   [[ -n "$sandboxctl_bin" ]] || die "sandboxctl binary not on PATH"
 
   log "building from $manifest"
-  # The Go CLI's _parse-build-manifest emits one tab-separated line per
-  # image — `name<TAB>context<TAB>dockerfile<TAB>tag<TAB>aliases<TAB>deps`.
-  # Real YAML via gopkg.in/yaml.v3, no python3 dependency.
   local entries
   entries="$("$sandboxctl_bin" _parse-build-manifest "$manifest")" || \
     die "failed to parse $manifest"
@@ -1570,9 +1497,8 @@ cmd_build_from_manifest() {
     fi
 
     local image="localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
-    # Pass any alias tags as additional -t flags so the builder applies
-    # them in a single pass (e.g. so `FROM fiber-agent-sdk` works in
-    # downstream Dockerfiles).
+    # Aliases become extra -t flags so downstream Dockerfiles' FROMs
+    # (e.g. `FROM fiber-agent-sdk`) resolve to the freshly-built image.
     local extra_tags=()
     if [[ -n "$aliases" ]]; then
       local alias
@@ -1594,12 +1520,7 @@ cmd_build_from_manifest() {
 }
 
 cmd_images() {
-  # Subcommands:
-  #   sandboxctl images               list pushed images + tags
-  #   sandboxctl images rm <ref>      delete one ref (e.g. 'myapp:v1' or 'myapp')
-  #   sandboxctl images prune         delete every image, then GC blobs
-  #   sandboxctl images gc            run registry garbage-collector now
-  #                                   (reclaims disk after rm/prune)
+  # list / rm <ref> / prune / gc — see usage block.
   local sub="${1:-list}"; shift || true
   case "$sub" in
     list|"")  registry_images_list ;;
@@ -1630,10 +1551,8 @@ registry_tags() {
 }
 
 registry_manifest_digest() {
-  # Fetch the Docker-Content-Digest header for <repo>:<tag>. Covers all
-  # four manifest types we may encounter (single-arch v2, single-arch
-  # OCI v1, multi-arch list v2, OCI image index). Returns empty if no
-  # manifest type matches — caller decides how to handle.
+  # Accept covers all four manifest types: Docker v2, OCI v1,
+  # Docker manifest list, OCI image index. Empty return = caller decides.
   local repo="$1" tag="$2"
   curl -s -I --max-time 5 \
     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
@@ -1641,11 +1560,9 @@ registry_manifest_digest() {
     2>/dev/null | awk -v IGNORECASE=1 '/^docker-content-digest:/ {print $2}' | tr -d '\r' | head -1 || true
 }
 
-# Delete a tag's link file directly from the registry pod's filesystem.
-# Use as a fallback when registry_manifest_digest returns empty (the
-# manifest blob has been GC'd but the tag→manifest link still exists,
-# which makes /tags/list claim the tag is present even though /manifests/<tag>
-# returns 404). Requires kubectl access to the cluster.
+# Fallback when the manifest blob has been GC'd but the tag→manifest
+# link still exists (registry tag listing claims the tag is present
+# while /manifests/<tag> 404s). Removes the link directly via kubectl.
 registry_filesystem_remove_tag() {
   local repo="$1" tag="$2"
   local pod
@@ -1727,11 +1644,8 @@ registry_images_prune() {
 }
 
 registry_images_gc() {
-  # DELETEing a manifest only marks blobs for GC; the on-disk space is
-  # reclaimed by running the registry's built-in garbage-collector inside
-  # the pod. We bounce the registry afterwards so it picks up the cleaned
-  # filesystem cleanly (otherwise the in-process tag cache can mask the
-  # change until the next restart).
+  # DELETE only marks blobs; the registry's built-in GC reclaims disk.
+  # Bounce the pod afterwards to flush its in-memory tag cache.
   require_running_cluster
   local pod
   pod="$(kc -n "$REGISTRY_NS" get pod -l app=registry \
