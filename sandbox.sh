@@ -1530,75 +1530,19 @@ cmd_build_from_manifest() {
   #
   # Order in the YAML IS the build order — we don't topologically sort.
   # depends_on only validates that the named dep was built earlier.
-  # Per-image `tag` defaults to 'latest' inside the YAML parser.
+  # Per-image `tag` defaults to 'latest' (handled inside the parser).
   local manifest="$1"
-  command -v python3 >/dev/null 2>&1 || die "python3 required to parse $manifest"
+  local sandboxctl_bin
+  sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
+  [[ -n "$sandboxctl_bin" ]] || die "sandboxctl binary not on PATH"
 
   log "building from $manifest"
-  # Walk the YAML, emit one tab-separated line per image:
-  #   name<TAB>context<TAB>dockerfile<TAB>tag<TAB>aliases-comma-sep<TAB>deps-comma-sep
-  # We use python's stdlib only (no PyYAML dependency on user machines).
-  # The parser below is intentionally tolerant — it only needs the four
-  # fields above and is not a full YAML implementation.
+  # The Go CLI's _parse-build-manifest emits one tab-separated line per
+  # image — `name<TAB>context<TAB>dockerfile<TAB>tag<TAB>aliases<TAB>deps`.
+  # Real YAML via gopkg.in/yaml.v3, no python3 dependency.
   local entries
-  entries="$(python3 - "$manifest" <<'PY'
-import sys, re
-
-path = sys.argv[1]
-with open(path) as f:
-    raw = f.read()
-
-# Strip comments + collapse blank lines.
-lines = []
-for ln in raw.splitlines():
-    s = ln.split('#', 1)[0].rstrip()
-    if s.strip():
-        lines.append(s)
-
-# Find the 'images:' block and parse list items.
-in_images = False
-items = []
-cur = None
-for ln in lines:
-    if re.match(r'^images\s*:\s*$', ln):
-        in_images = True
-        continue
-    if not in_images:
-        continue
-    m = re.match(r'^(\s+)- (\w+)\s*:\s*(.*)$', ln)
-    if m:
-        if cur:
-            items.append(cur)
-        cur = {m.group(2): m.group(3).strip()}
-        continue
-    m = re.match(r'^(\s+)(\w+)\s*:\s*(.*)$', ln)
-    if m and cur is not None:
-        cur[m.group(2)] = m.group(3).strip()
-        continue
-if cur:
-    items.append(cur)
-
-def parse_list(s):
-    s = s.strip()
-    if not s:
-        return []
-    if s.startswith('['):
-        s = s.strip('[] ')
-        return [x.strip().strip('"\'') for x in s.split(',') if x.strip()]
-    return [s.strip('"\'')]
-
-for it in items:
-    name = it.get('name', '').strip('"\'')
-    if not name:
-        continue
-    ctx = it.get('context', '.').strip('"\'')
-    df = it.get('dockerfile', '').strip('"\'') or f'{ctx}/Dockerfile'
-    tag = it.get('tag', 'latest').strip('"\'')
-    aliases = ','.join(parse_list(it.get('aliases', '')))
-    deps = ','.join(parse_list(it.get('depends_on', '')))
-    print(f'{name}\t{ctx}\t{df}\t{tag}\t{aliases}\t{deps}')
-PY
-)"
+  entries="$("$sandboxctl_bin" _parse-build-manifest "$manifest")" || \
+    die "failed to parse $manifest"
 
   if [[ -z "$entries" ]]; then
     die "no images parsed from $manifest (check the file format)"
@@ -1686,14 +1630,31 @@ registry_tags() {
 }
 
 registry_manifest_digest() {
-  # Fetch the Docker-Content-Digest header for <repo>:<tag>. Returns empty
-  # if not found.
+  # Fetch the Docker-Content-Digest header for <repo>:<tag>. Covers all
+  # four manifest types we may encounter (single-arch v2, single-arch
+  # OCI v1, multi-arch list v2, OCI image index). Returns empty if no
+  # manifest type matches — caller decides how to handle.
   local repo="$1" tag="$2"
   curl -s -I --max-time 5 \
-    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-    -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
     "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/manifests/${tag}" \
     2>/dev/null | awk -v IGNORECASE=1 '/^docker-content-digest:/ {print $2}' | tr -d '\r' | head -1 || true
+}
+
+# Delete a tag's link file directly from the registry pod's filesystem.
+# Use as a fallback when registry_manifest_digest returns empty (the
+# manifest blob has been GC'd but the tag→manifest link still exists,
+# which makes /tags/list claim the tag is present even though /manifests/<tag>
+# returns 404). Requires kubectl access to the cluster.
+registry_filesystem_remove_tag() {
+  local repo="$1" tag="$2"
+  local pod
+  pod="$(kc -n "$REGISTRY_NS" get pod -l app=registry \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [[ -n "$pod" ]] || return 1
+  kc -n "$REGISTRY_NS" exec "$pod" -- \
+    rm -rf "/var/lib/registry/docker/registry/v2/repositories/${repo}/_manifests/tags/${tag}" \
+    >/dev/null 2>&1
 }
 
 registry_images_list() {
@@ -1723,10 +1684,23 @@ registry_images_rm() {
   if [[ -n "$tag" ]]; then
     log "deleting ${repo}:${tag}"
     local digest; digest="$(registry_manifest_digest "$repo" "$tag")"
-    [[ -n "$digest" ]] || die "manifest not found for ${repo}:${tag}"
-    curl -s -X DELETE --max-time 5 \
-      "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/manifests/${digest}" >/dev/null
-    ok "deleted ${repo}:${tag} (digest ${digest:0:19}...)"
+    if [[ -n "$digest" ]]; then
+      curl -s -X DELETE --max-time 5 \
+        "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/manifests/${digest}" >/dev/null
+      # Also remove the tag's link file. The DELETE above clears the
+      # manifest blob but the registry's tag→manifest symlink may still
+      # be listed by /tags/list until restarted (registry caches the
+      # tag listing in memory).
+      registry_filesystem_remove_tag "$repo" "$tag" || true
+      ok "deleted ${repo}:${tag} (digest ${digest:0:19}...)"
+    else
+      # Manifest is already gone (orphaned tag link) — clean up the FS.
+      if registry_filesystem_remove_tag "$repo" "$tag"; then
+        ok "deleted orphaned tag ${repo}:${tag} (manifest was already GC'd)"
+      else
+        die "manifest not found for ${repo}:${tag} and could not access registry pod to clean tag link"
+      fi
+    fi
   else
     log "deleting all tags of ${repo}"
     local tags; tags="$(registry_tags "$repo")"

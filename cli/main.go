@@ -65,7 +65,7 @@ func known(sub string) bool {
 	}
 	// Hidden subcommands consumed by sandbox.sh itself, not listed in usage.
 	switch sub {
-	case "secret":
+	case "secret", "_parse-build-manifest":
 		return true
 	}
 	return false
@@ -91,6 +91,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n\n%s", sub, usage())
 		os.Exit(2)
 	}
+
+	// Subcommands that don't need the runtime assets (sandbox.sh +
+	// manifests). Dispatch them before the assets-dir check so they
+	// work in CI, in dev builds, or when the user just wants to compute
+	// something locally.
+	if sub == "secret" {
+		os.Exit(runSecret(os.Args[2:]))
+	}
+	if sub == "_parse-build-manifest" {
+		os.Exit(runParseBuildManifest(os.Args[2:]))
+	}
+
 	if resolveAssetDir() == "" {
 		fmt.Fprintln(os.Stderr, "sandboxctl: cannot find runtime assets — set SANDBOXCTL_ASSETS or reinstall")
 		os.Exit(2)
@@ -102,9 +114,6 @@ func main() {
 			os.Exit(1)
 		}
 		return
-	}
-	if sub == "secret" {
-		os.Exit(runSecret(os.Args[2:]))
 	}
 
 	os.Exit(runScript(os.Args[1:]...))
