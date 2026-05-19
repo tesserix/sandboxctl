@@ -1429,13 +1429,15 @@ build_and_push() {
     die "build failed for ${image}"
 
   # If builder ≠ pusher, hand the image off to the pusher's local store.
-  # docker → podman: `podman pull docker-daemon:<image>` reads from docker's
-  # local image store directly. Avoids re-downloading or save/load gymnastics.
+  # We pipe `docker save` (a flat OCI/Docker tarball) into `podman load`.
+  # Works on every podman build — unlike `podman pull docker-daemon:`,
+  # which needs the containers/image library compiled with daemon support
+  # AND access to the docker socket, neither of which podman on macOS has
+  # (podman lives in its own VM, separate from Docker Desktop's).
   if [[ "$builder" != "$pusher" ]]; then
     log "transferring ${image} from ${builder} to ${pusher} for push"
-    podman pull --tls-verify=false "docker-daemon:${image}" >/dev/null || \
-      die "could not transfer ${image} from docker daemon to podman"
-    podman tag "${image}" "${image}" >/dev/null 2>&1 || true
+    "$builder" save "$image" 2>/dev/null | "$pusher" load 2>&1 | tail -3 || \
+      die "could not transfer ${image} from ${builder} to ${pusher}"
   fi
 
   log "pushing ${image}  (pusher: ${pusher})"
