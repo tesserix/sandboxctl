@@ -1388,8 +1388,6 @@ cmd_kargo_ui() {
 # ----- Build + push (registry) -----
 
 # Pick a builder: docker if available (typical), else `podman build`.
-# Returns the command to invoke as a single string suitable for splitting
-# into argv.
 detect_builder() {
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo docker
@@ -1398,6 +1396,51 @@ detect_builder() {
   else
     die "neither docker nor podman is available — install one to build images"
   fi
+}
+
+# Pick a pusher: ALWAYS podman.
+#
+# On Macs running Docker Desktop, `docker push` runs inside Docker
+# Desktop's own VM. That VM has its own loopback — `[::1]:5050` resolves
+# to Docker Desktop's VM, not your Mac. The push hangs forever with all
+# layers stuck at "Waiting" because the daemon can't reach the registry.
+# podman publishes ports through gvproxy on the Mac directly, so a
+# `podman push localhost:5050/img` actually reaches the socat proxy.
+# podman is a hard prerequisite of sandboxctl anyway — it runs the kind
+# cluster — so this never adds a dependency.
+detect_pusher() {
+  if command -v podman >/dev/null 2>&1; then
+    echo podman
+  else
+    die "podman is required for pushing images (sandboxctl runs kind via podman, so it should already be installed — try 'sandboxctl setup-podman')"
+  fi
+}
+
+# Cross-builder build → push helper.
+# $1 image, $2 dockerfile, $3 context, $4+ extra build args (e.g. -t alias)
+build_and_push() {
+  local image="$1" dockerfile="$2" context="$3"; shift 3
+  local builder pusher
+  builder="$(detect_builder)"
+  pusher="$(detect_pusher)"
+
+  log "building ${image}  (context: ${context}, builder: ${builder})"
+  "$builder" build -t "$image" "$@" -f "$dockerfile" "$context" || \
+    die "build failed for ${image}"
+
+  # If builder ≠ pusher, hand the image off to the pusher's local store.
+  # docker → podman: `podman pull docker-daemon:<image>` reads from docker's
+  # local image store directly. Avoids re-downloading or save/load gymnastics.
+  if [[ "$builder" != "$pusher" ]]; then
+    log "transferring ${image} from ${builder} to ${pusher} for push"
+    podman pull --tls-verify=false "docker-daemon:${image}" >/dev/null || \
+      die "could not transfer ${image} from docker daemon to podman"
+    podman tag "${image}" "${image}" >/dev/null 2>&1 || true
+  fi
+
+  log "pushing ${image}  (pusher: ${pusher})"
+  "$pusher" push --tls-verify=false "$image" || die "push failed for ${image}"
+  ok "${image}"
 }
 
 # slugify an arbitrary path component into a docker-image-name-safe form.
@@ -1413,8 +1456,7 @@ cmd_build() {
   #      FROMs another) or non-trivial build contexts.
   #   2. Otherwise the auto-walk: find every Dockerfile under target,
   #      build each with its own dir as the context, tag and push.
-  local target="${1:-.}" tag="${2:-latest}" builder
-  builder="$(detect_builder)"
+  local target="${1:-.}" tag="${2:-latest}"
 
   if ! nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
     die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
@@ -1425,14 +1467,14 @@ cmd_build() {
     [[ -f "$candidate" ]] && { manifest="$candidate"; break; }
   done
   if [[ -n "$manifest" ]]; then
-    cmd_build_from_manifest "$manifest" "$target" "$tag" "$builder"
+    cmd_build_from_manifest "$manifest"
   else
-    cmd_build_auto_walk "$target" "$tag" "$builder"
+    cmd_build_auto_walk "$target" "$tag"
   fi
 }
 
 cmd_build_auto_walk() {
-  local target="$1" tag="$2" builder="$3"
+  local target="$1" tag="$2"
   log "scanning ${target} for Dockerfiles (no sandboxctl.yaml found — using auto-walk)"
   local dockerfiles=()
   while IFS= read -r df; do
@@ -1455,11 +1497,7 @@ cmd_build_auto_walk() {
     name="$(slugify "$(basename "$(cd "$ctx" && pwd)")")"
     [[ -n "$name" ]] || name="image"
     image="localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
-    log "building ${image}  (context: ${ctx})"
-    "$builder" build -t "$image" -f "$df" "$ctx" || die "build failed for ${df}"
-    log "pushing ${image}"
-    "$builder" push "$image" || die "push failed for ${image}"
-    ok "${image}"
+    build_and_push "$image" "$df" "$ctx"
   done
 
   echo
@@ -1490,9 +1528,8 @@ cmd_build_from_manifest() {
   #
   # Order in the YAML IS the build order — we don't topologically sort.
   # depends_on only validates that the named dep was built earlier.
-  # Per-image `tag` defaults to 'latest' inside the YAML parser; we don't
-  # need a function-level default_tag.
-  local manifest="$1" builder="$4"
+  # Per-image `tag` defaults to 'latest' inside the YAML parser.
+  local manifest="$1"
   command -v python3 >/dev/null 2>&1 || die "python3 required to parse $manifest"
 
   log "building from $manifest"
@@ -1587,20 +1624,18 @@ PY
     fi
 
     local image="localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
-    local build_args=(-t "$image")
+    # Pass any alias tags as additional -t flags so the builder applies
+    # them in a single pass (e.g. so `FROM fiber-agent-sdk` works in
+    # downstream Dockerfiles).
+    local extra_tags=()
     if [[ -n "$aliases" ]]; then
       local alias
       for alias in ${aliases//,/ }; do
-        build_args+=(-t "$alias")
+        extra_tags+=(-t "$alias")
       done
     fi
 
-    log "building ${image}  (context: ${abs_ctx}${aliases:+  aliases: ${aliases//,/, }})"
-    "$builder" build "${build_args[@]}" -f "$abs_df" "$abs_ctx" || die "build failed for $name"
-
-    log "pushing ${image}"
-    "$builder" push "$image" || die "push failed for $name"
-    ok "${image}"
+    build_and_push "$image" "$abs_df" "$abs_ctx" "${extra_tags[@]}"
     built+=("$name")
   done <<< "$entries"
 
