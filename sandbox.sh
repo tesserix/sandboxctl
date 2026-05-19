@@ -635,7 +635,13 @@ install_gitea() {
   mkdir -p "$SANDBOX_STATE_DIR"
   local pass_file="${SANDBOX_STATE_DIR}/gitea-admin-pass"
   if [[ ! -s "$pass_file" ]]; then
-    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 > "$pass_file"
+    # NB: do NOT use `tr -dc … < /dev/urandom | head -c 32` here. Under
+    # `set -euo pipefail`, `head -c` closes the pipe after 32 bytes,
+    # `tr` gets SIGPIPE (status 141), and pipefail propagates that as
+    # the function's exit — silently aborting `up` between
+    # "installing Gitea" and the helm install. Generate via openssl
+    # instead, which produces a fixed-length string in one shot.
+    openssl rand -hex 16 > "$pass_file"
     chmod 600 "$pass_file"
   fi
   local admin_pass; admin_pass="$(cat "$pass_file")"
