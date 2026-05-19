@@ -1,8 +1,16 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-  - role: control-plane
 # Reachability from the Mac is provided by `kubectl port-forward` (managed
 # by the LaunchAgent installed in `up`), not by kind extraPortMappings.
 # That avoids the rootful-podman + gvproxy pitfall where extraPortMappings
 # get bound inside the podman VM but never published to the Mac.
+nodes:
+  - role: control-plane
+# Forward in-cluster pulls of `localhost:5001/<image>` to the in-cluster
+# registry Service. The Mac pushes via a separate kubectl port-forward to
+# the same Service on host port 5001, so the image reference is identical
+# from both sides.
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+      endpoint = ["http://registry.sandboxctl-registry.svc.cluster.local:5000"]

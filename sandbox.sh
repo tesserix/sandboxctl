@@ -18,6 +18,7 @@ CLUSTER_NAME="${SANDBOX_CLUSTER_NAME:-sandboxctl}"
 ARGOCD_NS="${ARGOCD_NS:-argocd}"
 KARGO_NS="${KARGO_NS:-kargo}"
 DEMO_NS="${DEMO_NS:-demo-app}"
+REGISTRY_NS="${REGISTRY_NS:-sandboxctl-registry}"
 ISTIO_SYSTEM_NS="${ISTIO_SYSTEM_NS:-istio-system}"
 ISTIO_INGRESS_NS="${ISTIO_INGRESS_NS:-istio-ingress}"
 LEGACY_INGRESS_NS="${LEGACY_INGRESS_NS:-ingress-nginx}"
@@ -61,12 +62,24 @@ ROOT_CA_CN="${SANDBOX_DOMAIN} sandbox root CA"
 # need sudo on every launchd start.
 SANDBOX_HTTPS_PORT="${SANDBOX_HTTPS_PORT:-8443}"
 SANDBOX_HTTP_PORT="${SANDBOX_HTTP_PORT:-8080}"
+
+# Registry: a registry:2 Pod inside $REGISTRY_NS, accessed from the Mac via
+# a kubectl port-forward to host port $SANDBOX_REGISTRY_PORT. Image
+# references stay identical from both sides — `localhost:5001/img:tag`
+# pushes from the Mac and pulls from in-cluster Pods. The cluster's
+# containerd is configured (in kind-config.yaml) to forward
+# `localhost:5001` to the in-cluster Service.
+SANDBOX_REGISTRY_PORT="${SANDBOX_REGISTRY_PORT:-5001}"
+SANDBOX_REGISTRY_STORAGE="${SANDBOX_REGISTRY_STORAGE:-5Gi}"
 SANDBOX_STATE_DIR="${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}"
 SANDBOX_STATE_FILE="${SANDBOX_STATE_DIR}/setup.yaml"
 SANDBOX_LAUNCHAGENT_DIR="${SANDBOX_LAUNCHAGENT_DIR:-$HOME/Library/LaunchAgents}"
 SANDBOX_LAUNCHAGENT_LABEL="${SANDBOX_LAUNCHAGENT_LABEL:-io.github.sandboxctl.portfwd}"
 SANDBOX_LAUNCHAGENT_PLIST="${SANDBOX_LAUNCHAGENT_DIR}/${SANDBOX_LAUNCHAGENT_LABEL}.plist"
+SANDBOX_REGISTRY_LAUNCHAGENT_LABEL="${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL:-io.github.sandboxctl.registry-portfwd}"
+SANDBOX_REGISTRY_LAUNCHAGENT_PLIST="${SANDBOX_LAUNCHAGENT_DIR}/${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL}.plist"
 SANDBOX_PF_LOG="${SANDBOX_STATE_DIR}/portfwd.log"
+SANDBOX_REGISTRY_PF_LOG="${SANDBOX_STATE_DIR}/registry-portfwd.log"
 SANDBOX_HOSTS_MARKER="# managed by sandboxctl (${SANDBOX_DOMAIN})"
 SANDBOX_SECRETS_FILE="${SANDBOX_STATE_DIR}/secrets.env"
 
@@ -427,6 +440,90 @@ EOF
   warn "current state: sync=${sync:-unknown} health=${health:-unknown}"
 }
 
+install_registry() {
+  # In-cluster Docker registry. Image references resolve to the same name
+  # ('localhost:5001/<image>') from both the Mac and in-cluster Pods:
+  #   - Mac push: a kubectl port-forward to this Service on host :5001 (added
+  #     to the LaunchAgent in install_portfwd).
+  #   - Cluster pull: kind's containerd is configured (kind-config.yaml) to
+  #     route 'localhost:5001' to this Service.
+  log "installing in-cluster registry (ns: ${REGISTRY_NS}, host port: ${SANDBOX_REGISTRY_PORT}, storage: ${SANDBOX_REGISTRY_STORAGE})"
+  kc create namespace "$REGISTRY_NS" --dry-run=client -o yaml | kc apply -f - >/dev/null
+
+  kc apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry
+  namespace: ${REGISTRY_NS}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: ${SANDBOX_REGISTRY_STORAGE}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: ${REGISTRY_NS}
+  labels:
+    app: registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: registry }
+  strategy:
+    type: Recreate     # only one writer at a time on the PVC
+  template:
+    metadata:
+      labels: { app: registry }
+    spec:
+      containers:
+        - name: registry
+          image: registry:2
+          ports:
+            - { name: http, containerPort: 5000 }
+          env:
+            - { name: REGISTRY_STORAGE_DELETE_ENABLED, value: "true" }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/registry }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: registry }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: ${REGISTRY_NS}
+spec:
+  selector: { app: registry }
+  ports:
+    - { name: http, port: 5000, targetPort: http }
+---
+# Tilt / Skaffold / etc. read this ConfigMap to discover the registry.
+# https://github.com/kubernetes/enhancements/tree/master/keps/sig-cluster-lifecycle/generic/1755-communicating-a-local-registry
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${SANDBOX_REGISTRY_PORT}"
+    hostFromContainerRuntime: "registry.${REGISTRY_NS}.svc.cluster.local:5000"
+    hostFromClusterNetwork: "registry.${REGISTRY_NS}.svc.cluster.local:5000"
+    help: "https://github.com/tesserix/sandboxctl#registry"
+EOF
+
+  kc -n "$REGISTRY_NS" rollout status deploy/registry --timeout=180s >/dev/null
+  ok "registry ready (push: localhost:${SANDBOX_REGISTRY_PORT}/<image>:<tag>)"
+}
+
 install_kagent() {
   # kagent — agentic AI controller + UI. The chart configures the Ollama
   # provider by default, but sandboxctl deliberately does NOT install or
@@ -642,6 +739,15 @@ uninstall_portfwd() {
   pkill -f "port-forward.*svc/istio-ingress" >/dev/null 2>&1 || true
 }
 
+uninstall_registry_portfwd() {
+  if [[ -f "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" ]]; then
+    log "unloading + removing LaunchAgent ${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL}"
+    launchctl unload "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" >/dev/null 2>&1 || true
+    rm -f "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST"
+  fi
+  pkill -f "port-forward.*svc/registry" >/dev/null 2>&1 || true
+}
+
 # port_listener_pid prints the PID listening on TCP 127.0.0.1:<port> on the
 # Mac, or empty if nothing is bound there. Uses lsof which is always present
 # on macOS. The trailing `|| true` is critical: lsof exits 1 when no socket
@@ -654,21 +760,25 @@ port_listener_pid() {
 
 # Best-effort identity check — is the process bound to $1 something we can
 # safely kill (i.e. a sandboxctl-owned kubectl port-forward), vs a foreign
-# process we should refuse to touch?
+# process we should refuse to touch? Matches both the istio-ingress and the
+# registry port-forwards.
 port_listener_is_ours() {
   local port="$1" pid cmdline
   pid="$(port_listener_pid "$port")"
   [[ -n "$pid" ]] || return 1
   cmdline="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$cmdline" == *"port-forward"*"svc/istio-ingress"* ]]
+  [[ "$cmdline" == *"port-forward"*"svc/istio-ingress"* ]] || \
+    [[ "$cmdline" == *"port-forward"*"svc/registry"* ]]
 }
 
 free_port_or_die() {
-  # Make sure $SANDBOX_HTTPS_PORT and $SANDBOX_HTTP_PORT are bindable. If
-  # they're held by a previous sandboxctl, kill it and retry. If they're
-  # held by a foreign process, fail with a clear, actionable error.
-  _check_port_or_die HTTP  "$SANDBOX_HTTP_PORT"
-  _check_port_or_die HTTPS "$SANDBOX_HTTPS_PORT"
+  # Make sure $SANDBOX_HTTPS_PORT, $SANDBOX_HTTP_PORT, and the registry port
+  # are bindable. If they're held by a previous sandboxctl, kill it and
+  # retry. If they're held by a foreign process, fail with a clear,
+  # actionable error.
+  _check_port_or_die HTTP     "$SANDBOX_HTTP_PORT"
+  _check_port_or_die HTTPS    "$SANDBOX_HTTPS_PORT"
+  _check_port_or_die REGISTRY "$SANDBOX_REGISTRY_PORT"
 }
 
 _check_port_or_die() {
@@ -729,28 +839,65 @@ EOF
 install_portfwd() {
   log "installing kubectl port-forward LaunchAgent (Mac :${SANDBOX_HTTP_PORT}/:${SANDBOX_HTTPS_PORT} → svc/istio-ingress)"
   uninstall_portfwd
+  uninstall_registry_portfwd
   free_port_or_die        # fail fast on foreign conflicts; clean up our own stale state
   write_portfwd_plist
+  write_registry_portfwd_plist
   launchctl load "$SANDBOX_LAUNCHAGENT_PLIST" || \
     die "launchctl load failed for ${SANDBOX_LAUNCHAGENT_PLIST} — check the file then 'sandboxctl restart'"
+  launchctl load "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" || \
+    die "launchctl load failed for ${SANDBOX_REGISTRY_LAUNCHAGENT_PLIST} — check the file then 'sandboxctl restart'"
 
-  # Wait for both ports to bind. If either doesn't come up in 30s, fail
-  # loudly: silently returning without a port-forward (the v1.2.1 regression)
-  # leaves the user with a healthy cluster but no Mac→cluster path, and
-  # the failure is invisible until they try a URL.
+  # Wait for all three ports to bind. If any doesn't come up in 30s, fail
+  # loudly: silently returning without a port-forward leaves the user with
+  # a healthy cluster but no Mac→cluster path, and the failure is invisible
+  # until they try a URL or `docker push`.
   local i
   for ((i=1; i<=30; i++)); do
-    if nc -z 127.0.0.1 "$SANDBOX_HTTPS_PORT" 2>/dev/null && \
-       nc -z 127.0.0.1 "$SANDBOX_HTTP_PORT"  2>/dev/null; then
-      ok "port-forward ready on 127.0.0.1:${SANDBOX_HTTP_PORT} + :${SANDBOX_HTTPS_PORT}"
+    if nc -z 127.0.0.1 "$SANDBOX_HTTPS_PORT"    2>/dev/null && \
+       nc -z 127.0.0.1 "$SANDBOX_HTTP_PORT"     2>/dev/null && \
+       nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
+      ok "port-forward ready on 127.0.0.1:${SANDBOX_HTTP_PORT}/${SANDBOX_HTTPS_PORT}/${SANDBOX_REGISTRY_PORT}"
       return
     fi
     sleep 1
   done
-  warn "LaunchAgent loaded but :${SANDBOX_HTTPS_PORT}/:${SANDBOX_HTTP_PORT} did not bind within 30s"
+  warn "LaunchAgent loaded but one of :${SANDBOX_HTTP_PORT}/:${SANDBOX_HTTPS_PORT}/:${SANDBOX_REGISTRY_PORT} did not bind within 30s"
   warn "last lines of ${SANDBOX_PF_LOG}:"
   tail -5 "$SANDBOX_PF_LOG" 2>&1 | sed 's/^/    /' >&2
+  warn "last lines of ${SANDBOX_REGISTRY_PF_LOG}:"
+  tail -5 "$SANDBOX_REGISTRY_PF_LOG" 2>&1 | sed 's/^/    /' >&2
   die "port-forward failed to bind — fix the cause above and run 'sandboxctl restart'"
+}
+
+write_registry_portfwd_plist() {
+  local kubectl_path
+  kubectl_path="$(command -v kubectl)" || die "kubectl not found on PATH"
+  mkdir -p "$SANDBOX_LAUNCHAGENT_DIR" "$SANDBOX_STATE_DIR"
+  cat > "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${kubectl_path}</string>
+    <string>--context</string><string>$(kctx)</string>
+    <string>port-forward</string>
+    <string>--address</string><string>127.0.0.1</string>
+    <string>-n</string><string>${REGISTRY_NS}</string>
+    <string>svc/registry</string>
+    <string>${SANDBOX_REGISTRY_PORT}:5000</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>${SANDBOX_REGISTRY_PF_LOG}</string>
+  <key>StandardErrorPath</key><string>${SANDBOX_REGISTRY_PF_LOG}</string>
+</dict>
+</plist>
+EOF
 }
 
 # ============================================================================
@@ -989,6 +1136,7 @@ cmd_up() {
   clean_legacy_state
   install_argocd
   install_kargo
+  install_registry
   install_demo_app
   install_kagent
   install_istio_ambient
@@ -1024,6 +1172,7 @@ cmd_down() {
 
   log "tearing down sandbox '$CLUSTER_NAME'"
   uninstall_portfwd
+  uninstall_registry_portfwd
   clean_legacy_state
 
   if cluster_registered; then
@@ -1100,6 +1249,7 @@ cmd_status() {
   workload_summary "$CERT_MANAGER_NS"  "cert-mgr"
   workload_summary "$ARGOCD_NS"        "argocd"
   workload_summary "$KARGO_NS"         "kargo"
+  workload_summary "$REGISTRY_NS"      "registry"
   workload_summary "$DEMO_NS"          "demo-app"
   workload_summary "$KAGENT_NS"        "kagent"
   echo
@@ -1108,6 +1258,7 @@ cmd_status() {
   printf '  %-12s https://%s:%s\n' "kargo"    "$KARGO_HOST"  "$SANDBOX_HTTPS_PORT"
   printf '  %-12s https://%s:%s\n' "demo-app" "$DEMO_HOST"   "$SANDBOX_HTTPS_PORT"
   printf '  %-12s https://%s:%s\n' "kagent"   "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  printf '  %-12s localhost:%s    (push: docker push localhost:%s/<image>:<tag>)\n' "registry" "$SANDBOX_REGISTRY_PORT" "$SANDBOX_REGISTRY_PORT"
 }
 
 # ----- Creds -----
@@ -1176,6 +1327,98 @@ cmd_kargo_ui() {
   echo "password: ${KARGO_ADMIN_PASSWORD:-<run 'sandboxctl up' to generate>}"
 }
 
+# ----- Build + push (registry) -----
+
+# Pick a builder: docker if available (typical), else `podman build`.
+# Returns the command to invoke as a single string suitable for splitting
+# into argv.
+detect_builder() {
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo docker
+  elif command -v podman >/dev/null 2>&1; then
+    echo podman
+  else
+    die "neither docker nor podman is available — install one to build images"
+  fi
+}
+
+# slugify an arbitrary path component into a docker-image-name-safe form.
+slugify() {
+  printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//'
+}
+
+cmd_build() {
+  # Walks down from the path argument (or cwd), finds Dockerfiles, builds
+  # each, tags as localhost:<port>/<dirname>:<tag>, pushes to the in-cluster
+  # registry. The image reference works identically inside the cluster.
+  local target="${1:-.}" tag="${2:-latest}" builder
+  builder="$(detect_builder)"
+
+  if ! nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
+    die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
+  fi
+
+  log "scanning ${target} for Dockerfiles (excluding node_modules / vendor / dist / .git)"
+  local dockerfiles=()
+  while IFS= read -r df; do
+    dockerfiles+=("$df")
+  done < <(
+    find "$target" -type f -name Dockerfile \
+      -not -path '*/node_modules/*' \
+      -not -path '*/vendor/*' \
+      -not -path '*/dist/*' \
+      -not -path '*/.git/*' 2>/dev/null
+  )
+  if [[ ${#dockerfiles[@]} -eq 0 ]]; then
+    die "no Dockerfile found under '${target}'"
+  fi
+  log "found ${#dockerfiles[@]} Dockerfile(s)"
+
+  local df ctx name image
+  for df in "${dockerfiles[@]}"; do
+    ctx="$(dirname "$df")"
+    name="$(slugify "$(basename "$(cd "$ctx" && pwd)")")"
+    [[ -n "$name" ]] || name="image"
+    image="localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
+    log "building ${image}  (context: ${ctx})"
+    "$builder" build -t "$image" -f "$df" "$ctx"
+    log "pushing ${image}"
+    "$builder" push "$image"
+    ok "${image}"
+  done
+
+  echo
+  echo "Use these images in your Deployments:"
+  for df in "${dockerfiles[@]}"; do
+    name="$(slugify "$(basename "$(cd "$(dirname "$df")" && pwd)")")"
+    [[ -n "$name" ]] || name="image"
+    echo "  image: localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
+  done
+}
+
+cmd_images() {
+  # List images in the in-cluster registry via its /v2 API.
+  if ! nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
+    die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
+  fi
+  local catalog
+  catalog="$(curl -s --max-time 5 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/_catalog" 2>/dev/null || echo '{}')"
+  local repos
+  repos="$(echo "$catalog" | python3 -c 'import sys, json; d=json.load(sys.stdin); print(" ".join(d.get("repositories", [])))' 2>/dev/null || echo "")"
+  if [[ -z "$repos" ]]; then
+    echo "no images pushed yet — try: sandboxctl build"
+    return 0
+  fi
+  printf '%-40s  %s\n' "IMAGE" "TAGS"
+  local repo tags_json
+  for repo in $repos; do
+    tags_json="$(curl -s --max-time 5 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/tags/list" 2>/dev/null || echo '{}')"
+    local tags
+    tags="$(echo "$tags_json" | python3 -c 'import sys, json; d=json.load(sys.stdin); print(", ".join(d.get("tags") or []))' 2>/dev/null || echo "")"
+    printf '%-40s  %s\n' "$repo" "${tags:-<none>}"
+  done
+}
+
 # ============================================================================
 # Usage + dispatcher
 # ============================================================================
@@ -1197,6 +1440,8 @@ usage:
   sandbox.sh creds          print login details (URLs + admin creds)
   sandbox.sh argocd-ui      print Argo CD URL + admin creds
   sandbox.sh kargo-ui       print Kargo URL + admin creds
+  sandbox.sh build [path]   find Dockerfiles under <path>, build + push to the cluster registry
+  sandbox.sh images         list images in the cluster registry
 
 env overrides:
   SANDBOX_RUNTIME             podman (default) or docker
@@ -1204,6 +1449,8 @@ env overrides:
   SANDBOX_DOMAIN              local DNS suffix (default: sandbox.app)
   SANDBOX_HTTP_PORT           host port for HTTP (default: 8080)
   SANDBOX_HTTPS_PORT          host port for HTTPS (default: 8443)
+  SANDBOX_REGISTRY_PORT       host port for the in-cluster registry (default: 5001)
+  SANDBOX_REGISTRY_STORAGE    PVC size for the registry (default: 5Gi)
   PODMAN_MACHINE_CPUS         CPUs for podman machine init (default: 4)
   PODMAN_MACHINE_MEMORY_MIB   RAM in MiB for podman machine (default: 6144)
   PODMAN_MACHINE_DISK_GIB     disk in GiB for podman machine init (default: 60)
@@ -1233,6 +1480,8 @@ main() {
     creds)              cmd_creds ;;
     argocd-ui)          cmd_argocd_ui ;;
     kargo-ui)           cmd_kargo_ui ;;
+    build)              shift; cmd_build "$@" ;;
+    images)             cmd_images ;;
     ""|-h|--help|help)  usage ;;
     *) die "unknown subcommand: $1 (try --help)" ;;
   esac
