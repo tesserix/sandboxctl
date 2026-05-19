@@ -1590,7 +1590,7 @@ main() {
     argocd-ui)          cmd_argocd_ui ;;
     kargo-ui)           cmd_kargo_ui ;;
     build)              shift; cmd_build "$@" ;;
-    images)             cmd_images ;;
+    images)             shift; cmd_images "$@" ;;
     ""|-h|--help|help)  usage ;;
     *) die "unknown subcommand: $1 (try --help)" ;;
   esac
