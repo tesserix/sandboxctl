@@ -31,9 +31,12 @@ CERT_MANAGER_CHART_VERSION="${CERT_MANAGER_CHART_VERSION:-v1.16.2}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.29.2}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.35.0}"
 
-# kagent: agentic-AI controller + UI. Defaults to Ollama on the Mac
-# (host.docker.internal:11434) so no cloud API key is needed; user just
-# needs `brew install ollama && ollama serve && ollama pull llama3.2`.
+# kagent: agentic-AI controller + UI. The chart's default LLM provider is
+# Ollama at host.docker.internal:11434. sandboxctl does NOT install Ollama
+# itself — the kagent UI is reachable either way; if the user wants the
+# agents to actually invoke an LLM, they install Ollama locally
+# (`brew install ollama && ollama serve && ollama pull llama3.2`) or set
+# KAGENT_OLLAMA_HOST to a remote endpoint.
 KAGENT_NS="${KAGENT_NS:-kagent}"
 KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
 KAGENT_OLLAMA_HOST="${KAGENT_OLLAMA_HOST:-host.docker.internal:11434}"
@@ -425,12 +428,13 @@ EOF
 }
 
 install_kagent() {
-  # kagent — agentic AI controller + UI. Defaults to Ollama as the LLM
-  # provider so the install is self-contained: no cloud API key required.
-  # ensure_ollama makes sure Ollama is installed, running, and has the
-  # model pulled before we install kagent itself.
-  ensure_ollama
-
+  # kagent — agentic AI controller + UI. The chart configures the Ollama
+  # provider by default, but sandboxctl deliberately does NOT install or
+  # start Ollama on the user's Mac. The kagent UI comes up healthy
+  # regardless; if the user wants the agents to actually invoke an LLM,
+  # they install Ollama themselves (`brew install ollama && ollama serve
+  # && ollama pull llama3.2`) or set KAGENT_OLLAMA_HOST to a remote
+  # endpoint.
   log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — provider: Ollama at ${KAGENT_OLLAMA_HOST}"
 
   # CRDs ship as a separate chart and must land before the main chart.
@@ -450,120 +454,6 @@ install_kagent() {
   kc -n "$KAGENT_NS" wait --for=condition=ready --timeout=180s \
     pod -l app.kubernetes.io/component=ui >/dev/null
   ok "kagent ready (UI: https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT})"
-}
-
-# ----- Ollama lifecycle helpers (Mac-side) -----
-
-ollama_reachable() {
-  # The kagent pod talks to host.docker.internal:11434 (= Mac's :11434).
-  # Reachability from the Mac is a reliable proxy for the pod path.
-  curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1
-}
-
-ollama_running_via_brew() {
-  command -v brew >/dev/null 2>&1 || return 1
-  brew services list 2>/dev/null | awk '$1=="ollama" {print $2}' | grep -qx started
-}
-
-ollama_has_model() {
-  curl -s --max-time 3 http://127.0.0.1:11434/api/tags 2>/dev/null \
-    | grep -q "\"$KAGENT_OLLAMA_MODEL\""
-}
-
-ensure_ollama() {
-  # Idempotent: install if missing, start if not running, pull model if
-  # absent. Skip cleanly when each step is already done — re-running `up`
-  # shouldn't reinstall, restart, or re-pull.
-  if [[ "${KAGENT_OLLAMA_HOST}" != host.docker.internal:* ]] && \
-     [[ "${KAGENT_OLLAMA_HOST}" != localhost:* ]] && \
-     [[ "${KAGENT_OLLAMA_HOST}" != 127.0.0.1:* ]]; then
-    # User pointed kagent at a remote Ollama — don't try to manage it.
-    log "kagent uses a remote Ollama (${KAGENT_OLLAMA_HOST}); skipping local Ollama setup"
-    return 0
-  fi
-
-  if ! command -v ollama >/dev/null 2>&1; then
-    command -v brew >/dev/null 2>&1 || die "ollama not installed and brew is unavailable"
-    log "installing ollama via brew (one-time, ~few hundred MB)"
-    brew install ollama
-  fi
-
-  if ! ollama_reachable; then
-    log "starting ollama as a brew service (binds 127.0.0.1:11434, persists across reboots)"
-    brew services start ollama >/dev/null
-    # Wait briefly for it to bind.
-    local i
-    for ((i=1; i<=15; i++)); do
-      ollama_reachable && break
-      sleep 1
-    done
-    ollama_reachable || die "ollama service started but isn't responding on :11434 — try 'brew services list'"
-  elif ! ollama_running_via_brew; then
-    log "ollama is reachable on :11434 but not via brew services — leaving the running instance alone"
-  fi
-
-  if ! ollama_has_model; then
-    log "pulling LLM model '${KAGENT_OLLAMA_MODEL}' (~2 GB on first run; cached for next time)"
-    ollama pull "$KAGENT_OLLAMA_MODEL"
-  fi
-
-  ok "ollama ready (model: ${KAGENT_OLLAMA_MODEL})"
-}
-
-uninstall_ollama_service() {
-  # Stop the brew-managed Ollama service if `up` started it. Leaves the
-  # binary + model cache alone — those are general dev tools, not ours
-  # to remove on a routine `down`. `purge` removes them.
-  if command -v brew >/dev/null 2>&1 && ollama_running_via_brew; then
-    log "stopping ollama brew service"
-    brew services stop ollama >/dev/null 2>&1 || true
-  fi
-}
-
-purge_ollama() {
-  # Full removal: stop service, delete the pulled model from the cache,
-  # uninstall the brew formula. Called only from `purge`.
-  uninstall_ollama_service
-  if command -v ollama >/dev/null 2>&1; then
-    if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -q "^${KAGENT_OLLAMA_MODEL}"; then
-      log "removing ollama model '${KAGENT_OLLAMA_MODEL}'"
-      ollama rm "$KAGENT_OLLAMA_MODEL" >/dev/null 2>&1 || true
-    fi
-  fi
-  if command -v brew >/dev/null 2>&1 && brew list --formula 2>/dev/null | grep -qx ollama; then
-    log "uninstalling ollama brew formula"
-    brew uninstall ollama >/dev/null 2>&1 || true
-  fi
-}
-
-# ----- Dev CLIs (claude + codex) -----
-
-ensure_dev_clis() {
-  # claude (Claude Code) and codex (OpenAI Codex CLI) are useful agentic
-  # CLIs that pair well with the kagent demo. Install if missing; skip
-  # silently if already present. Authentication is per-user (API key or
-  # interactive login) — we don't manage that here; we just print a hint
-  # at the end of `up`.
-  command -v brew >/dev/null 2>&1 || { warn "brew unavailable — skipping claude + codex install"; return 0; }
-
-  ensure_node    # claude is npm-only; codex prefers brew but we keep node available either way
-
-  if ! command -v claude >/dev/null 2>&1; then
-    log "installing Claude Code via npm (one-time)"
-    npm install -g @anthropic-ai/claude-code >/dev/null
-  fi
-  if ! command -v codex >/dev/null 2>&1; then
-    log "installing Codex via brew (one-time)"
-    brew install --cask codex >/dev/null
-  fi
-
-  ok "dev CLIs ready: claude=$(command -v claude || echo missing), codex=$(command -v codex || echo missing)"
-}
-
-ensure_node() {
-  if command -v node >/dev/null 2>&1; then return 0; fi
-  log "installing Node.js via brew (required by claude)"
-  brew install node >/dev/null
 }
 
 helm_istio() {
@@ -754,10 +644,12 @@ uninstall_portfwd() {
 
 # port_listener_pid prints the PID listening on TCP 127.0.0.1:<port> on the
 # Mac, or empty if nothing is bound there. Uses lsof which is always present
-# on macOS.
+# on macOS. The trailing `|| true` is critical: lsof exits 1 when no socket
+# matches, which under `set -o pipefail` propagates through `| head -1` and
+# would kill the script via `set -e` at the next assignment site.
 port_listener_pid() {
   local port="$1"
-  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
 }
 
 # Best-effort identity check — is the process bound to $1 something we can
@@ -1143,11 +1035,9 @@ cmd_down() {
 
   uninstall_hosts
   untrust_root_ca
-  uninstall_ollama_service
 
-  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, root CA trust, ollama service removed)"
-  echo "Preserved: ${SANDBOX_STATE_DIR} (logs/state), ollama formula + model cache."
-  echo "Use 'sandboxctl purge' to also remove the state dir, ollama, and the cached model."
+  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, root CA trust removed)"
+  echo "Preserved: ${SANDBOX_STATE_DIR} (logs/state) — use 'sandboxctl purge' to also remove it."
   echo "Leaves alone: kindest/node image cache, podman machine."
 }
 
@@ -1155,7 +1045,6 @@ cmd_purge() {
   cat <<EOF
 This will do everything 'sandboxctl down' does, plus:
   • remove ${SANDBOX_STATE_DIR}
-  • remove the ollama brew formula and the '${KAGENT_OLLAMA_MODEL}' model cache
 
 EOF
   if [[ "${SANDBOX_PURGE_ASSUME_YES:-}" != "1" ]]; then
@@ -1167,7 +1056,6 @@ EOF
     esac
   fi
   cmd_down
-  purge_ollama
   if [[ -d "$SANDBOX_STATE_DIR" ]]; then
     log "removing $SANDBOX_STATE_DIR"
     rm -rf "$SANDBOX_STATE_DIR"
@@ -1260,9 +1148,13 @@ Demo app
 
 kagent
   URL:       https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT}
-  LLM:       Ollama at ${KAGENT_OLLAMA_HOST} (model: ${KAGENT_OLLAMA_MODEL})
-  Note:      run \`brew install ollama && ollama serve && ollama pull ${KAGENT_OLLAMA_MODEL}\`
-             on the Mac for the agents to actually answer queries.
+  LLM:       configured for Ollama at ${KAGENT_OLLAMA_HOST} (model: ${KAGENT_OLLAMA_MODEL})
+  Note:      kagent is installed but not wired to a live LLM by default.
+             To make agents answer queries, install Ollama yourself:
+               brew install ollama
+               ollama serve &
+               ollama pull ${KAGENT_OLLAMA_MODEL}
+             or set KAGENT_OLLAMA_HOST to a remote endpoint and re-run 'sandboxctl up'.
 
 kubectl context: $(kctx)
 EOF
