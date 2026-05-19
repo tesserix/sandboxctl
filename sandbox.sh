@@ -304,6 +304,32 @@ bring_up_cluster() {
   fi
   log "creating kind cluster '$CLUSTER_NAME'"
   kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$KIND_CONFIG"
+  configure_node_registry_mirror
+}
+
+configure_node_registry_mirror() {
+  # Tell containerd inside each kind node to forward `localhost:5050/*`
+  # pulls to the in-cluster registry Service. Uses the modern hosts.toml
+  # mechanism — the legacy containerdConfigPatches `mirrors` block in
+  # kind-config.yaml is incompatible with containerd v2.x (which
+  # kindest/node:v1.35.0 ships) and breaks the CRI plugin.
+  local nodes node host_dir
+  nodes="$("$SANDBOX_RUNTIME" ps --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME" --format '{{.Names}}')"
+  [[ -n "$nodes" ]] || { warn "no kind nodes found to configure registry mirror"; return 0; }
+
+  log "configuring containerd registry mirror localhost:${SANDBOX_REGISTRY_PORT} → in-cluster registry"
+  host_dir="/etc/containerd/certs.d/localhost:${SANDBOX_REGISTRY_PORT}"
+  for node in $nodes; do
+    "$SANDBOX_RUNTIME" exec "$node" mkdir -p "$host_dir"
+    "$SANDBOX_RUNTIME" exec "$node" sh -c "cat > '$host_dir/hosts.toml'" <<EOF
+server = "https://registry-1.docker.io"
+
+[host."http://registry.${REGISTRY_NS}.svc.cluster.local:5000"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true
+EOF
+  done
+  ok "registry mirror configured on $(echo "$nodes" | wc -w | tr -d ' ') node(s)"
 }
 
 install_cert_manager() {

@@ -4,13 +4,13 @@ apiVersion: kind.x-k8s.io/v1alpha4
 # by the LaunchAgent installed in `up`), not by kind extraPortMappings.
 # That avoids the rootful-podman + gvproxy pitfall where extraPortMappings
 # get bound inside the podman VM but never published to the Mac.
+#
+# Registry mirroring (localhost:5050 → in-cluster registry Service) is
+# wired by sandbox.sh's configure_node_registry_mirror function, which
+# writes a hosts.toml file inside each kind node post-create. The legacy
+# containerdConfigPatches `mirrors` block is incompatible with
+# containerd v2 (which kindest/node:v1.35.0 ships) — it causes the CRI
+# plugin to fail to load with "mirrors cannot be set when config_path
+# is provided", which in turn breaks kubelet startup.
 nodes:
   - role: control-plane
-# Forward in-cluster pulls of `localhost:5050/<image>` to the in-cluster
-# registry Service. The Mac pushes via a separate kubectl port-forward to
-# the same Service on host port 5050, so the image reference is identical
-# from both sides. Default chosen to avoid Docker Desktop's :5001.
-containerdConfigPatches:
-  - |-
-    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5050"]
-      endpoint = ["http://registry.sandboxctl-registry.svc.cluster.local:5000"]
