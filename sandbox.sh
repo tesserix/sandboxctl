@@ -1114,6 +1114,12 @@ install_registry_proxy() {
   # socat container on the kind network: host:$SANDBOX_REGISTRY_PORT →
   # kind-node:30050. Persistent TCP — handles Docker's parallel layer
   # uploads, which kubectl port-forward stalls.
+  #
+  # Cleanup any stale container left over from a previous machine
+  # session. Without this, `podman run` would refuse with "container
+  # name already in use" the second time `up` runs.
+  "$SANDBOX_RUNTIME" rm -f "$SANDBOX_REGISTRY_PROXY_CONTAINER" >/dev/null 2>&1 || true
+
   local node_ip
   node_ip="$("$SANDBOX_RUNTIME" inspect "${CLUSTER_NAME}-control-plane" \
     --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
@@ -1139,6 +1145,37 @@ install_registry_proxy() {
   warn "registry proxy container started but :${SANDBOX_REGISTRY_PORT} not reachable after 15s"
   "$SANDBOX_RUNTIME" logs --tail=10 "$SANDBOX_REGISTRY_PROXY_CONTAINER" 2>&1 | sed 's/^/    /' >&2
   die "registry proxy failed to forward — check 'podman logs ${SANDBOX_REGISTRY_PROXY_CONTAINER}'"
+}
+
+# Make sure `localhost:$SANDBOX_REGISTRY_PORT` is push-reachable from
+# the Mac. This fails on a fresh `up` only if the registry pod itself
+# isn't ready yet — but on every subsequent run it can fail because
+# the host-side proxy container (socat on the kind network) was
+# stopped or removed (machine reboot, podman machine restart, prior
+# `down` left it dead).
+#
+# Self-heal: if the cluster is up + the registry pod is running but
+# the proxy container isn't reachable, restart it. Only `die` if
+# something more fundamental is broken.
+_ensure_registry_reachable() {
+  if nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
+    return 0
+  fi
+
+  if ! cluster_registered || ! cluster_api_reachable; then
+    die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
+  fi
+
+  if ! kc -n "$REGISTRY_NS" get deploy registry >/dev/null 2>&1; then
+    die "in-cluster registry not installed — run 'sandboxctl up' to provision it"
+  fi
+
+  log "registry reachable check failed — (re)starting host-side proxy container"
+  install_registry_proxy
+
+  if ! nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
+    die "registry still not reachable on localhost:${SANDBOX_REGISTRY_PORT} after starting the proxy — see 'podman logs ${SANDBOX_REGISTRY_PROXY_CONTAINER}'"
+  fi
 }
 
 # ============================================================================
@@ -1491,11 +1528,22 @@ EOF
   done
   target="${target:-.}"
 
+  # Print a final status panel even if bootstrap aborts midway. Users
+  # reported that earlier failures left them with no signal about what
+  # was up vs. broken — the panel mirrors what `up` and `deploy` print
+  # at success so they can either recover or re-run.
+  trap '_bootstrap_failure_panel' ERR
+
   # Bring the platform up only if it isn't already. This is what makes
   # bootstrap safe to re-run as a "redeploy my app" shortcut — no
   # 5-minute helm dance on every invocation.
   if cluster_registered && cluster_api_reachable; then
     log "cluster '${CLUSTER_NAME}' is already up — skipping platform install"
+    # The cluster being up doesn't guarantee the host-side registry
+    # proxy container is still alive — it can disappear after a
+    # machine reboot or a podman-machine restart. Heal it up-front so
+    # cmd_build below doesn't fail at the first push attempt.
+    _ensure_registry_reachable
   else
     log "bringing the sandbox platform up (first run takes ~5–8 min)"
     cmd_up "${up_args[@]}"
@@ -1505,6 +1553,32 @@ EOF
   # validating that <target> actually contains something deployable.
   log "deploying from product dir: ${target}"
   cmd_deploy "$target" "${deploy_args[@]}"
+
+  trap - ERR
+}
+
+# Loud failure panel for bootstrap — print what's up vs. what's broken
+# so the user can act, instead of leaving them with just an ERROR line
+# and no signal.
+_bootstrap_failure_panel() {
+  local rc=$?
+  trap - ERR
+  echo
+  warn "bootstrap aborted (exit ${rc}) — current state:"
+  echo
+  if cluster_registered && cluster_api_reachable; then
+    cmd_status 2>&1 | sed 's/^/  /' || true
+    echo
+    echo "  recover by re-running:"
+    echo "    sandboxctl bootstrap"
+  else
+    echo "  • kind cluster '${CLUSTER_NAME}': not running"
+    echo
+    echo "  recover by:"
+    echo "    sandboxctl up"
+    echo "    sandboxctl bootstrap   # then re-run the deploy half"
+  fi
+  exit "$rc"
 }
 
 cmd_down() {
@@ -1734,9 +1808,7 @@ cmd_build() {
   # aliases, deps). Otherwise auto-walk Dockerfiles.
   local target="${1:-.}" tag="${2:-latest}"
 
-  if ! nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
-    die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
-  fi
+  _ensure_registry_reachable
 
   local manifest=""
   for candidate in "${target}/sandboxctl.yaml" "${target}/sandboxctl.yml" "$(pwd)/sandboxctl.yaml"; do
@@ -1860,8 +1932,7 @@ cmd_images() {
 }
 
 registry_must_be_reachable() {
-  nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null || \
-    die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
+  _ensure_registry_reachable
 }
 
 registry_repos() {
