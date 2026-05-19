@@ -31,6 +31,14 @@ CERT_MANAGER_CHART_VERSION="${CERT_MANAGER_CHART_VERSION:-v1.16.2}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.29.2}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.35.0}"
 
+# kagent: agentic-AI controller + UI. Defaults to Ollama on the Mac
+# (host.docker.internal:11434) so no cloud API key is needed; user just
+# needs `brew install ollama && ollama serve && ollama pull llama3.2`.
+KAGENT_NS="${KAGENT_NS:-kagent}"
+KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
+KAGENT_OLLAMA_HOST="${KAGENT_OLLAMA_HOST:-host.docker.internal:11434}"
+KAGENT_OLLAMA_MODEL="${KAGENT_OLLAMA_MODEL:-llama3.2}"
+
 SANDBOX_DOMAIN="${SANDBOX_DOMAIN:-sandbox.app}"
 
 # Demo app source. Argo CD watches this repo + path and reconciles the
@@ -42,6 +50,7 @@ DEMO_APP_REPO_REVISION="${DEMO_APP_REPO_REVISION:-main}"
 ARGO_HOST="argo.${SANDBOX_DOMAIN}"
 KARGO_HOST="kargo.${SANDBOX_DOMAIN}"
 DEMO_HOST="demo-app.${SANDBOX_DOMAIN}"
+KAGENT_HOST="kagent.${SANDBOX_DOMAIN}"
 ROOT_CA_CN="${SANDBOX_DOMAIN} sandbox root CA"
 
 # Mac↔cluster routing: a LaunchAgent runs `kubectl port-forward` to the
@@ -415,6 +424,46 @@ EOF
   warn "current state: sync=${sync:-unknown} health=${health:-unknown}"
 }
 
+install_kagent() {
+  # kagent — agentic AI controller + UI. Defaults to Ollama as the LLM
+  # provider so the install is self-contained: no cloud API key required,
+  # just `ollama serve` running on the Mac. The pod reaches the host's
+  # Ollama via the kind/podman-injected `host.docker.internal` DNS name.
+  log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — provider: Ollama at ${KAGENT_OLLAMA_HOST}"
+
+  # CRDs ship as a separate chart and must land before the main chart.
+  helm upgrade --install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
+    --namespace "$KAGENT_NS" --create-namespace \
+    --version "$KAGENT_CHART_VERSION" \
+    --wait --timeout 5m
+
+  helm upgrade --install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
+    --namespace "$KAGENT_NS" \
+    --version "$KAGENT_CHART_VERSION" \
+    --set 'providers.default=ollama' \
+    --set "providers.ollama.model=${KAGENT_OLLAMA_MODEL}" \
+    --set "providers.ollama.config.host=${KAGENT_OLLAMA_HOST}" \
+    --wait --timeout 10m
+
+  # The pods are part of the controller chart; wait for the UI specifically.
+  kc -n "$KAGENT_NS" wait --for=condition=ready --timeout=180s \
+    pod -l app.kubernetes.io/component=ui >/dev/null
+  ok "kagent ready (UI: https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT})"
+
+  if ! ollama_reachable_from_host; then
+    warn "kagent's default LLM is Ollama at ${KAGENT_OLLAMA_HOST}, but it doesn't appear to be running on your Mac."
+    warn "Install + start it: 'brew install ollama && ollama serve' (in another terminal)"
+    warn "Pull the default model:                      'ollama pull ${KAGENT_OLLAMA_MODEL}'"
+    warn "Until then the UI is reachable but agents will fail to invoke the model."
+  fi
+}
+
+ollama_reachable_from_host() {
+  # The kagent pod talks to host.docker.internal:11434 (= Mac's :11434).
+  # We verify reachability from the Mac itself as a proxy for the pod path.
+  curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1
+}
+
 helm_istio() {
   # $1 release, $2 chart, rest passed verbatim to helm.
   local release="$1" chart="$2"; shift 2
@@ -514,6 +563,15 @@ spec:
   gateways: ["${ISTIO_INGRESS_NS}/sandbox-gateway"]
   http:
     - route: [{ destination: { host: demo-app.${DEMO_NS}.svc.cluster.local, port: { number: 80 } } }]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: { name: kagent, namespace: ${KAGENT_NS} }
+spec:
+  hosts: ["${KAGENT_HOST}"]
+  gateways: ["${ISTIO_INGRESS_NS}/sandbox-gateway"]
+  http:
+    - route: [{ destination: { host: kagent-ui.${KAGENT_NS}.svc.cluster.local, port: { number: 8080 } } }]
 EOF
   ok "routes applied"
 }
@@ -524,7 +582,7 @@ EOF
 
 hosts_line_present() {
   local h
-  for h in "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST"; do
+  for h in "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$KAGENT_HOST"; do
     grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${h}\b" /etc/hosts || return 1
   done
 }
@@ -532,7 +590,7 @@ hosts_line_present() {
 install_hosts() {
   log "configuring /etc/hosts entries for ${SANDBOX_DOMAIN}"
   if hosts_line_present; then
-    ok "/etc/hosts already maps ${ARGO_HOST}, ${KARGO_HOST}, ${DEMO_HOST} to 127.0.0.1"
+    ok "/etc/hosts already maps ${ARGO_HOST}, ${KARGO_HOST}, ${DEMO_HOST}, ${KAGENT_HOST} to 127.0.0.1"
     return
   fi
   prime_sudo
@@ -540,7 +598,7 @@ install_hosts() {
   # final `install` does.
   local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
   grep -v "${SANDBOX_HOSTS_MARKER}" /etc/hosts > "$tmp" || true
-  printf '127.0.0.1\t%s %s %s\t%s\n' "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
+  printf '127.0.0.1\t%s %s %s %s\t%s\n' "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$KAGENT_HOST" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
   sudo install -m 0644 "$tmp" /etc/hosts
   rm -f "$tmp"
   ok "/etc/hosts updated"
@@ -734,6 +792,7 @@ hosts:
   - ${ARGO_HOST}
   - ${KARGO_HOST}
   - ${DEMO_HOST}
+  - ${KAGENT_HOST}
 launch_agent: ${SANDBOX_LAUNCHAGENT_LABEL}
 created_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
@@ -746,7 +805,7 @@ EOF
 validate_urls() {
   log "validating URLs reachable from the Mac"
   local failed=0 host url code
-  for host in "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST"; do
+  for host in "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$KAGENT_HOST"; do
     url="https://${host}:${SANDBOX_HTTPS_PORT}/"
     # -k: curl's bundle doesn't know our local CA; the browser does after
     # trust_root_ca. Browsers send SNI from the URL host — curl too, since
@@ -858,6 +917,7 @@ cmd_up() {
   install_argocd
   install_kargo
   install_demo_app
+  install_kagent
   install_istio_ambient
   install_routes
   install_hosts
@@ -870,9 +930,10 @@ cmd_up() {
   cmd_status
   echo
   echo "next:"
-  printf '  open https://%s:%s\n' "$ARGO_HOST"  "$SANDBOX_HTTPS_PORT"
-  printf '  open https://%s:%s\n' "$KARGO_HOST" "$SANDBOX_HTTPS_PORT"
-  printf '  open https://%s:%s\n' "$DEMO_HOST"  "$SANDBOX_HTTPS_PORT"
+  printf '  open https://%s:%s\n' "$ARGO_HOST"   "$SANDBOX_HTTPS_PORT"
+  printf '  open https://%s:%s\n' "$KARGO_HOST"  "$SANDBOX_HTTPS_PORT"
+  printf '  open https://%s:%s\n' "$DEMO_HOST"   "$SANDBOX_HTTPS_PORT"
+  printf '  open https://%s:%s\n' "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
   echo "  sandboxctl creds   # full login details"
 }
 
@@ -967,11 +1028,13 @@ cmd_status() {
   workload_summary "$ARGOCD_NS"        "argocd"
   workload_summary "$KARGO_NS"         "kargo"
   workload_summary "$DEMO_NS"          "demo-app"
+  workload_summary "$KAGENT_NS"        "kagent"
   echo
   echo "apps & URLs:"
-  printf '  %-12s https://%s:%s\n' "argocd"   "$ARGO_HOST"  "$SANDBOX_HTTPS_PORT"
-  printf '  %-12s https://%s:%s\n' "kargo"    "$KARGO_HOST" "$SANDBOX_HTTPS_PORT"
-  printf '  %-12s https://%s:%s\n' "demo-app" "$DEMO_HOST"  "$SANDBOX_HTTPS_PORT"
+  printf '  %-12s https://%s:%s\n' "argocd"   "$ARGO_HOST"   "$SANDBOX_HTTPS_PORT"
+  printf '  %-12s https://%s:%s\n' "kargo"    "$KARGO_HOST"  "$SANDBOX_HTTPS_PORT"
+  printf '  %-12s https://%s:%s\n' "demo-app" "$DEMO_HOST"   "$SANDBOX_HTTPS_PORT"
+  printf '  %-12s https://%s:%s\n' "kagent"   "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
 }
 
 # ----- Creds -----
@@ -1009,6 +1072,12 @@ Kargo
 
 Demo app
   URL:       https://${DEMO_HOST}:${SANDBOX_HTTPS_PORT}
+
+kagent
+  URL:       https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT}
+  LLM:       Ollama at ${KAGENT_OLLAMA_HOST} (model: ${KAGENT_OLLAMA_MODEL})
+  Note:      run \`brew install ollama && ollama serve && ollama pull ${KAGENT_OLLAMA_MODEL}\`
+             on the Mac for the agents to actually answer queries.
 
 kubectl context: $(kctx)
 EOF
@@ -1066,6 +1135,9 @@ env overrides:
   KARGO_CHART_VERSION         pin kargo helm chart version
   CERT_MANAGER_CHART_VERSION  pin cert-manager chart version
   ISTIO_CHART_VERSION         pin istio version
+  KAGENT_CHART_VERSION        pin kagent helm chart version
+  KAGENT_OLLAMA_HOST          Ollama endpoint kagent connects to (default: host.docker.internal:11434)
+  KAGENT_OLLAMA_MODEL         model kagent will pull from Ollama (default: llama3.2)
   KARGO_TOKEN_SIGNING_KEY     pin Kargo JWT signing key (default: random per install)
 EOF
 }

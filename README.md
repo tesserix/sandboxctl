@@ -14,6 +14,7 @@ After `sandboxctl up`:
 | `https://argo.sandbox.app:8443` | Argo CD |
 | `https://kargo.sandbox.app:8443` | Kargo |
 | `https://demo-app.sandbox.app:8443` | a small demo deployment |
+| `https://kagent.sandbox.app:8443` | [kagent](https://github.com/kagent-dev/kagent) — agentic AI controller + UI |
 
 All three are served by an Istio gateway behind a wildcard cert that's
 trusted by macOS — no browser warnings, no manual port-forwards.
@@ -48,6 +49,22 @@ and never leaves it.
 `sandboxctl setup-podman` will install and configure podman for you if it's
 not yet ready (rootful mode, 6 GiB memory).
 
+### Optional: Ollama for kagent
+
+`kagent` ships with the sandbox and uses Ollama as its LLM provider by default,
+so no cloud API key is required. To make the kagent UI's queries actually
+work:
+
+```sh
+brew install ollama
+ollama serve &              # in a separate terminal
+ollama pull llama3.2        # one-time, ~2 GB
+```
+
+The kagent pod reaches your Mac's Ollama via `host.docker.internal:11434`.
+Override `KAGENT_OLLAMA_HOST` / `KAGENT_OLLAMA_MODEL` to point at a different
+endpoint or model.
+
 ## Install
 
 ```sh
@@ -77,7 +94,7 @@ sandboxctl creds     # login details for Argo CD and Kargo
 sandboxctl down      # tear it all down
 ```
 
-The first `up` will prompt for `sudo` once — it needs root to add three
+The first `up` will prompt for `sudo` once — it needs root to add four
 entries to `/etc/hosts` and trust the local root CA in the System keychain.
 After that it's silent on subsequent runs.
 
@@ -98,7 +115,8 @@ After that it's silent on subsequent runs.
    │       │                                       │
    │       ├── argocd-server (argocd ns)           │
    │       ├── kargo-api      (kargo ns)           │
-   │       └── demo-app       (demo-app ns)        │
+   │       ├── demo-app       (demo-app ns)        │
+   │       └── kagent-ui      (kagent ns)          │
    └───────────────────────────────────────────────┘
 ```
 
@@ -109,6 +127,8 @@ The pieces:
 - **Istio ambient** — `istio-base` + `istiod` + `istio-cni` + `ztunnel` +
   `istio/gateway`. The gateway serves TLS with the wildcard cert.
 - **Argo CD, Kargo, demo app** — installed via Helm into their own namespaces
+- **kagent** — agentic AI controller + UI (kagent-dev/kagent), defaults to
+  Ollama as the LLM provider so no cloud API key is needed
 - **macOS LaunchAgent** — runs `kubectl port-forward` so the gateway is
   reachable on `127.0.0.1:8443`. Survives reboots, auto-restarts on failure.
 - **State file** at `~/.sandboxctl/setup.yaml` records the live config
@@ -139,7 +159,7 @@ Everything is overridable via env vars. Defaults work for most people.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `SANDBOX_DOMAIN` | `sandbox.app` | DNS suffix for the three hostnames |
+| `SANDBOX_DOMAIN` | `sandbox.app` | DNS suffix for the four hostnames |
 | `SANDBOX_CLUSTER_NAME` | `sandboxctl` | kind cluster name |
 | `SANDBOX_HTTP_PORT` | `8080` | host HTTP port |
 | `SANDBOX_HTTPS_PORT` | `8443` | host HTTPS port |
@@ -151,6 +171,9 @@ Everything is overridable via env vars. Defaults work for most people.
 | `KARGO_CHART_VERSION` | `1.1.1` | kargo Helm chart version |
 | `CERT_MANAGER_CHART_VERSION` | `v1.16.2` | cert-manager chart version |
 | `ISTIO_CHART_VERSION` | `1.29.2` | Istio chart version |
+| `KAGENT_CHART_VERSION` | `0.9.4` | kagent chart version |
+| `KAGENT_OLLAMA_HOST` | `host.docker.internal:11434` | endpoint kagent talks to for the LLM |
+| `KAGENT_OLLAMA_MODEL` | `llama3.2` | Ollama model the agents use |
 
 ### Adding your own apps
 
