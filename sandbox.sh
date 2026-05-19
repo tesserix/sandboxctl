@@ -70,7 +70,7 @@ SANDBOX_HTTP_PORT="${SANDBOX_HTTP_PORT:-8080}"
 # containerd is configured (in kind-config.yaml) to forward
 # `localhost:5001` to the in-cluster Service.
 SANDBOX_REGISTRY_PORT="${SANDBOX_REGISTRY_PORT:-5001}"
-SANDBOX_REGISTRY_STORAGE="${SANDBOX_REGISTRY_STORAGE:-5Gi}"
+SANDBOX_REGISTRY_STORAGE="${SANDBOX_REGISTRY_STORAGE:-12Gi}"
 SANDBOX_STATE_DIR="${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}"
 SANDBOX_STATE_FILE="${SANDBOX_STATE_DIR}/setup.yaml"
 SANDBOX_LAUNCHAGENT_DIR="${SANDBOX_LAUNCHAGENT_DIR:-$HOME/Library/LaunchAgents}"
@@ -1397,26 +1397,132 @@ cmd_build() {
 }
 
 cmd_images() {
-  # List images in the in-cluster registry via its /v2 API.
-  if ! nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
+  # Subcommands:
+  #   sandboxctl images               list pushed images + tags
+  #   sandboxctl images rm <ref>      delete one ref (e.g. 'myapp:v1' or 'myapp')
+  #   sandboxctl images prune         delete every image, then GC blobs
+  #   sandboxctl images gc            run registry garbage-collector now
+  #                                   (reclaims disk after rm/prune)
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list|"")  registry_images_list ;;
+    rm)       [[ $# -ge 1 ]] || die "usage: sandboxctl images rm <image>[:tag]"
+              registry_images_rm "$1"; registry_images_gc ;;
+    prune)    registry_images_prune; registry_images_gc ;;
+    gc)       registry_images_gc ;;
+    *)        die "unknown 'images' subcommand: $sub (use list, rm, prune, gc)" ;;
+  esac
+}
+
+registry_must_be_reachable() {
+  nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null || \
     die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
-  fi
-  local catalog
-  catalog="$(curl -s --max-time 5 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/_catalog" 2>/dev/null || echo '{}')"
-  local repos
-  repos="$(echo "$catalog" | python3 -c 'import sys, json; d=json.load(sys.stdin); print(" ".join(d.get("repositories", [])))' 2>/dev/null || echo "")"
+}
+
+registry_repos() {
+  curl -s --max-time 5 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/_catalog" 2>/dev/null \
+    | python3 -c 'import sys, json; d=json.load(sys.stdin); print(" ".join(d.get("repositories") or []))' \
+      2>/dev/null || true
+}
+
+registry_tags() {
+  local repo="$1"
+  curl -s --max-time 5 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/tags/list" 2>/dev/null \
+    | python3 -c 'import sys, json; d=json.load(sys.stdin); print(" ".join(d.get("tags") or []))' \
+      2>/dev/null || true
+}
+
+registry_manifest_digest() {
+  # Fetch the Docker-Content-Digest header for <repo>:<tag>. Returns empty
+  # if not found.
+  local repo="$1" tag="$2"
+  curl -s -I --max-time 5 \
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/manifests/${tag}" \
+    2>/dev/null | awk -v IGNORECASE=1 '/^docker-content-digest:/ {print $2}' | tr -d '\r' | head -1 || true
+}
+
+registry_images_list() {
+  registry_must_be_reachable
+  local repos; repos="$(registry_repos)"
   if [[ -z "$repos" ]]; then
     echo "no images pushed yet — try: sandboxctl build"
     return 0
   fi
   printf '%-40s  %s\n' "IMAGE" "TAGS"
-  local repo tags_json
+  local repo
   for repo in $repos; do
-    tags_json="$(curl -s --max-time 5 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/tags/list" 2>/dev/null || echo '{}')"
-    local tags
-    tags="$(echo "$tags_json" | python3 -c 'import sys, json; d=json.load(sys.stdin); print(", ".join(d.get("tags") or []))' 2>/dev/null || echo "")"
+    local tags; tags="$(registry_tags "$repo")"
     printf '%-40s  %s\n' "$repo" "${tags:-<none>}"
   done
+}
+
+registry_images_rm() {
+  registry_must_be_reachable
+  local ref="$1" repo tag
+  if [[ "$ref" == *:* ]]; then
+    repo="${ref%:*}"; tag="${ref##*:}"
+  else
+    repo="$ref"; tag=""
+  fi
+
+  if [[ -n "$tag" ]]; then
+    log "deleting ${repo}:${tag}"
+    local digest; digest="$(registry_manifest_digest "$repo" "$tag")"
+    [[ -n "$digest" ]] || die "manifest not found for ${repo}:${tag}"
+    curl -s -X DELETE --max-time 5 \
+      "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/manifests/${digest}" >/dev/null
+    ok "deleted ${repo}:${tag} (digest ${digest:0:19}...)"
+  else
+    log "deleting all tags of ${repo}"
+    local tags; tags="$(registry_tags "$repo")"
+    [[ -n "$tags" ]] || { warn "no tags found for ${repo}"; return 0; }
+    local t
+    for t in $tags; do
+      registry_images_rm "${repo}:${t}"
+    done
+  fi
+}
+
+registry_images_prune() {
+  registry_must_be_reachable
+  local repos; repos="$(registry_repos)"
+  if [[ -z "$repos" ]]; then
+    ok "registry already empty"
+    return 0
+  fi
+  log "deleting all images (pruning the registry)"
+  local repo
+  for repo in $repos; do
+    registry_images_rm "$repo"
+  done
+}
+
+registry_images_gc() {
+  # DELETEing a manifest only marks blobs for GC; the on-disk space is
+  # reclaimed by running the registry's built-in garbage-collector inside
+  # the pod. We bounce the registry afterwards so it picks up the cleaned
+  # filesystem cleanly (otherwise the in-process tag cache can mask the
+  # change until the next restart).
+  require_running_cluster
+  local pod
+  pod="$(kc -n "$REGISTRY_NS" get pod -l app=registry \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [[ -n "$pod" ]] || die "no registry pod found in ${REGISTRY_NS}"
+
+  log "running garbage-collector inside the registry pod"
+  local before after
+  before="$(kc -n "$REGISTRY_NS" exec "$pod" -- du -sh /var/lib/registry 2>/dev/null | awk '{print $1}' || echo unknown)"
+  kc -n "$REGISTRY_NS" exec "$pod" -- \
+    registry garbage-collect -m /etc/docker/registry/config.yml 2>&1 | sed 's/^/    /'
+  after="$(kc -n "$REGISTRY_NS" exec "$pod" -- du -sh /var/lib/registry 2>/dev/null | awk '{print $1}' || echo unknown)"
+  ok "registry GC complete  (storage: ${before} → ${after})"
+
+  log "restarting the registry pod so it picks up the cleaned filesystem"
+  kc -n "$REGISTRY_NS" rollout restart deploy/registry >/dev/null
+  kc -n "$REGISTRY_NS" rollout status  deploy/registry --timeout=60s >/dev/null
+  ok "registry restarted"
 }
 
 # ============================================================================
@@ -1440,8 +1546,11 @@ usage:
   sandbox.sh creds          print login details (URLs + admin creds)
   sandbox.sh argocd-ui      print Argo CD URL + admin creds
   sandbox.sh kargo-ui       print Kargo URL + admin creds
-  sandbox.sh build [path]   find Dockerfiles under <path>, build + push to the cluster registry
-  sandbox.sh images         list images in the cluster registry
+  sandbox.sh build [path]            find Dockerfiles under <path>, build + push to the cluster registry
+  sandbox.sh images                  list images in the cluster registry
+  sandbox.sh images rm <ref>         delete an image (e.g. 'myapp:v1' or 'myapp' for all tags)
+  sandbox.sh images prune            delete every image, then GC blobs
+  sandbox.sh images gc               run registry garbage-collector to reclaim disk now
 
 env overrides:
   SANDBOX_RUNTIME             podman (default) or docker
@@ -1450,7 +1559,7 @@ env overrides:
   SANDBOX_HTTP_PORT           host port for HTTP (default: 8080)
   SANDBOX_HTTPS_PORT          host port for HTTPS (default: 8443)
   SANDBOX_REGISTRY_PORT       host port for the in-cluster registry (default: 5001)
-  SANDBOX_REGISTRY_STORAGE    PVC size for the registry (default: 5Gi)
+  SANDBOX_REGISTRY_STORAGE    PVC size for the registry (default: 12Gi)
   PODMAN_MACHINE_CPUS         CPUs for podman machine init (default: 4)
   PODMAN_MACHINE_MEMORY_MIB   RAM in MiB for podman machine (default: 6144)
   PODMAN_MACHINE_DISK_GIB     disk in GiB for podman machine init (default: 60)

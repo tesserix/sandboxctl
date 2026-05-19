@@ -44,7 +44,7 @@ var commands = []command{
 	{"argocd-ui", "print Argo CD URL + admin creds"},
 	{"kargo-ui", "print Kargo  URL + admin creds"},
 	{"build", "find Dockerfiles under [path] (default cwd), build + push to the cluster registry"},
-	{"images", "list images in the cluster registry"},
+	{"images", "list / rm <ref> / prune / gc — manage images in the cluster registry"},
 	{"tui", "live status dashboard (Bubble Tea)"},
 	{"version", "print sandboxctl version, commit, and build date"},
 }
