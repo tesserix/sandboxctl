@@ -77,10 +77,16 @@ SANDBOX_STATE_FILE="${SANDBOX_STATE_DIR}/setup.yaml"
 SANDBOX_LAUNCHAGENT_DIR="${SANDBOX_LAUNCHAGENT_DIR:-$HOME/Library/LaunchAgents}"
 SANDBOX_LAUNCHAGENT_LABEL="${SANDBOX_LAUNCHAGENT_LABEL:-io.github.sandboxctl.portfwd}"
 SANDBOX_LAUNCHAGENT_PLIST="${SANDBOX_LAUNCHAGENT_DIR}/${SANDBOX_LAUNCHAGENT_LABEL}.plist"
-SANDBOX_REGISTRY_LAUNCHAGENT_LABEL="${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL:-io.github.sandboxctl.registry-portfwd}"
-SANDBOX_REGISTRY_LAUNCHAGENT_PLIST="${SANDBOX_LAUNCHAGENT_DIR}/${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL}.plist"
 SANDBOX_PF_LOG="${SANDBOX_STATE_DIR}/portfwd.log"
-SANDBOX_REGISTRY_PF_LOG="${SANDBOX_STATE_DIR}/registry-portfwd.log"
+
+# Registry proxy — a socat container on the kind podman network that
+# forwards Mac:$SANDBOX_REGISTRY_PORT → kind-node:30050 → registry pod.
+# Replaces the previous kubectl port-forward, which couldn't keep up with
+# Docker's parallel layer uploads (16 concurrent streams stalled on
+# port-forward's stream serialisation).
+SANDBOX_REGISTRY_PROXY_CONTAINER="${SANDBOX_REGISTRY_PROXY_CONTAINER:-${CLUSTER_NAME}-registry-proxy}"
+SANDBOX_REGISTRY_PROXY_IMAGE="${SANDBOX_REGISTRY_PROXY_IMAGE:-docker.io/alpine/socat:latest}"
+SANDBOX_REGISTRY_NODEPORT="${SANDBOX_REGISTRY_NODEPORT:-30050}"
 SANDBOX_HOSTS_MARKER="# managed by sandboxctl (${SANDBOX_DOMAIN})"
 SANDBOX_SECRETS_FILE="${SANDBOX_STATE_DIR}/secrets.env"
 
@@ -502,9 +508,13 @@ metadata:
   name: registry
   namespace: ${REGISTRY_NS}
 spec:
+  type: NodePort
   selector: { app: registry }
   ports:
-    - { name: http, port: 5000, targetPort: http }
+    # nodePort fixed so the side-car socat proxy in install_registry_proxy
+    # can target a stable kind-node:port. Picked 30050 to keep symmetry
+    # with the host-side default 5050.
+    - { name: http, port: 5000, targetPort: http, nodePort: 30050 }
 ---
 # Tilt / Skaffold / etc. read this ConfigMap to discover the registry.
 # https://github.com/kubernetes/enhancements/tree/master/keps/sig-cluster-lifecycle/generic/1755-communicating-a-local-registry
@@ -741,11 +751,21 @@ uninstall_portfwd() {
 }
 
 uninstall_registry_portfwd() {
-  if [[ -f "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" ]]; then
-    log "unloading + removing LaunchAgent ${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL}"
-    launchctl unload "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" >/dev/null 2>&1 || true
-    rm -f "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST"
+  # Tear down both: the new socat proxy container and any leftover
+  # LaunchAgent / kubectl port-forward from older sandboxctl versions.
+  if "$SANDBOX_RUNTIME" inspect "$SANDBOX_REGISTRY_PROXY_CONTAINER" >/dev/null 2>&1; then
+    log "removing registry proxy container ${SANDBOX_REGISTRY_PROXY_CONTAINER}"
+    "$SANDBOX_RUNTIME" rm -f "$SANDBOX_REGISTRY_PROXY_CONTAINER" >/dev/null 2>&1 || true
   fi
+  # Legacy registry-portfwd LaunchAgent (v1.3.0 / v1.3.1) — still installed
+  # on machines that upgraded mid-stream.
+  local legacy_plist="${SANDBOX_LAUNCHAGENT_DIR}/io.github.sandboxctl.registry-portfwd.plist"
+  if [[ -f "$legacy_plist" ]]; then
+    log "removing legacy registry LaunchAgent"
+    launchctl unload "$legacy_plist" >/dev/null 2>&1 || true
+    rm -f "$legacy_plist"
+  fi
+  launchctl remove io.github.sandboxctl.registry-portfwd >/dev/null 2>&1 || true
   pkill -f "port-forward.*svc/registry" >/dev/null 2>&1 || true
 }
 
@@ -761,8 +781,8 @@ port_listener_pid() {
 
 # Best-effort identity check — is the process bound to $1 something we can
 # safely kill (i.e. a sandboxctl-owned kubectl port-forward), vs a foreign
-# process we should refuse to touch? Matches both the istio-ingress and the
-# registry port-forwards.
+# process we should refuse to touch? The legacy registry port-forward
+# pattern is also recognised so v1.3.0/1 leftovers get cleaned up cleanly.
 port_listener_is_ours() {
   local port="$1" pid cmdline
   pid="$(port_listener_pid "$port")"
@@ -773,13 +793,25 @@ port_listener_is_ours() {
 }
 
 free_port_or_die() {
-  # Make sure $SANDBOX_HTTPS_PORT, $SANDBOX_HTTP_PORT, and the registry port
-  # are bindable. If they're held by a previous sandboxctl, kill it and
-  # retry. If they're held by a foreign process, fail with a clear,
-  # actionable error.
+  # Make sure $SANDBOX_HTTPS_PORT, $SANDBOX_HTTP_PORT are bindable. The
+  # registry port is owned by a podman socat container — uninstall_registry_portfwd
+  # already removed it before we got here.
   _check_port_or_die HTTP     "$SANDBOX_HTTP_PORT"
   _check_port_or_die HTTPS    "$SANDBOX_HTTPS_PORT"
-  _check_port_or_die REGISTRY "$SANDBOX_REGISTRY_PORT"
+  _check_registry_port_or_die "$SANDBOX_REGISTRY_PORT"
+}
+
+_check_registry_port_or_die() {
+  # If something is holding the registry port after uninstall_registry_portfwd,
+  # it's foreign. Fail with a clear message.
+  local port="$1" pid cmdline
+  pid="$(port_listener_pid "$port")"
+  [[ -z "$pid" ]] && return 0
+  cmdline="$(ps -p "$pid" -o command= 2>/dev/null || echo unknown)"
+  local alt_port=$(( port + 100 ))
+  die "REGISTRY port :${port} is in use by an unrelated process (pid ${pid}: ${cmdline}).
+       Either stop that process, or pick a different port and re-run.
+       Example:  SANDBOX_REGISTRY_PORT=${alt_port} sandboxctl up"
 }
 
 _check_port_or_die() {
@@ -846,62 +878,58 @@ install_portfwd() {
   uninstall_registry_portfwd
   free_port_or_die        # fail fast on foreign conflicts; clean up our own stale state
   write_portfwd_plist
-  write_registry_portfwd_plist
   launchctl load "$SANDBOX_LAUNCHAGENT_PLIST" || \
     die "launchctl load failed for ${SANDBOX_LAUNCHAGENT_PLIST} — check the file then 'sandboxctl restart'"
-  launchctl load "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" || \
-    die "launchctl load failed for ${SANDBOX_REGISTRY_LAUNCHAGENT_PLIST} — check the file then 'sandboxctl restart'"
 
-  # Wait for all three ports to bind. If any doesn't come up in 30s, fail
-  # loudly: silently returning without a port-forward leaves the user with
-  # a healthy cluster but no Mac→cluster path, and the failure is invisible
-  # until they try a URL or `docker push`.
+  # Wait for both UI ports to bind. The registry port is wired separately
+  # via install_registry_proxy (a socat container) because kubectl
+  # port-forward chokes on Docker's parallel layer uploads.
   local i
   for ((i=1; i<=30; i++)); do
-    if nc -z 127.0.0.1 "$SANDBOX_HTTPS_PORT"    2>/dev/null && \
-       nc -z 127.0.0.1 "$SANDBOX_HTTP_PORT"     2>/dev/null && \
-       nc -z 127.0.0.1 "$SANDBOX_REGISTRY_PORT" 2>/dev/null; then
-      ok "port-forward ready on 127.0.0.1:${SANDBOX_HTTP_PORT}/${SANDBOX_HTTPS_PORT}/${SANDBOX_REGISTRY_PORT}"
+    if nc -z 127.0.0.1 "$SANDBOX_HTTPS_PORT" 2>/dev/null && \
+       nc -z 127.0.0.1 "$SANDBOX_HTTP_PORT"  2>/dev/null; then
+      ok "port-forward ready on 127.0.0.1:${SANDBOX_HTTP_PORT}/${SANDBOX_HTTPS_PORT}"
+      install_registry_proxy
       return
     fi
     sleep 1
   done
-  warn "LaunchAgent loaded but one of :${SANDBOX_HTTP_PORT}/:${SANDBOX_HTTPS_PORT}/:${SANDBOX_REGISTRY_PORT} did not bind within 30s"
+  warn "LaunchAgent loaded but :${SANDBOX_HTTP_PORT}/:${SANDBOX_HTTPS_PORT} did not bind within 30s"
   warn "last lines of ${SANDBOX_PF_LOG}:"
   tail -5 "$SANDBOX_PF_LOG" 2>&1 | sed 's/^/    /' >&2
-  warn "last lines of ${SANDBOX_REGISTRY_PF_LOG}:"
-  tail -5 "$SANDBOX_REGISTRY_PF_LOG" 2>&1 | sed 's/^/    /' >&2
   die "port-forward failed to bind — fix the cause above and run 'sandboxctl restart'"
 }
 
-write_registry_portfwd_plist() {
-  local kubectl_path
-  kubectl_path="$(command -v kubectl)" || die "kubectl not found on PATH"
-  mkdir -p "$SANDBOX_LAUNCHAGENT_DIR" "$SANDBOX_STATE_DIR"
-  cat > "$SANDBOX_REGISTRY_LAUNCHAGENT_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${SANDBOX_REGISTRY_LAUNCHAGENT_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${kubectl_path}</string>
-    <string>--context</string><string>$(kctx)</string>
-    <string>port-forward</string>
-    <string>--address</string><string>127.0.0.1</string>
-    <string>-n</string><string>${REGISTRY_NS}</string>
-    <string>svc/registry</string>
-    <string>${SANDBOX_REGISTRY_PORT}:5000</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>5</integer>
-  <key>StandardOutPath</key><string>${SANDBOX_REGISTRY_PF_LOG}</string>
-  <key>StandardErrorPath</key><string>${SANDBOX_REGISTRY_PF_LOG}</string>
-</dict>
-</plist>
-EOF
+install_registry_proxy() {
+  # Run a socat container on the kind podman network forwarding host
+  # :$SANDBOX_REGISTRY_PORT to the kind-node's NodePort on the registry
+  # Service. Real persistent TCP — handles Docker's 16 parallel layer
+  # uploads cleanly, unlike kubectl port-forward.
+  local node_ip
+  node_ip="$("$SANDBOX_RUNTIME" inspect "${CLUSTER_NAME}-control-plane" \
+    --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
+  [[ -n "$node_ip" ]] || die "could not determine kind node IP for registry proxy"
+
+  log "starting registry proxy container (Mac :${SANDBOX_REGISTRY_PORT} → kind-node:${SANDBOX_REGISTRY_NODEPORT})"
+  "$SANDBOX_RUNTIME" run -d --restart=unless-stopped \
+    --name "$SANDBOX_REGISTRY_PROXY_CONTAINER" \
+    --network kind \
+    -p "${SANDBOX_REGISTRY_PORT}:5000" \
+    "$SANDBOX_REGISTRY_PROXY_IMAGE" \
+    -d TCP-LISTEN:5000,fork,reuseaddr "TCP:${node_ip}:${SANDBOX_REGISTRY_NODEPORT}" >/dev/null
+
+  # Wait for the registry to be reachable through the proxy.
+  local i
+  for ((i=1; i<=15; i++)); do
+    if curl -sf --max-time 2 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/" >/dev/null 2>&1; then
+      ok "registry proxy ready (push: docker push localhost:${SANDBOX_REGISTRY_PORT}/<image>:<tag>)"
+      return
+    fi
+    sleep 1
+  done
+  warn "registry proxy container started but :${SANDBOX_REGISTRY_PORT} not reachable after 15s"
+  "$SANDBOX_RUNTIME" logs --tail=10 "$SANDBOX_REGISTRY_PROXY_CONTAINER" 2>&1 | sed 's/^/    /' >&2
+  die "registry proxy failed to forward — check 'podman logs ${SANDBOX_REGISTRY_PROXY_CONTAINER}'"
 }
 
 # ============================================================================
