@@ -775,25 +775,32 @@ free_port_or_die() {
   # Make sure $SANDBOX_HTTPS_PORT and $SANDBOX_HTTP_PORT are bindable. If
   # they're held by a previous sandboxctl, kill it and retry. If they're
   # held by a foreign process, fail with a clear, actionable error.
-  local port label
-  for port_label in "HTTP:$SANDBOX_HTTP_PORT" "HTTPS:$SANDBOX_HTTPS_PORT"; do
-    label="${port_label%%:*}"
-    port="${port_label##*:}"
-    local pid
-    pid="$(port_listener_pid "$port")"
-    [[ -n "$pid" ]] || continue
-    if port_listener_is_ours "$port"; then
-      log "${label} port :${port} held by a stale sandboxctl port-forward (pid ${pid}) — killing"
-      kill "$pid" 2>/dev/null || true
+  _check_port_or_die HTTP  "$SANDBOX_HTTP_PORT"
+  _check_port_or_die HTTPS "$SANDBOX_HTTPS_PORT"
+}
+
+_check_port_or_die() {
+  local label="$1" port="$2" pid cmdline
+  pid="$(port_listener_pid "$port")"
+  if [[ -z "$pid" ]]; then
+    return 0   # port is free, nothing to do
+  fi
+  if port_listener_is_ours "$port"; then
+    log "${label} port :${port} held by a stale sandboxctl port-forward (pid ${pid}) — killing"
+    kill "$pid" 2>/dev/null || true
+    # Wait briefly for the kernel to release the port. lsof -nP -iTCP:<port>
+    # -sTCP:LISTEN is the fastest reliable check.
+    local i
+    for ((i=1; i<=10; i++)); do
+      [[ -z "$(port_listener_pid "$port")" ]] && return 0
       sleep 1
-    else
-      local cmdline
-      cmdline="$(ps -p "$pid" -o command= 2>/dev/null || echo unknown)"
-      die "${label} port :${port} is in use by an unrelated process (pid ${pid}: ${cmdline}).
+    done
+    die "killed stale sandboxctl listener on :${port} but the port is still occupied — try 'sandboxctl restart'"
+  fi
+  cmdline="$(ps -p "$pid" -o command= 2>/dev/null || echo unknown)"
+  die "${label} port :${port} is in use by an unrelated process (pid ${pid}: ${cmdline}).
        Either stop that process, or set SANDBOX_${label}_PORT=<unused-port> and re-run.
        Example:  SANDBOX_HTTPS_PORT=8543 sandboxctl up"
-    fi
-  done
 }
 
 write_portfwd_plist() {
@@ -832,16 +839,26 @@ install_portfwd() {
   uninstall_portfwd
   free_port_or_die        # fail fast on foreign conflicts; clean up our own stale state
   write_portfwd_plist
-  launchctl load "$SANDBOX_LAUNCHAGENT_PLIST"
+  launchctl load "$SANDBOX_LAUNCHAGENT_PLIST" || \
+    die "launchctl load failed for ${SANDBOX_LAUNCHAGENT_PLIST} — check the file then 'sandboxctl restart'"
+
+  # Wait for both ports to bind. If either doesn't come up in 30s, fail
+  # loudly: silently returning without a port-forward (the v1.2.1 regression)
+  # leaves the user with a healthy cluster but no Mac→cluster path, and
+  # the failure is invisible until they try a URL.
   local i
-  for ((i=1; i<=15; i++)); do
-    if nc -z 127.0.0.1 "$SANDBOX_HTTPS_PORT" 2>/dev/null; then
+  for ((i=1; i<=30; i++)); do
+    if nc -z 127.0.0.1 "$SANDBOX_HTTPS_PORT" 2>/dev/null && \
+       nc -z 127.0.0.1 "$SANDBOX_HTTP_PORT"  2>/dev/null; then
       ok "port-forward ready on 127.0.0.1:${SANDBOX_HTTP_PORT} + :${SANDBOX_HTTPS_PORT}"
       return
     fi
     sleep 1
   done
-  warn "LaunchAgent loaded but :${SANDBOX_HTTPS_PORT} did not bind within 15s — check ${SANDBOX_PF_LOG}"
+  warn "LaunchAgent loaded but :${SANDBOX_HTTPS_PORT}/:${SANDBOX_HTTP_PORT} did not bind within 30s"
+  warn "last lines of ${SANDBOX_PF_LOG}:"
+  tail -5 "$SANDBOX_PF_LOG" 2>&1 | sed 's/^/    /' >&2
+  die "port-forward failed to bind — fix the cause above and run 'sandboxctl restart'"
 }
 
 # ============================================================================
