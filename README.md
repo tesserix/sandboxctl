@@ -49,21 +49,25 @@ and never leaves it.
 `sandboxctl setup-podman` will install and configure podman for you if it's
 not yet ready (rootful mode, 6 GiB memory).
 
-### Optional: Ollama for kagent
+### Ollama for kagent (handled automatically)
 
-`kagent` ships with the sandbox and uses Ollama as its LLM provider by default,
-so no cloud API key is required. To make the kagent UI's queries actually
-work:
+`kagent` ships with the sandbox and uses Ollama as its LLM provider by
+default, so no cloud API key is required. `sandboxctl up` handles all of
+this for you:
 
-```sh
-brew install ollama
-ollama serve &              # in a separate terminal
-ollama pull llama3.2        # one-time, ~2 GB
-```
+- Installs `ollama` via Homebrew if it isn't already there.
+- Starts it as a background service (`brew services start ollama`).
+- Pulls the default model (`llama3.2`, ~2 GB) on first run if it isn't
+  already cached. Subsequent `up` invocations skip the pull.
+
+`sandboxctl down` stops the service but leaves the brew formula and the
+cached model alone (they're shared dev tools). `sandboxctl purge`
+removes everything including the model cache.
 
 The kagent pod reaches your Mac's Ollama via `host.docker.internal:11434`.
-Override `KAGENT_OLLAMA_HOST` / `KAGENT_OLLAMA_MODEL` to point at a different
-endpoint or model.
+Override `KAGENT_OLLAMA_HOST` / `KAGENT_OLLAMA_MODEL` to point at a
+different endpoint or model — set `KAGENT_OLLAMA_HOST` to a non-localhost
+value and sandboxctl will skip local Ollama management entirely.
 
 ## Install
 

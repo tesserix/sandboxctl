@@ -426,9 +426,11 @@ EOF
 
 install_kagent() {
   # kagent — agentic AI controller + UI. Defaults to Ollama as the LLM
-  # provider so the install is self-contained: no cloud API key required,
-  # just `ollama serve` running on the Mac. The pod reaches the host's
-  # Ollama via the kind/podman-injected `host.docker.internal` DNS name.
+  # provider so the install is self-contained: no cloud API key required.
+  # ensure_ollama makes sure Ollama is installed, running, and has the
+  # model pulled before we install kagent itself.
+  ensure_ollama
+
   log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — provider: Ollama at ${KAGENT_OLLAMA_HOST}"
 
   # CRDs ship as a separate chart and must land before the main chart.
@@ -445,23 +447,93 @@ install_kagent() {
     --set "providers.ollama.config.host=${KAGENT_OLLAMA_HOST}" \
     --wait --timeout 10m
 
-  # The pods are part of the controller chart; wait for the UI specifically.
   kc -n "$KAGENT_NS" wait --for=condition=ready --timeout=180s \
     pod -l app.kubernetes.io/component=ui >/dev/null
   ok "kagent ready (UI: https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT})"
+}
 
-  if ! ollama_reachable_from_host; then
-    warn "kagent's default LLM is Ollama at ${KAGENT_OLLAMA_HOST}, but it doesn't appear to be running on your Mac."
-    warn "Install + start it: 'brew install ollama && ollama serve' (in another terminal)"
-    warn "Pull the default model:                      'ollama pull ${KAGENT_OLLAMA_MODEL}'"
-    warn "Until then the UI is reachable but agents will fail to invoke the model."
+# ----- Ollama lifecycle helpers (Mac-side) -----
+
+ollama_reachable() {
+  # The kagent pod talks to host.docker.internal:11434 (= Mac's :11434).
+  # Reachability from the Mac is a reliable proxy for the pod path.
+  curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1
+}
+
+ollama_running_via_brew() {
+  command -v brew >/dev/null 2>&1 || return 1
+  brew services list 2>/dev/null | awk '$1=="ollama" {print $2}' | grep -qx started
+}
+
+ollama_has_model() {
+  curl -s --max-time 3 http://127.0.0.1:11434/api/tags 2>/dev/null \
+    | grep -q "\"$KAGENT_OLLAMA_MODEL\""
+}
+
+ensure_ollama() {
+  # Idempotent: install if missing, start if not running, pull model if
+  # absent. Skip cleanly when each step is already done — re-running `up`
+  # shouldn't reinstall, restart, or re-pull.
+  if [[ "${KAGENT_OLLAMA_HOST}" != host.docker.internal:* ]] && \
+     [[ "${KAGENT_OLLAMA_HOST}" != localhost:* ]] && \
+     [[ "${KAGENT_OLLAMA_HOST}" != 127.0.0.1:* ]]; then
+    # User pointed kagent at a remote Ollama — don't try to manage it.
+    log "kagent uses a remote Ollama (${KAGENT_OLLAMA_HOST}); skipping local Ollama setup"
+    return 0
+  fi
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    command -v brew >/dev/null 2>&1 || die "ollama not installed and brew is unavailable"
+    log "installing ollama via brew (one-time, ~few hundred MB)"
+    brew install ollama
+  fi
+
+  if ! ollama_reachable; then
+    log "starting ollama as a brew service (binds 127.0.0.1:11434, persists across reboots)"
+    brew services start ollama >/dev/null
+    # Wait briefly for it to bind.
+    local i
+    for ((i=1; i<=15; i++)); do
+      ollama_reachable && break
+      sleep 1
+    done
+    ollama_reachable || die "ollama service started but isn't responding on :11434 — try 'brew services list'"
+  elif ! ollama_running_via_brew; then
+    log "ollama is reachable on :11434 but not via brew services — leaving the running instance alone"
+  fi
+
+  if ! ollama_has_model; then
+    log "pulling LLM model '${KAGENT_OLLAMA_MODEL}' (~2 GB on first run; cached for next time)"
+    ollama pull "$KAGENT_OLLAMA_MODEL"
+  fi
+
+  ok "ollama ready (model: ${KAGENT_OLLAMA_MODEL})"
+}
+
+uninstall_ollama_service() {
+  # Stop the brew-managed Ollama service if `up` started it. Leaves the
+  # binary + model cache alone — those are general dev tools, not ours
+  # to remove on a routine `down`. `purge` removes them.
+  if command -v brew >/dev/null 2>&1 && ollama_running_via_brew; then
+    log "stopping ollama brew service"
+    brew services stop ollama >/dev/null 2>&1 || true
   fi
 }
 
-ollama_reachable_from_host() {
-  # The kagent pod talks to host.docker.internal:11434 (= Mac's :11434).
-  # We verify reachability from the Mac itself as a proxy for the pod path.
-  curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1
+purge_ollama() {
+  # Full removal: stop service, delete the pulled model from the cache,
+  # uninstall the brew formula. Called only from `purge`.
+  uninstall_ollama_service
+  if command -v ollama >/dev/null 2>&1; then
+    if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -q "^${KAGENT_OLLAMA_MODEL}"; then
+      log "removing ollama model '${KAGENT_OLLAMA_MODEL}'"
+      ollama rm "$KAGENT_OLLAMA_MODEL" >/dev/null 2>&1 || true
+    fi
+  fi
+  if command -v brew >/dev/null 2>&1 && brew list --formula 2>/dev/null | grep -qx ollama; then
+    log "uninstalling ollama brew formula"
+    brew uninstall ollama >/dev/null 2>&1 || true
+  fi
 }
 
 helm_istio() {
@@ -962,9 +1034,11 @@ cmd_down() {
 
   uninstall_hosts
   untrust_root_ca
+  uninstall_ollama_service
 
-  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, root CA trust removed)"
-  echo "Preserved: ${SANDBOX_STATE_DIR} (logs/state) — use 'sandboxctl purge' to also remove it."
+  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, root CA trust, ollama service removed)"
+  echo "Preserved: ${SANDBOX_STATE_DIR} (logs/state), ollama formula + model cache."
+  echo "Use 'sandboxctl purge' to also remove the state dir, ollama, and the cached model."
   echo "Leaves alone: kindest/node image cache, podman machine."
 }
 
@@ -972,6 +1046,7 @@ cmd_purge() {
   cat <<EOF
 This will do everything 'sandboxctl down' does, plus:
   • remove ${SANDBOX_STATE_DIR}
+  • remove the ollama brew formula and the '${KAGENT_OLLAMA_MODEL}' model cache
 
 EOF
   if [[ "${SANDBOX_PURGE_ASSUME_YES:-}" != "1" ]]; then
@@ -983,6 +1058,7 @@ EOF
     esac
   fi
   cmd_down
+  purge_ollama
   if [[ -d "$SANDBOX_STATE_DIR" ]]; then
     log "removing $SANDBOX_STATE_DIR"
     rm -rf "$SANDBOX_STATE_DIR"
