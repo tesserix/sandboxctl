@@ -27,6 +27,8 @@ LEGACY_GUESTBOOK_NS="${LEGACY_GUESTBOOK_NS:-guestbook}"
 
 ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-9.5.13}"
 KARGO_CHART_VERSION="${KARGO_CHART_VERSION:-1.1.1}"
+REFLECTOR_NS="${REFLECTOR_NS:-reflector}"
+REFLECTOR_CHART_VERSION="${REFLECTOR_CHART_VERSION:-9.1.7}"
 CERT_MANAGER_NS="${CERT_MANAGER_NS:-cert-manager}"
 CERT_MANAGER_CHART_VERSION="${CERT_MANAGER_CHART_VERSION:-v1.16.2}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.29.2}"
@@ -438,6 +440,20 @@ install_argocd() {
     --set 'configs.params.server\.insecure=true' \
     --wait --timeout 10m
   ok "Argo CD ready"
+}
+
+install_reflector() {
+  # Mirrors annotated Secrets/ConfigMaps across namespaces. Used by the
+  # fiber chart to push fiber-secrets into github-mcp without touching
+  # sandboxctl. Inert until something is actually annotated.
+  log "installing reflector (ns: $REFLECTOR_NS, chart $REFLECTOR_CHART_VERSION)"
+  helm repo add emberstack https://emberstack.github.io/helm-charts >/dev/null 2>&1 || true
+  helm repo update emberstack >/dev/null
+  helm upgrade --install reflector emberstack/reflector \
+    --namespace "$REFLECTOR_NS" --create-namespace \
+    --version "$REFLECTOR_CHART_VERSION" \
+    --wait --timeout 5m
+  ok "reflector ready"
 }
 
 install_kargo() {
@@ -1442,6 +1458,7 @@ EOF
   install_pki
   clean_legacy_state
   install_argocd
+  install_reflector
   install_kargo
   install_registry
   install_demo_app

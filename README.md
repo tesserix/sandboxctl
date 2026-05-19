@@ -257,6 +257,8 @@ The pieces:
 - **Istio ambient** — `istio-base` + `istiod` + `istio-cni` + `ztunnel` +
   `istio/gateway`. The gateway terminates TLS with the wildcard cert.
 - **Argo CD, Kargo, kagent, demo-app** — Helm-installed control plane
+- **reflector** — mirrors annotated Secrets/ConfigMaps across namespaces
+  (inert until a workload chart annotates something)
 - **In-cluster Gitea** — backs the GitOps loop for `sandboxctl deploy`
 - **In-cluster registry** — `localhost:5050` push target, mirrored into
   the kind node's containerd via `hosts.toml`
@@ -280,6 +282,7 @@ Defaults work for most people. Override via env vars:
 | `KIND_NODE_IMAGE` | `kindest/node:v1.35.0` | kind node image |
 | `ARGOCD_CHART_VERSION` | `9.5.13` | argo-cd chart version |
 | `KARGO_CHART_VERSION` | `1.1.1` | kargo chart version |
+| `REFLECTOR_CHART_VERSION` | `9.1.7` | emberstack/reflector chart version |
 | `CERT_MANAGER_CHART_VERSION` | `v1.16.2` | cert-manager chart version |
 | `ISTIO_CHART_VERSION` | `1.29.2` | Istio chart version |
 | `KAGENT_CHART_VERSION` | `0.9.4` | kagent chart version |
