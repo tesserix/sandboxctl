@@ -117,6 +117,14 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1 (i
 kctx() { echo "kind-$CLUSTER_NAME"; }
 kc()   { kubectl --context "$(kctx)" "$@"; }
 
+# Truth source for "is kagent installed in this cluster?" — checked
+# at runtime against the live API rather than a flag in state, so
+# `status` / `validate` / `down` / `install_routes` agree across
+# upgrades and across re-runs that flip the toggle.
+_kagent_present() {
+  kc get ns "$KAGENT_NS" >/dev/null 2>&1
+}
+
 prime_sudo() {
   if ! sudo -n true 2>/dev/null; then
     log "sudo required for /etc/hosts + macOS keychain trust — you'll be prompted once"
@@ -612,8 +620,14 @@ install_kagent() {
 install_gitea() {
   log "installing Gitea (ns: $GITEA_NS, chart $GITEA_CHART_VERSION) — GitOps source for 'sandboxctl deploy'"
 
+  # `helm repo add` is silent on success but can return 1 with a stale
+  # ~/.cache/helm directory. Force-update so the index is fresh, and
+  # let the next `helm upgrade --install` resolve the chart correctly.
   helm repo add gitea-charts https://dl.gitea.com/charts/ >/dev/null 2>&1 || true
-  helm repo update gitea-charts >/dev/null
+  if ! helm repo update gitea-charts >/dev/null 2>&1; then
+    warn "helm repo update gitea-charts failed — retrying with full refresh"
+    helm repo update >/dev/null
+  fi
 
   # Random admin password persisted to ~/.sandboxctl/gitea-admin-pass.
   # Read once during initial install; subsequent `sandboxctl up` calls
@@ -630,47 +644,55 @@ install_gitea() {
   # subchart dependencies (valkey-cluster + postgresql-ha are enabled
   # by default in the gitea helm chart and are overkill for a one-user
   # sandbox).
-  helm upgrade --install gitea gitea-charts/gitea \
-    --namespace "$GITEA_NS" --create-namespace \
-    --version "$GITEA_CHART_VERSION" \
-    --set "gitea.admin.username=${GITEA_ADMIN_USER}" \
-    --set "gitea.admin.password=${admin_pass}" \
-    --set 'gitea.admin.email=sandbox@local' \
-    --set 'gitea.config.database.DB_TYPE=sqlite3' \
-    --set 'gitea.config.cache.ADAPTER=memory' \
-    --set 'gitea.config.session.PROVIDER=memory' \
-    --set 'gitea.config.queue.TYPE=level' \
-    --set 'gitea.config.indexer.ISSUE_INDEXER_TYPE=bleve' \
-    --set 'valkey-cluster.enabled=false' \
-    --set 'valkey.enabled=false' \
-    --set 'postgresql-ha.enabled=false' \
-    --set 'postgresql.enabled=false' \
-    --set 'redis-cluster.enabled=false' \
-    --set 'redis.enabled=false' \
-    --set 'memcached.enabled=false' \
-    --set 'persistence.size=1Gi' \
-    --set 'replicaCount=1' \
-    --set 'service.http.port=3000' \
-    --wait --timeout 8m
+  log "running helm upgrade --install gitea (this can take ~3 min on first run)"
+  if ! helm upgrade --install gitea gitea-charts/gitea \
+      --namespace "$GITEA_NS" --create-namespace \
+      --version "$GITEA_CHART_VERSION" \
+      --set "gitea.admin.username=${GITEA_ADMIN_USER}" \
+      --set "gitea.admin.password=${admin_pass}" \
+      --set 'gitea.admin.email=sandbox@local' \
+      --set 'gitea.config.database.DB_TYPE=sqlite3' \
+      --set 'gitea.config.cache.ADAPTER=memory' \
+      --set 'gitea.config.session.PROVIDER=memory' \
+      --set 'gitea.config.queue.TYPE=level' \
+      --set 'gitea.config.indexer.ISSUE_INDEXER_TYPE=bleve' \
+      --set 'valkey-cluster.enabled=false' \
+      --set 'valkey.enabled=false' \
+      --set 'postgresql-ha.enabled=false' \
+      --set 'postgresql.enabled=false' \
+      --set 'redis-cluster.enabled=false' \
+      --set 'redis.enabled=false' \
+      --set 'memcached.enabled=false' \
+      --set 'persistence.size=1Gi' \
+      --set 'replicaCount=1' \
+      --set 'service.http.port=3000' \
+      --wait --timeout 8m 2>&1; then
+    die "gitea helm install failed — see 'helm -n ${GITEA_NS} status gitea' and 'kc -n ${GITEA_NS} get events --sort-by=.lastTimestamp'"
+  fi
 
   kc -n "$GITEA_NS" rollout status deploy/gitea --timeout=180s >/dev/null
 
-  # Create the `sandbox` org once (idempotent — gitea CLI returns 422 if
-  # it already exists, which is fine). Run inside the pod so we don't
-  # need to expose the API to the host.
-  kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
-    su git -c "gitea admin user list" >/dev/null 2>&1 || true
-
+  # Sanity-poke the API once before declaring ready. Use `</dev/null`
+  # on every `kc exec` to guarantee stdin closes — without it,
+  # kubectl-exec can hang indefinitely on some podman/containerd
+  # builds (the symptom in v1.5.x: cmd_up froze silently mid-`up`
+  # right after kagent finished).
   if ! kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
-        sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' http://127.0.0.1:3000/api/v1/orgs/${GITEA_ORG}" \
-        >/dev/null 2>&1; then
-    kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
-      sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' \
-        -H 'Content-Type: application/json' \
-        -d '{\"username\":\"${GITEA_ORG}\",\"visibility\":\"public\"}' \
-        http://127.0.0.1:3000/api/v1/orgs" >/dev/null \
-      || warn "could not create gitea org '${GITEA_ORG}' — sandboxctl deploy will retry"
+        sh -c "curl -sf --max-time 5 -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+          http://127.0.0.1:3000/api/v1/version" </dev/null >/dev/null 2>&1; then
+    warn "gitea API didn't respond to a quick auth probe — first 'sandboxctl deploy' will retry"
   fi
+
+  # Org create is best-effort: missing org just means the first
+  # `sandboxctl deploy` will create it on demand inside
+  # gitea_push_chart. Skipping a hard failure here keeps `up` robust
+  # against a slow Gitea startup.
+  kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+    sh -c "curl -sf --max-time 5 -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+      -H 'Content-Type: application/json' \
+      -d '{\"username\":\"${GITEA_ORG}\",\"visibility\":\"public\"}' \
+      http://127.0.0.1:3000/api/v1/orgs" </dev/null >/dev/null 2>&1 \
+    || true
 
   ok "gitea ready (in-cluster: http://gitea-http.${GITEA_NS}.svc.cluster.local:3000)"
 }
@@ -687,16 +709,28 @@ gitea_push_chart() {
   [[ -s "$pass_file" ]] || die "gitea password file missing — run 'sandboxctl up' first"
   local admin_pass; admin_pass="$(cat "$pass_file")"
 
-  # Create the repo via Gitea API if it doesn't exist. Idempotent.
+  # Ensure the org exists (best-effort — install_gitea attempts it but
+  # may have skipped on a slow Gitea startup). 422 means "already
+  # exists", which is fine.
   kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
-    sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' \
-      http://127.0.0.1:3000/api/v1/repos/${GITEA_ORG}/${repo_name}" >/dev/null 2>&1 || \
-  kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
-    sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+    sh -c "curl -sf --max-time 5 -u '${GITEA_ADMIN_USER}:${admin_pass}' \
       -H 'Content-Type: application/json' \
-      -d '{\"name\":\"${repo_name}\",\"auto_init\":true,\"default_branch\":\"main\"}' \
-      http://127.0.0.1:3000/api/v1/orgs/${GITEA_ORG}/repos" >/dev/null \
-    || die "could not create gitea repo ${GITEA_ORG}/${repo_name}"
+      -d '{\"username\":\"${GITEA_ORG}\",\"visibility\":\"public\"}' \
+      http://127.0.0.1:3000/api/v1/orgs" </dev/null >/dev/null 2>&1 || true
+
+  # Create the repo via Gitea API if it doesn't exist. Idempotent.
+  if ! kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+        sh -c "curl -sf --max-time 5 -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+          http://127.0.0.1:3000/api/v1/repos/${GITEA_ORG}/${repo_name}" \
+        </dev/null >/dev/null 2>&1; then
+    kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+      sh -c "curl -sf --max-time 10 -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+        -H 'Content-Type: application/json' \
+        -d '{\"name\":\"${repo_name}\",\"auto_init\":true,\"default_branch\":\"main\"}' \
+        http://127.0.0.1:3000/api/v1/orgs/${GITEA_ORG}/repos" \
+      </dev/null >/dev/null \
+      || die "could not create gitea repo ${GITEA_ORG}/${repo_name}"
+  fi
 
   # Push the chart via host-side git over a port-forward.
   local pf_pid="" tmp
@@ -829,7 +863,13 @@ spec:
   gateways: ["${ISTIO_INGRESS_NS}/sandbox-gateway"]
   http:
     - route: [{ destination: { host: demo-app.${DEMO_NS}.svc.cluster.local, port: { number: 80 } } }]
----
+EOF
+
+  # Kagent VS only when the namespace exists (i.e. user opted in via
+  # --with-kagent). Without this gate, Istio still accepts the VS but
+  # routes 503 because the destination Service doesn't resolve.
+  if _kagent_present; then
+    kc apply -f - <<EOF >/dev/null
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata: { name: kagent, namespace: ${KAGENT_NS} }
@@ -839,6 +879,7 @@ spec:
   http:
     - route: [{ destination: { host: kagent-ui.${KAGENT_NS}.svc.cluster.local, port: { number: 8080 } } }]
 EOF
+  fi
   ok "routes applied"
 }
 
@@ -846,17 +887,26 @@ EOF
 # /etc/hosts management
 # ============================================================================
 
+_managed_hosts() {
+  # Hostnames sandboxctl manages on the marker line. Kagent appears
+  # only when its namespace is live, so a default-off `up` doesn't
+  # leak `kagent.sandbox.app` into /etc/hosts.
+  local out=("$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST")
+  if _kagent_present; then out+=("$KAGENT_HOST"); fi
+  printf '%s\n' "${out[@]}"
+}
+
 hosts_line_present() {
   local h
-  for h in "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$KAGENT_HOST"; do
+  while IFS= read -r h; do
     grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${h}\b" /etc/hosts || return 1
-  done
+  done < <(_managed_hosts)
 }
 
 install_hosts() {
   log "configuring /etc/hosts entries for ${SANDBOX_DOMAIN}"
   if hosts_line_present; then
-    ok "/etc/hosts already maps ${ARGO_HOST}, ${KARGO_HOST}, ${DEMO_HOST}, ${KAGENT_HOST} to 127.0.0.1"
+    ok "/etc/hosts already maps $(_managed_hosts | paste -sd ',' -) to 127.0.0.1"
     return
   fi
   prime_sudo
@@ -864,7 +914,7 @@ install_hosts() {
   # final `install` does.
   local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
   grep -v "${SANDBOX_HOSTS_MARKER}" /etc/hosts > "$tmp" || true
-  printf '127.0.0.1\t%s %s %s %s\t%s\n' "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$KAGENT_HOST" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
+  printf '127.0.0.1\t%s\t%s\n' "$(_managed_hosts | paste -sd ' ' -)" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
   sudo install -m 0644 "$tmp" /etc/hosts
   rm -f "$tmp"
   ok "/etc/hosts updated"
@@ -1197,10 +1247,7 @@ ports:
   http: ${SANDBOX_HTTP_PORT}
   https: ${SANDBOX_HTTPS_PORT}
 hosts:
-  - ${ARGO_HOST}
-  - ${KARGO_HOST}
-  - ${DEMO_HOST}
-  - ${KAGENT_HOST}
+$(while IFS= read -r h; do printf '  - %s\n' "$h"; done < <(_managed_hosts))
 launch_agent: ${SANDBOX_LAUNCHAGENT_LABEL}
 created_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
@@ -1213,7 +1260,7 @@ EOF
 validate_urls() {
   log "validating URLs reachable from the Mac"
   local failed=0 host url code
-  for host in "$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST" "$KAGENT_HOST"; do
+  while IFS= read -r host; do
     url="https://${host}:${SANDBOX_HTTPS_PORT}/"
     # -k: curl's bundle doesn't know our local CA (browser does post-trust).
     # tail -c 3: --retry prints one code per attempt; we want the final one.
@@ -1226,7 +1273,7 @@ validate_urls() {
       printf '  %-50s FAIL (%s)\n' "$url" "$code"
       failed=1
     fi
-  done
+  done < <(_managed_hosts)
   if (( failed )); then
     warn "one or more URLs are not reachable from the Mac — see ${SANDBOX_PF_LOG} and 'sandboxctl status'"
     return 1
@@ -1304,6 +1351,36 @@ start_sudo_keepalive() {
 # ============================================================================
 
 cmd_up() {
+  # Optional add-ons. Off by default — they're useful for some users
+  # but slow down `up` and pull a noticeable amount of disk. Toggle on
+  # individually (--with-kagent) or all at once (--install all).
+  INSTALL_KAGENT=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with-kagent)    INSTALL_KAGENT=1; shift ;;
+      --install)
+        case "${2:-}" in
+          all)          INSTALL_KAGENT=1; shift 2 ;;
+          *) die "--install: expected 'all' (got '${2:-}')" ;;
+        esac ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl up [--with-kagent] [--install all]
+
+Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
+Kargo + Istio + in-cluster registry + Gitea + a demo app, all wired
+behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+
+Add-ons (off by default — they take longer and use more memory):
+  --with-kagent    Install kagent (agentic AI controller + UI).
+  --install all    Install every add-on. Today: kagent.
+EOF
+        return 0 ;;
+      *) die "unknown flag: $1 (try 'sandboxctl up --help')" ;;
+    esac
+  done
+  export INSTALL_KAGENT
+
   require_tools
   ensure_tooling
 
@@ -1325,7 +1402,11 @@ cmd_up() {
   install_kargo
   install_registry
   install_demo_app
-  install_kagent
+  if (( INSTALL_KAGENT )); then
+    install_kagent
+  else
+    log "skipping kagent (pass --with-kagent or --install all to enable)"
+  fi
   install_gitea
   install_istio_ambient
   install_routes
@@ -1339,10 +1420,12 @@ cmd_up() {
   cmd_status
   echo
   echo "next:"
-  printf '  open https://%s:%s\n' "$ARGO_HOST"   "$SANDBOX_HTTPS_PORT"
-  printf '  open https://%s:%s\n' "$KARGO_HOST"  "$SANDBOX_HTTPS_PORT"
-  printf '  open https://%s:%s\n' "$DEMO_HOST"   "$SANDBOX_HTTPS_PORT"
-  printf '  open https://%s:%s\n' "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  printf '  open https://%s:%s\n' "$ARGO_HOST"  "$SANDBOX_HTTPS_PORT"
+  printf '  open https://%s:%s\n' "$KARGO_HOST" "$SANDBOX_HTTPS_PORT"
+  printf '  open https://%s:%s\n' "$DEMO_HOST"  "$SANDBOX_HTTPS_PORT"
+  if (( INSTALL_KAGENT )); then
+    printf '  open https://%s:%s\n' "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  fi
   echo "  sandboxctl creds   # full login details"
 }
 
@@ -1439,13 +1522,17 @@ cmd_status() {
   workload_summary "$KARGO_NS"         "kargo"
   workload_summary "$REGISTRY_NS"      "registry"
   workload_summary "$DEMO_NS"          "demo-app"
-  workload_summary "$KAGENT_NS"        "kagent"
+  if _kagent_present; then
+    workload_summary "$KAGENT_NS"      "kagent"
+  fi
   echo
   echo "apps & URLs:"
   printf '  %-12s https://%s:%s\n' "argocd"   "$ARGO_HOST"   "$SANDBOX_HTTPS_PORT"
   printf '  %-12s https://%s:%s\n' "kargo"    "$KARGO_HOST"  "$SANDBOX_HTTPS_PORT"
   printf '  %-12s https://%s:%s\n' "demo-app" "$DEMO_HOST"   "$SANDBOX_HTTPS_PORT"
-  printf '  %-12s https://%s:%s\n' "kagent"   "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  if _kagent_present; then
+    printf '  %-12s https://%s:%s\n' "kagent" "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  fi
   printf '  %-12s localhost:%s    (push: docker push localhost:%s/<image>:<tag>)\n' "registry" "$SANDBOX_REGISTRY_PORT" "$SANDBOX_REGISTRY_PORT"
 }
 
@@ -1484,6 +1571,9 @@ Kargo
 
 Demo app
   URL:       https://${DEMO_HOST}:${SANDBOX_HTTPS_PORT}
+EOF
+  if _kagent_present; then
+    cat <<EOF
 
 kagent
   URL:       https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT}
@@ -1494,9 +1584,9 @@ kagent
                ollama serve &
                ollama pull ${KAGENT_OLLAMA_MODEL}
              or set KAGENT_OLLAMA_HOST to a remote endpoint and re-run 'sandboxctl up'.
-
-kubectl context: $(kctx)
 EOF
+  fi
+  printf '\nkubectl context: %s\n' "$(kctx)"
 }
 
 cmd_argocd_ui() {
@@ -2487,7 +2577,9 @@ usage:
   sandbox.sh setup-podman   install/configure rootful podman machine (one-time)
   sandbox.sh trust-ca       trust the sandbox root CA in macOS System keychain (sudo)
   sandbox.sh untrust-ca     remove the sandbox root CA from System keychain (sudo)
-  sandbox.sh up             create cluster + install argocd/kargo/demo + ingress + PKI + hosts + portfwd
+  sandbox.sh up [--with-kagent | --install all]
+                            create cluster + install argocd/kargo/demo/registry/gitea + ingress + PKI + hosts + portfwd
+                            (kagent is opt-in: --with-kagent or --install all)
   sandbox.sh down           remove cluster + LaunchAgent + /etc/hosts + keychain CA (keeps ~/.sandbox)
   sandbox.sh purge          down + remove ~/.sandbox (prompts for confirmation)
   sandbox.sh restart        down + up
@@ -2540,7 +2632,7 @@ main() {
     setup-podman)       cmd_setup_podman ;;
     trust-ca)           trust_root_ca ;;
     untrust-ca)         untrust_root_ca ;;
-    up)                 cmd_up ;;
+    up)                 shift; cmd_up "$@" ;;
     down)               cmd_down ;;
     purge)              cmd_purge ;;
     status)             cmd_status ;;
