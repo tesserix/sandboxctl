@@ -2306,22 +2306,51 @@ add_app_host() {
   fi
   prime_sudo
   local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
-  # If the sandboxctl-managed line already exists (cmd_up wrote it),
-  # append the new hostname there; otherwise add a fresh line. This
-  # second branch matters when add_app_host runs before cmd_up has
-  # written the marker.
-  if grep -qF "${SANDBOX_HOSTS_MARKER}" /etc/hosts; then
-    awk -v host="$hostname" -v marker="$SANDBOX_HOSTS_MARKER" '
-      {
-        if (index($0, marker) > 0 && index($0, host) == 0) {
-          sub(marker, host " " marker)
-        }
-        print
-      }
-    ' /etc/hosts > "$tmp"
+
+  # Rewrite via pure-bash string ops — never feed awk/sed a regex
+  # built from $SANDBOX_HOSTS_MARKER, which contains parentheses
+  # (e.g. "# managed by sandboxctl (sandbox.app)"). macOS BSD awk
+  # treats `(...)` in `sub`'s pattern as an ERE group, so the prior
+  # implementation silently no-op'd on every Mac and the deploy log
+  # said "OK: /etc/hosts: …" while the file was untouched.
+  #
+  # The shape we maintain on the marker line is:
+  #   127.0.0.1\t<host1> <host2> …\t# managed by sandboxctl (<domain>)
+  # We splice <new-host> in just before the marker, separated by a
+  # single space — matching cmd_up's install_hosts output.
+  if grep -qF "$SANDBOX_HOSTS_MARKER" /etc/hosts; then
+    local replaced=0 line prefix suffix
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if (( replaced == 0 )) && [[ "$line" == *"$SANDBOX_HOSTS_MARKER"* && "$line" != *"$hostname"* ]]; then
+        # Bash parameter expansion: split the line on the marker.
+        prefix="${line%%"$SANDBOX_HOSTS_MARKER"*}"
+        suffix="${SANDBOX_HOSTS_MARKER}${line##*"$SANDBOX_HOSTS_MARKER"}"
+        # `prefix` ends with whitespace before the marker — strip a
+        # single trailing tab/space, append " <hostname>", then a tab
+        # before the marker so the columns stay aligned.
+        prefix="${prefix%[[:space:]]}"
+        printf '%s %s\t%s\n' "$prefix" "$hostname" "$suffix" >> "$tmp"
+        replaced=1
+      else
+        printf '%s\n' "$line" >> "$tmp"
+      fi
+    done < /etc/hosts
+    if (( replaced == 0 )); then
+      # Marker line didn't match the splice (e.g. odd whitespace) —
+      # fall back to appending a fresh line so we never silently no-op.
+      printf '127.0.0.1\t%s\t%s\n' "$hostname" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
+    fi
   else
     cp /etc/hosts "$tmp"
     printf '127.0.0.1\t%s\t%s\n' "$hostname" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
+  fi
+
+  # Sanity-check we actually wrote the host before swapping /etc/hosts.
+  # Without this, an unforeseen edge in the splice would still print
+  # "OK" while leaving the system file unchanged.
+  if ! grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${hostname}\b" "$tmp"; then
+    rm -f "$tmp"
+    die "internal: failed to splice ${hostname} into /etc/hosts (marker shape unexpected — please file a bug)"
   fi
 
   if ! sudo install -m 0644 "$tmp" /etc/hosts 2>/dev/null; then
@@ -2347,9 +2376,30 @@ remove_app_host() {
   fi
   prime_sudo
   local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
-  sed -E "s| ${hostname}\b||g" /etc/hosts > "$tmp"
-  sudo install -m 0644 "$tmp" /etc/hosts
+
+  # Pure-bash splice for the same reason as add_app_host: avoid sed's
+  # regex on a hostname that may contain dots (which match anything in
+  # ERE). We strip exactly the literal " ${hostname}" token, leaving
+  # the rest of the marker line intact.
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"$SANDBOX_HOSTS_MARKER"* && "$line" == *" ${hostname} "* ]]; then
+      line="${line/ ${hostname} / }"
+    elif [[ "$line" == *"$SANDBOX_HOSTS_MARKER"* && "$line" == *" ${hostname}"$'\t'* ]]; then
+      line="${line/ ${hostname}/}"
+    fi
+    printf '%s\n' "$line" >> "$tmp"
+  done < /etc/hosts
+
+  if ! sudo install -m 0644 "$tmp" /etc/hosts 2>/dev/null; then
+    rm -f "$tmp"
+    warn "failed to write /etc/hosts (sudo) — leaving entry behind"
+    return 0
+  fi
   rm -f "$tmp"
+
+  sudo dscacheutil -flushcache 2>/dev/null || true
+  sudo killall -HUP mDNSResponder 2>/dev/null || true
 }
 
 cmd_deploy() {
