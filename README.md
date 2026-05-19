@@ -19,9 +19,24 @@ That's the only step. The formula installs the binary plus the bundled
 
 ## Quickstart
 
+From your product repo root (the dir that holds your Dockerfile, chart,
+and `k8s/secrets.yaml`):
+
+```sh
+cd path/to/your-app
+sandboxctl bootstrap               # brings the platform up + deploys your app
+```
+
+`bootstrap` is the one-shot wrapper. It runs `sandboxctl up` (skipped if
+the cluster is already up) then `sandboxctl deploy` in the current dir,
+so re-running it later is also fine as your "redeploy this app"
+shortcut.
+
+If you'd rather run the steps separately:
+
 ```sh
 sandboxctl up                      # one-time: bring the platform up (~5–8 min first run)
-cd path/to/your-app                # change into your product dir
+cd path/to/your-app
 sandboxctl deploy                  # build + push images, deploy via Argo CD
 ```
 

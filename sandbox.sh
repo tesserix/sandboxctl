@@ -1429,6 +1429,84 @@ EOF
   echo "  sandboxctl creds   # full login details"
 }
 
+# `sandboxctl bootstrap` — one-shot wrapper for first-time users:
+#   1. brings the platform up (skipping `up` if the cluster is already
+#      running so re-runs are cheap)
+#   2. deploys whatever charts live in the current product directory
+#
+# Run this from your product repo root — the dir that holds your
+# Dockerfile(s), chart, k8s/secrets.yaml, and (optionally) sandboxctl.yaml.
+# All `up` and `deploy` flags are accepted and forwarded to the right
+# sub-step. Path argument follows the same convention as `cmd_deploy`.
+#
+# Why a separate command instead of an alias? `up` and `deploy` need
+# different sudo-priming windows and different working-dir semantics
+# (`up` is product-agnostic; `deploy` needs to be run *in* the product
+# dir so it can find the Dockerfile / chart / secrets). Bootstrapping
+# wraps them so a fresh-checkout user runs one command instead of
+# remembering the order.
+cmd_bootstrap() {
+  local target="" up_args=() deploy_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with-kagent|--install)
+        # `--install` takes a value (today: "all"). Forward both forms.
+        if [[ "$1" == "--install" ]]; then
+          up_args+=("$1" "${2:-}"); shift 2
+        else
+          up_args+=("$1"); shift
+        fi ;;
+      --env|--chart|--values|--name)
+        deploy_args+=("$1" "${2:-}"); shift 2 ;;
+      --no-build)
+        deploy_args+=("$1"); shift ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl bootstrap [path] [up flags] [deploy flags]
+
+One-shot for first-time users: brings the sandbox cluster up if it
+isn't already, then deploys the chart in the current product
+directory.
+
+Run this from your product repo root — the directory that holds your
+Dockerfile(s), chart, and k8s/secrets.yaml.
+
+  sandboxctl bootstrap                       # cwd = product dir
+  sandboxctl bootstrap path/to/repo
+  sandboxctl bootstrap --with-kagent         # forwarded to 'up'
+  sandboxctl bootstrap --chart custom/chart  # forwarded to 'deploy'
+  sandboxctl bootstrap --no-build            # forwarded to 'deploy'
+
+If the cluster is already up the platform install is skipped — only
+the deploy half runs, so this is also fine to use as your every-day
+"redeploy this app" shortcut.
+EOF
+        return 0 ;;
+      -*) die "unknown flag: $1 (try 'sandboxctl bootstrap --help')" ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; shift
+        else die "unexpected argument: $1"
+        fi ;;
+    esac
+  done
+  target="${target:-.}"
+
+  # Bring the platform up only if it isn't already. This is what makes
+  # bootstrap safe to re-run as a "redeploy my app" shortcut — no
+  # 5-minute helm dance on every invocation.
+  if cluster_registered && cluster_api_reachable; then
+    log "cluster '${CLUSTER_NAME}' is already up — skipping platform install"
+  else
+    log "bringing the sandbox platform up (first run takes ~5–8 min)"
+    cmd_up "${up_args[@]}"
+  fi
+
+  # Deploy the product's chart. cmd_deploy is responsible for
+  # validating that <target> actually contains something deployable.
+  log "deploying from product dir: ${target}"
+  cmd_deploy "$target" "${deploy_args[@]}"
+}
+
 cmd_down() {
   need kind
 
@@ -2600,6 +2678,8 @@ usage:
                                      route <chart>.${SANDBOX_DOMAIN} per app
   sandbox.sh undeploy --name <appname> [--env <name>]
                                      remove the Argo Application, route, and hosts entry (namespace preserved)
+  sandbox.sh bootstrap [path] [up flags] [deploy flags]
+                                     run 'up' (if not already up) + 'deploy' in one shot — handy first-run wrapper
 
 env overrides:
   SANDBOX_RUNTIME             podman (default) or docker
@@ -2645,6 +2725,7 @@ main() {
     images)             shift; cmd_images "$@" ;;
     deploy)             shift; cmd_deploy "$@" ;;
     undeploy)           shift; cmd_undeploy "$@" ;;
+    bootstrap)          shift; cmd_bootstrap "$@" ;;
     ""|-h|--help|help)  usage ;;
     *) die "unknown subcommand: $1 (try --help)" ;;
   esac

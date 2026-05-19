@@ -47,6 +47,7 @@ var commands = []command{
 	{"images", "list / rm <ref> / prune / gc — manage images in the cluster registry"},
 	{"deploy", "auto-discover every chart under [path], build + push images, push to Gitea, create Argo Apps, route URLs"},
 	{"undeploy", "remove the Argo Application + route created by 'deploy'"},
+	{"bootstrap", "first-run wrapper: 'up' (if needed) + 'deploy' in one command, run from your product dir"},
 	{"tui", "live status dashboard (Bubble Tea)"},
 	{"version", "print sandboxctl version, commit, and build date"},
 }
