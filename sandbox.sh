@@ -1490,7 +1490,9 @@ cmd_build_from_manifest() {
   #
   # Order in the YAML IS the build order — we don't topologically sort.
   # depends_on only validates that the named dep was built earlier.
-  local manifest="$1" target="$2" default_tag="$3" builder="$4"
+  # Per-image `tag` defaults to 'latest' inside the YAML parser; we don't
+  # need a function-level default_tag.
+  local manifest="$1" builder="$4"
   command -v python3 >/dev/null 2>&1 || die "python3 required to parse $manifest"
 
   log "building from $manifest"
