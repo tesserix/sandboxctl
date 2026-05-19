@@ -83,12 +83,18 @@ run `docker build` from. The CLI will:
 
 ```
 1. ./k8s/chart/Chart.yaml              ← recommended layout
-2. Any Chart.yaml within depth 5 of cwd
+2. Any Chart.yaml within depth 5 of cwd (Helm only — rendered-manifest
+                                         dirs like deploy/ or k8s/ are
+                                         intentionally not auto-picked)
 3. Interactive prompt for a path       ← when nothing is found
 ```
 
-Override with `--chart <dir>` if your chart lives somewhere else
-(absolute path, or relative to the product dir):
+If steps 1 and 2 turn up nothing, sandboxctl prompts for a chart path
+(absolute, or relative to the product dir) and continues with whatever
+you enter. Press Enter on an empty line to abort.
+
+Override with `--chart <dir>` if your chart lives outside the product
+dir and you want to skip the prompt:
 
 ```sh
 sandboxctl deploy --chart ../platform/manifests/my-app/chart

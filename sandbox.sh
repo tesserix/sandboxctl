@@ -2351,28 +2351,52 @@ EOF
     [[ -z "$values_override" && -z "$name_override" ]] \
       || die "--values and --name require --chart"
 
-    # Convention: <target>/k8s/chart is the recommended layout — sandboxctl
-    # treats it as the implicit --chart when no flag is passed.
+    # Convention: <target>/k8s/chart is the recommended layout. Resolve
+    # in this order:
+    #   1. <target>/k8s/chart/Chart.yaml          — implicit chart
+    #   2. discover_app_charts, helm entries only — multi-chart repos
+    #   3. interactive prompt for a chart path    — keeps the user in-flow
+    #
+    # We deliberately don't fall back to discover_app_charts's "directory"
+    # mode (rendered manifests under k8s/ or deploy/). That fallback was
+    # correct in theory but in practice repos like this one have a
+    # deploy/ holding misc infra (operator CRDs, ad-hoc YAML), and Argo
+    # would happily try to apply all of it as the app's manifests.
     if [[ -f "${target}/k8s/chart/Chart.yaml" ]]; then
       log "found chart at ${target}/k8s/chart (the recommended layout)"
       entries="$(_emit_explicit_chart_entry "$target" "k8s/chart" "" "")" || return 1
-    elif entries="$(discover_app_charts "$target" 2>/dev/null)" && [[ -n "$entries" ]]; then
-      :
     else
-      # No chart anywhere obvious — prompt the user for an absolute or
-      # relative path so they don't have to abort and re-run with --chart.
-      local prompt_path=""
-      if [[ -t 0 ]]; then
+      local discovered=""
+      discovered="$(discover_app_charts "$target" 2>/dev/null || true)"
+      # Strip any "directory" rows — those are manifest dirs, not charts,
+      # and silently picking them up is what caused earlier deploys to
+      # apply unrelated infra (e.g. operator CRDs sitting under deploy/).
+      local helm_only=""
+      helm_only="$(printf '%s\n' "$discovered" | awk -F'\t' 'NF>=2 && $1=="helm"')"
+
+      if [[ -n "$helm_only" ]]; then
+        entries="$helm_only"
+      else
+        # Nothing chart-shaped under <target>. Prompt for a path —
+        # absolute, or relative to <target>.
+        if [[ ! -t 0 ]]; then
+          die "no chart found under ${target} — pass --chart <dir> or place a chart at ${target}/k8s/chart (no TTY available for interactive prompt)"
+        fi
         echo
-        echo "  No chart found at ${target}/k8s/chart (the default location)"
-        echo "  and auto-discovery turned up nothing under ${target}."
+        echo "  No chart found at ${target}/k8s/chart (the recommended layout)"
+        echo "  and no other Helm chart was discovered under ${target}."
         echo
-        printf '  Path to your Helm chart (absolute or relative to %s): ' "$target"
+        echo "  If your chart lives elsewhere, enter its path now (absolute"
+        echo "  or relative to ${target}). Press Enter on an empty line to"
+        echo "  abort."
+        echo
+        local prompt_path=""
+        printf '  Chart path: '
         read -r prompt_path
+        [[ -n "$prompt_path" ]] || \
+          die "deploy aborted — no chart path provided"
+        entries="$(_emit_explicit_chart_entry "$target" "$prompt_path" "" "")" || return 1
       fi
-      [[ -n "$prompt_path" ]] || \
-        die "no chart found under ${target} — pass --chart <dir> or place a chart at ${target}/k8s/chart"
-      entries="$(_emit_explicit_chart_entry "$target" "$prompt_path" "" "")" || return 1
     fi
   fi
 
