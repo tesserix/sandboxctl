@@ -65,11 +65,12 @@ SANDBOX_HTTP_PORT="${SANDBOX_HTTP_PORT:-8080}"
 
 # Registry: a registry:2 Pod inside $REGISTRY_NS, accessed from the Mac via
 # a kubectl port-forward to host port $SANDBOX_REGISTRY_PORT. Image
-# references stay identical from both sides — `localhost:5001/img:tag`
+# references stay identical from both sides — `localhost:5050/img:tag`
 # pushes from the Mac and pulls from in-cluster Pods. The cluster's
 # containerd is configured (in kind-config.yaml) to forward
-# `localhost:5001` to the in-cluster Service.
-SANDBOX_REGISTRY_PORT="${SANDBOX_REGISTRY_PORT:-5001}"
+# `localhost:5050` to the in-cluster Service. Default 5050 chosen to
+# avoid clashing with Docker Desktop's :5001 registry mirror.
+SANDBOX_REGISTRY_PORT="${SANDBOX_REGISTRY_PORT:-5050}"
 SANDBOX_REGISTRY_STORAGE="${SANDBOX_REGISTRY_STORAGE:-12Gi}"
 SANDBOX_STATE_DIR="${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}"
 SANDBOX_STATE_FILE="${SANDBOX_STATE_DIR}/setup.yaml"
@@ -800,9 +801,12 @@ _check_port_or_die() {
     die "killed stale sandboxctl listener on :${port} but the port is still occupied — try 'sandboxctl restart'"
   fi
   cmdline="$(ps -p "$pid" -o command= 2>/dev/null || echo unknown)"
+  # Suggest a concrete alternative port. Add 100 to dodge the typical
+  # tools (8543 vs 8443, 5150 vs 5050, 8180 vs 8080).
+  local alt_port=$(( port + 100 ))
   die "${label} port :${port} is in use by an unrelated process (pid ${pid}: ${cmdline}).
-       Either stop that process, or set SANDBOX_${label}_PORT=<unused-port> and re-run.
-       Example:  SANDBOX_HTTPS_PORT=8543 sandboxctl up"
+       Either stop that process, or pick a different port and re-run.
+       Example:  SANDBOX_${label}_PORT=${alt_port} sandboxctl up"
 }
 
 write_portfwd_plist() {
@@ -1558,7 +1562,7 @@ env overrides:
   SANDBOX_DOMAIN              local DNS suffix (default: sandbox.app)
   SANDBOX_HTTP_PORT           host port for HTTP (default: 8080)
   SANDBOX_HTTPS_PORT          host port for HTTPS (default: 8443)
-  SANDBOX_REGISTRY_PORT       host port for the in-cluster registry (default: 5001)
+  SANDBOX_REGISTRY_PORT       host port for the in-cluster registry (default: 5050)
   SANDBOX_REGISTRY_STORAGE    PVC size for the registry (default: 12Gi)
   PODMAN_MACHINE_CPUS         CPUs for podman machine init (default: 4)
   PODMAN_MACHINE_MEMORY_MIB   RAM in MiB for podman machine (default: 6144)

@@ -6,11 +6,11 @@ apiVersion: kind.x-k8s.io/v1alpha4
 # get bound inside the podman VM but never published to the Mac.
 nodes:
   - role: control-plane
-# Forward in-cluster pulls of `localhost:5001/<image>` to the in-cluster
+# Forward in-cluster pulls of `localhost:5050/<image>` to the in-cluster
 # registry Service. The Mac pushes via a separate kubectl port-forward to
-# the same Service on host port 5001, so the image reference is identical
-# from both sides.
+# the same Service on host port 5050, so the image reference is identical
+# from both sides. Default chosen to avoid Docker Desktop's :5001.
 containerdConfigPatches:
   - |-
-    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5050"]
       endpoint = ["http://registry.sandboxctl-registry.svc.cluster.local:5000"]
