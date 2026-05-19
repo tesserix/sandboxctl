@@ -536,6 +536,36 @@ purge_ollama() {
   fi
 }
 
+# ----- Dev CLIs (claude + codex) -----
+
+ensure_dev_clis() {
+  # claude (Claude Code) and codex (OpenAI Codex CLI) are useful agentic
+  # CLIs that pair well with the kagent demo. Install if missing; skip
+  # silently if already present. Authentication is per-user (API key or
+  # interactive login) — we don't manage that here; we just print a hint
+  # at the end of `up`.
+  command -v brew >/dev/null 2>&1 || { warn "brew unavailable — skipping claude + codex install"; return 0; }
+
+  ensure_node    # claude is npm-only; codex prefers brew but we keep node available either way
+
+  if ! command -v claude >/dev/null 2>&1; then
+    log "installing Claude Code via npm (one-time)"
+    npm install -g @anthropic-ai/claude-code >/dev/null
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    log "installing Codex via brew (one-time)"
+    brew install --cask codex >/dev/null
+  fi
+
+  ok "dev CLIs ready: claude=$(command -v claude || echo missing), codex=$(command -v codex || echo missing)"
+}
+
+ensure_node() {
+  if command -v node >/dev/null 2>&1; then return 0; fi
+  log "installing Node.js via brew (required by claude)"
+  brew install node >/dev/null
+}
+
 helm_istio() {
   # $1 release, $2 chart, rest passed verbatim to helm.
   local release="$1" chart="$2"; shift 2
@@ -696,13 +726,74 @@ portfwd_running() {
   launchctl list 2>/dev/null | awk -v label="$SANDBOX_LAUNCHAGENT_LABEL" '$3==label {print $1}' | grep -qE '^[0-9]+$'
 }
 
+# Labels from prior sandboxctl versions. uninstall_portfwd unloads them too
+# so a fresh install isn't fighting a stale stuck listener that still owns
+# the port. Add to this list when the active label changes.
+LEGACY_LAUNCHAGENT_LABELS=(
+  com.zendesk.sandboxctl.portfwd
+)
+
 uninstall_portfwd() {
   if [[ -f "$SANDBOX_LAUNCHAGENT_PLIST" ]]; then
     log "unloading + removing LaunchAgent ${SANDBOX_LAUNCHAGENT_LABEL}"
     launchctl unload "$SANDBOX_LAUNCHAGENT_PLIST" >/dev/null 2>&1 || true
     rm -f "$SANDBOX_LAUNCHAGENT_PLIST"
   fi
+  local legacy
+  for legacy in "${LEGACY_LAUNCHAGENT_LABELS[@]}"; do
+    local legacy_plist="${SANDBOX_LAUNCHAGENT_DIR}/${legacy}.plist"
+    if [[ -f "$legacy_plist" ]]; then
+      log "removing legacy LaunchAgent ${legacy}"
+      launchctl unload "$legacy_plist" >/dev/null 2>&1 || true
+      rm -f "$legacy_plist"
+    fi
+    launchctl remove "$legacy" >/dev/null 2>&1 || true
+  done
   pkill -f "port-forward.*svc/istio-ingress" >/dev/null 2>&1 || true
+}
+
+# port_listener_pid prints the PID listening on TCP 127.0.0.1:<port> on the
+# Mac, or empty if nothing is bound there. Uses lsof which is always present
+# on macOS.
+port_listener_pid() {
+  local port="$1"
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+# Best-effort identity check — is the process bound to $1 something we can
+# safely kill (i.e. a sandboxctl-owned kubectl port-forward), vs a foreign
+# process we should refuse to touch?
+port_listener_is_ours() {
+  local port="$1" pid cmdline
+  pid="$(port_listener_pid "$port")"
+  [[ -n "$pid" ]] || return 1
+  cmdline="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$cmdline" == *"port-forward"*"svc/istio-ingress"* ]]
+}
+
+free_port_or_die() {
+  # Make sure $SANDBOX_HTTPS_PORT and $SANDBOX_HTTP_PORT are bindable. If
+  # they're held by a previous sandboxctl, kill it and retry. If they're
+  # held by a foreign process, fail with a clear, actionable error.
+  local port label
+  for port_label in "HTTP:$SANDBOX_HTTP_PORT" "HTTPS:$SANDBOX_HTTPS_PORT"; do
+    label="${port_label%%:*}"
+    port="${port_label##*:}"
+    local pid
+    pid="$(port_listener_pid "$port")"
+    [[ -n "$pid" ]] || continue
+    if port_listener_is_ours "$port"; then
+      log "${label} port :${port} held by a stale sandboxctl port-forward (pid ${pid}) — killing"
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+    else
+      local cmdline
+      cmdline="$(ps -p "$pid" -o command= 2>/dev/null || echo unknown)"
+      die "${label} port :${port} is in use by an unrelated process (pid ${pid}: ${cmdline}).
+       Either stop that process, or set SANDBOX_${label}_PORT=<unused-port> and re-run.
+       Example:  SANDBOX_HTTPS_PORT=8543 sandboxctl up"
+    fi
+  done
 }
 
 write_portfwd_plist() {
@@ -739,6 +830,7 @@ EOF
 install_portfwd() {
   log "installing kubectl port-forward LaunchAgent (Mac :${SANDBOX_HTTP_PORT}/:${SANDBOX_HTTPS_PORT} → svc/istio-ingress)"
   uninstall_portfwd
+  free_port_or_die        # fail fast on foreign conflicts; clean up our own stale state
   write_portfwd_plist
   launchctl load "$SANDBOX_LAUNCHAGENT_PLIST"
   local i
