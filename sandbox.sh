@@ -40,6 +40,19 @@ KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
 KAGENT_OLLAMA_HOST="${KAGENT_OLLAMA_HOST:-host.docker.internal:11434}"
 KAGENT_OLLAMA_MODEL="${KAGENT_OLLAMA_MODEL:-llama3.2}"
 
+# Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
+# pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
+# CD pulls from that URL — proper GitOps loop without needing external
+# git creds. Chart pinned for reproducibility; rootless image + sqlite
+# keeps the install footprint tiny (one Pod + a 1Gi PVC).
+GITEA_NS="${GITEA_NS:-gitea}"
+GITEA_CHART_VERSION="${GITEA_CHART_VERSION:-12.5.0}"
+GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-sandbox}"
+# Org under which `sandboxctl deploy` pushes chart repos. Must NOT
+# collide with GITEA_ADMIN_USER — Gitea's API rejects org creation with
+# 422 "user already exists" when the names match.
+GITEA_ORG="${GITEA_ORG:-apps}"
+
 SANDBOX_DOMAIN="${SANDBOX_DOMAIN:-sandbox.app}"
 
 # Demo app: Argo CD watches this repo + path. Override to point at a fork.
@@ -317,17 +330,27 @@ configure_node_registry_mirror() {
 
   log "configuring containerd registry mirror localhost:${SANDBOX_REGISTRY_PORT} → in-cluster registry"
   host_dir="/etc/containerd/certs.d/localhost:${SANDBOX_REGISTRY_PORT}"
+  # Two notes:
+  #  1. `podman exec` (and `docker exec`) require `-i` for stdin to flow
+  #     into the in-container `sh -c "cat > …"`. Without it the heredoc
+  #     hits EOF immediately and writes a zero-byte hosts.toml.
+  #  2. The mirror endpoint must be a host the kind node's containerd
+  #     can resolve. Cluster-DNS Service names (registry.<ns>.svc.cluster.local)
+  #     fail because the kind node's resolver doesn't go through
+  #     CoreDNS. Use 127.0.0.1:<NodePort> instead — `install_registry`
+  #     pins the Service to NodePort 30050 inside the kind node.
+  local registry_endpoint="http://127.0.0.1:${SANDBOX_REGISTRY_NODEPORT}"
   for node in $nodes; do
     "$SANDBOX_RUNTIME" exec "$node" mkdir -p "$host_dir"
-    "$SANDBOX_RUNTIME" exec "$node" sh -c "cat > '$host_dir/hosts.toml'" <<EOF
+    "$SANDBOX_RUNTIME" exec -i "$node" sh -c "cat > '$host_dir/hosts.toml'" <<EOF
 server = "https://registry-1.docker.io"
 
-[host."http://registry.${REGISTRY_NS}.svc.cluster.local:5000"]
+[host."${registry_endpoint}"]
   capabilities = ["pull", "resolve"]
   skip_verify = true
 EOF
   done
-  ok "registry mirror configured on $(echo "$nodes" | wc -w | tr -d ' ') node(s)"
+  ok "registry mirror configured on $(echo "$nodes" | wc -w | tr -d ' ') node(s) → ${registry_endpoint}"
 }
 
 install_cert_manager() {
@@ -571,6 +594,141 @@ install_kagent() {
   kc -n "$KAGENT_NS" wait --for=condition=ready --timeout=180s \
     pod -l app.kubernetes.io/component=ui >/dev/null
   ok "kagent ready (UI: https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT})"
+}
+
+# In-cluster Gitea — the GitOps source for `sandboxctl deploy`.
+#
+# Why in-cluster instead of GitHub: Argo CD pulls the chart from this
+# repo, so the URL has to be reachable from argocd-repo-server. Using
+# an external host (GitHub, etc.) would mean either making every test
+# repo public or wiring credentials through argocd-repo-server. With
+# Gitea inside the cluster, both sandboxctl (host side) and Argo (in-
+# cluster) can push/pull anonymously over the cluster network.
+#
+# Layout: rootless image + sqlite + a single 1Gi PVC. No HTTP route
+# is created (this is the GitOps backend, not a UI surface). sandboxctl
+# reaches Gitea by `kubectl exec`-ing the pod for git ops; Argo reaches
+# it via http://gitea-http.gitea.svc.cluster.local:3000.
+install_gitea() {
+  log "installing Gitea (ns: $GITEA_NS, chart $GITEA_CHART_VERSION) — GitOps source for 'sandboxctl deploy'"
+
+  helm repo add gitea-charts https://dl.gitea.com/charts/ >/dev/null 2>&1 || true
+  helm repo update gitea-charts >/dev/null
+
+  # Random admin password persisted to ~/.sandboxctl/gitea-admin-pass.
+  # Read once during initial install; subsequent `sandboxctl up` calls
+  # reuse the file so existing repos remain accessible.
+  mkdir -p "$SANDBOX_STATE_DIR"
+  local pass_file="${SANDBOX_STATE_DIR}/gitea-admin-pass"
+  if [[ ! -s "$pass_file" ]]; then
+    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 > "$pass_file"
+    chmod 600 "$pass_file"
+  fi
+  local admin_pass; admin_pass="$(cat "$pass_file")"
+
+  # Single-Pod gitea: sqlite + in-process queue/cache/session, no
+  # subchart dependencies (valkey-cluster + postgresql-ha are enabled
+  # by default in the gitea helm chart and are overkill for a one-user
+  # sandbox).
+  helm upgrade --install gitea gitea-charts/gitea \
+    --namespace "$GITEA_NS" --create-namespace \
+    --version "$GITEA_CHART_VERSION" \
+    --set "gitea.admin.username=${GITEA_ADMIN_USER}" \
+    --set "gitea.admin.password=${admin_pass}" \
+    --set 'gitea.admin.email=sandbox@local' \
+    --set 'gitea.config.database.DB_TYPE=sqlite3' \
+    --set 'gitea.config.cache.ADAPTER=memory' \
+    --set 'gitea.config.session.PROVIDER=memory' \
+    --set 'gitea.config.queue.TYPE=level' \
+    --set 'gitea.config.indexer.ISSUE_INDEXER_TYPE=bleve' \
+    --set 'valkey-cluster.enabled=false' \
+    --set 'valkey.enabled=false' \
+    --set 'postgresql-ha.enabled=false' \
+    --set 'postgresql.enabled=false' \
+    --set 'redis-cluster.enabled=false' \
+    --set 'redis.enabled=false' \
+    --set 'memcached.enabled=false' \
+    --set 'persistence.size=1Gi' \
+    --set 'replicaCount=1' \
+    --set 'service.http.port=3000' \
+    --wait --timeout 8m
+
+  kc -n "$GITEA_NS" rollout status deploy/gitea --timeout=180s >/dev/null
+
+  # Create the `sandbox` org once (idempotent — gitea CLI returns 422 if
+  # it already exists, which is fine). Run inside the pod so we don't
+  # need to expose the API to the host.
+  kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+    su git -c "gitea admin user list" >/dev/null 2>&1 || true
+
+  if ! kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+        sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' http://127.0.0.1:3000/api/v1/orgs/${GITEA_ORG}" \
+        >/dev/null 2>&1; then
+    kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+      sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+        -H 'Content-Type: application/json' \
+        -d '{\"username\":\"${GITEA_ORG}\",\"visibility\":\"public\"}' \
+        http://127.0.0.1:3000/api/v1/orgs" >/dev/null \
+      || warn "could not create gitea org '${GITEA_ORG}' — sandboxctl deploy will retry"
+  fi
+
+  ok "gitea ready (in-cluster: http://gitea-http.${GITEA_NS}.svc.cluster.local:3000)"
+}
+
+# Push (or refresh) a chart subtree to Gitea over a kubectl-exec'd git
+# session. Returns the in-cluster repo URL on stdout.
+#
+# Args: $1 = repo name (e.g. <chart>-chart); $2 = local source dir.
+gitea_push_chart() {
+  local repo_name="$1" src_dir="$2"
+  [[ -d "$src_dir" ]] || die "gitea_push_chart: source dir not found: $src_dir"
+
+  local pass_file="${SANDBOX_STATE_DIR}/gitea-admin-pass"
+  [[ -s "$pass_file" ]] || die "gitea password file missing — run 'sandboxctl up' first"
+  local admin_pass; admin_pass="$(cat "$pass_file")"
+
+  # Create the repo via Gitea API if it doesn't exist. Idempotent.
+  kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+    sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+      http://127.0.0.1:3000/api/v1/repos/${GITEA_ORG}/${repo_name}" >/dev/null 2>&1 || \
+  kc -n "$GITEA_NS" exec deploy/gitea -c gitea -- \
+    sh -c "curl -sf -u '${GITEA_ADMIN_USER}:${admin_pass}' \
+      -H 'Content-Type: application/json' \
+      -d '{\"name\":\"${repo_name}\",\"auto_init\":true,\"default_branch\":\"main\"}' \
+      http://127.0.0.1:3000/api/v1/orgs/${GITEA_ORG}/repos" >/dev/null \
+    || die "could not create gitea repo ${GITEA_ORG}/${repo_name}"
+
+  # Push the chart via host-side git over a port-forward.
+  local pf_pid="" tmp
+  tmp="$(mktemp -d -t sandboxctl-gitea.XXXXXX)"
+  # shellcheck disable=SC2064  # intentional now-expansion of $tmp; pf_pid is set later
+  trap 'rm -rf "$tmp"; [[ -n "$pf_pid" ]] && kill "$pf_pid" 2>/dev/null || true' RETURN
+
+  kc -n "$GITEA_NS" port-forward svc/gitea-http 13000:3000 >/dev/null 2>&1 &
+  pf_pid=$!
+  # Wait for port-forward to bind. lsof -i is faster than nc-style polling.
+  local i
+  for ((i=0; i<30; i++)); do
+    curl -sf "http://127.0.0.1:13000/api/v1/version" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+
+  local push_url="http://${GITEA_ADMIN_USER}:${admin_pass}@127.0.0.1:13000/${GITEA_ORG}/${repo_name}.git"
+
+  (
+    set -e
+    cp -R "${src_dir}/." "$tmp/"
+    cd "$tmp"
+    git init -q -b main
+    git config user.email "sandbox@local"
+    git config user.name  "sandboxctl"
+    git add -A
+    git commit -q -m "sandboxctl: chart snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)" --allow-empty
+    git remote add origin "$push_url"
+    git push -q -f origin main
+  ) || die "git push to gitea failed"
+
+  echo "http://gitea-http.${GITEA_NS}.svc.cluster.local:3000/${GITEA_ORG}/${repo_name}.git"
 }
 
 helm_istio() {
@@ -1168,6 +1326,7 @@ cmd_up() {
   install_registry
   install_demo_app
   install_kagent
+  install_gitea
   install_istio_ambient
   install_routes
   install_hosts
@@ -1498,7 +1657,7 @@ cmd_build_from_manifest() {
 
     local image="localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
     # Aliases become extra -t flags so downstream Dockerfiles' FROMs
-    # (e.g. `FROM fiber-agent-sdk`) resolve to the freshly-built image.
+    # (e.g. `FROM my-base:latest`) resolve to the freshly-built image.
     local extra_tags=()
     if [[ -n "$aliases" ]]; then
       local alias
@@ -1667,6 +1826,625 @@ registry_images_gc() {
 }
 
 # ============================================================================
+# Deploy / undeploy (Argo-managed apps with auto-routed sandbox.app URLs)
+# ============================================================================
+
+# Walk <target> for every Helm chart and every directory of rendered
+# manifests. Emits one tab-separated entry per discovered app:
+#
+#   <kind>\t<chart-name>\t<absolute-source-dir>\t<values-file>
+#
+# kind is "helm" (Chart.yaml present) or "directory" (rendered manifests).
+# values-file is empty for "directory" entries; for helm entries it's a
+# filename relative to the chart dir, picked from a fixed preference
+# list (see _emit_chart_entry below).
+#
+# chart-name comes from Chart.yaml's `name:` field for helm entries, or
+# from the directory basename for "directory" entries. That name becomes
+# the Argo Application name and the routed hostname's left-half.
+#
+# Discovery scope (in <target>, recursive within reasonable depth):
+#   1. <target>/chart/Chart.yaml             — single in-repo chart
+#   2. <target>/helm/Chart.yaml              — single in-repo chart
+#   3. <target>/charts/<svc>/Chart.yaml      — multi-service repo
+#   4. Any other Chart.yaml within depth 5   — catch-alls (e.g.
+#                                              manifests/<svc>/chart/)
+#   5. <target>/deploy/, <target>/k8s/       — rendered manifests
+#                                              (only when no chart was
+#                                              found above)
+#
+# Callers can bypass discovery entirely by passing --chart and
+# --values to cmd_deploy.
+discover_app_charts() {
+  local target="$1"
+  local found=0
+
+  # Pull every Chart.yaml under <target> within a sane depth. find's
+  # -prune skips the heavy directories (vendor, node_modules, .git,
+  # dist) so we don't walk through huge dependency trees.
+  local chart_yml seen_dirs=""
+  while IFS= read -r chart_yml; do
+    [[ -n "$chart_yml" ]] || continue
+    # De-dupe in case multiple finds catch the same dir.
+    case ":$seen_dirs:" in *":$(dirname "$chart_yml"):"*) continue ;; esac
+    seen_dirs="${seen_dirs}:$(dirname "$chart_yml")"
+    _emit_chart_entry "$chart_yml" || continue
+    found=1
+  done < <(
+    find "$target" -maxdepth 5 -type d \
+        \( -name node_modules -o -name vendor -o -name dist -o -name .git \) -prune \
+      -o -type f -name Chart.yaml -print 2>/dev/null
+  )
+
+  # Rendered-manifest dirs at the repo root. Only emit if no chart was
+  # discovered (Helm wins) — chart + raw manifests in the same repo
+  # would otherwise double-deploy the same workload.
+  if (( found == 0 )); then
+    local p base
+    base="$(basename "$target")"
+    for p in deploy k8s; do
+      [[ -d "${target}/${p}" ]] && {
+        printf 'directory\t%s\t%s\t\n' "$base" "${target}/${p}"
+        found=1
+        break
+      }
+    done
+  fi
+
+  (( found > 0 )) || return 1
+  return 0
+}
+
+# Emit one helm row to stdout for the chart whose Chart.yaml is at $1.
+# Resolves the chart's `name:` field and picks the best values file.
+# Returns non-zero (and emits nothing) if the chart name is unreadable.
+_emit_chart_entry() {
+  local chart_yml="$1"
+  local chart_dir name values=""
+  chart_dir="$(cd "$(dirname "$chart_yml")" && pwd)"
+
+  # Chart names tend to be a single token on a `name:` line — a
+  # one-pass sed is enough; no need for a yaml parser here.
+  name="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "$chart_yml" | head -n1)"
+  [[ -n "$name" ]] || return 1
+
+  # Prefer values-sandbox.yaml (sandboxctl-specific overrides). Fall
+  # back to values-local.yaml for charts that haven't been
+  # sandbox-ified yet. Charts with neither still deploy with the
+  # chart's baseline values.yaml.
+  if   [[ -f "${chart_dir}/values-sandbox.yaml" ]]; then values="values-sandbox.yaml"
+  elif [[ -f "${chart_dir}/values-local.yaml"   ]]; then values="values-local.yaml"
+  fi
+
+  printf 'helm\t%s\t%s\t%s\n' "$name" "$chart_dir" "$values"
+}
+
+ensure_secrets_for_namespace() {
+  # If $target/k8s/secrets.yaml exists, apply it into $namespace.
+  # If only secrets.example.yaml exists, copy → secrets.yaml, ensure
+  # gitignore, prompt the user to fill it, then apply on Enter.
+  local target="$1" namespace="$2"
+  local k8s_dir="${target}/k8s"
+  local secrets="${k8s_dir}/secrets.yaml"
+  local example="${k8s_dir}/secrets.example.yaml"
+
+  if [[ ! -d "$k8s_dir" ]]; then
+    log "no k8s/ directory in ${target} — skipping secret management"
+    return 0
+  fi
+
+  if [[ ! -f "$secrets" ]]; then
+    [[ -f "$example" ]] || { warn "no k8s/secrets.yaml or k8s/secrets.example.yaml — skipping secret management"; return 0; }
+    log "creating k8s/secrets.yaml from k8s/secrets.example.yaml"
+    cp "$example" "$secrets"
+    ensure_gitignore_entry "$target" "k8s/secrets.yaml"
+    cat <<EOF
+
+  k8s/secrets.yaml has been created from the example. Edit it now and
+  set base64-encoded values for each key. To encode a value:
+
+      echo -n 'your-secret' | base64
+
+  Press Enter when you have finished editing the file (Ctrl+C to abort)…
+EOF
+    read -r _
+  fi
+
+  # Validate: refuse to apply if any obvious placeholder is left.
+  if grep -qE '<base64-encoded-[a-z-]+>' "$secrets" 2>/dev/null; then
+    die "k8s/secrets.yaml still contains <base64-encoded-...> placeholders — fill them in and re-run"
+  fi
+
+  log "applying k8s/secrets.yaml into namespace ${namespace}"
+  kc create namespace "$namespace" --dry-run=client -o yaml | kc apply -f - >/dev/null
+  # Force the namespace from the manifest to whatever we resolved (so a
+  # secrets.yaml that hard-codes `namespace: <app>` still lands in
+  # `<app>-staging` when the caller passed --env=staging).
+  sed -E "s|^([[:space:]]*namespace:[[:space:]]*).*$|\1${namespace}|" "$secrets" \
+    | kc apply -f - >/dev/null
+  ok "secrets applied"
+}
+
+ensure_gitignore_entry() {
+  local target="$1" entry="$2"
+  local gi="${target}/.gitignore"
+  if [[ ! -f "$gi" ]] || ! grep -qxF "$entry" "$gi"; then
+    log "adding ${entry} to ${gi}"
+    echo "$entry" >> "$gi"
+  fi
+}
+
+# Compute the namespace + hostname for an app/env pair.
+deploy_namespace_for() {
+  local app="$1" env="$2"
+  if [[ "$env" == "dev" ]]; then echo "$app"
+  else echo "${app}-${env}"
+  fi
+}
+deploy_hostname_for() {
+  # Hostname is per-app (not per-env). The env still differentiates the
+  # destination namespace via deploy_namespace_for, so dev/staging
+  # don't collide on the cluster — but the URL stays stable, which is
+  # what users actually want for browser bookmarks. Override at the
+  # call site only when truly needed (no caller does today).
+  local app="$1"
+  echo "${app}.${SANDBOX_DOMAIN}"
+}
+
+# Add a VirtualService routing $hostname:$SANDBOX_HTTPS_PORT to the
+# given Service in the given namespace. Idempotent.
+add_app_route() {
+  local hostname="$1" namespace="$2" svc_host="$3" svc_port="$4"
+  local vs_name="sandboxctl-${hostname//./-}"
+  log "adding Istio route ${hostname} → ${svc_host}:${svc_port}"
+  kc apply -f - <<EOF >/dev/null
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: { name: ${vs_name}, namespace: ${namespace} }
+spec:
+  hosts: ["${hostname}"]
+  gateways: ["${ISTIO_INGRESS_NS}/sandbox-gateway"]
+  http:
+    - route: [{ destination: { host: ${svc_host}.${namespace}.svc.cluster.local, port: { number: ${svc_port} } } }]
+EOF
+}
+
+remove_app_route() {
+  local hostname="$1" namespace="$2"
+  local vs_name="sandboxctl-${hostname//./-}"
+  kc -n "$namespace" delete virtualservice "$vs_name" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+# Add (or remove) a hostname to the sandboxctl-managed /etc/hosts line.
+add_app_host() {
+  local hostname="$1"
+  if grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${hostname}\b" /etc/hosts; then
+    return 0
+  fi
+  prime_sudo
+  local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
+  # If the sandboxctl-managed line already exists (cmd_up wrote it),
+  # append the new hostname there; otherwise add a fresh line. This
+  # second branch matters when add_app_host runs before cmd_up has
+  # written the marker.
+  if grep -qF "${SANDBOX_HOSTS_MARKER}" /etc/hosts; then
+    awk -v host="$hostname" -v marker="$SANDBOX_HOSTS_MARKER" '
+      {
+        if (index($0, marker) > 0 && index($0, host) == 0) {
+          sub(marker, host " " marker)
+        }
+        print
+      }
+    ' /etc/hosts > "$tmp"
+  else
+    cp /etc/hosts "$tmp"
+    printf '127.0.0.1\t%s\t%s\n' "$hostname" "$SANDBOX_HOSTS_MARKER" >> "$tmp"
+  fi
+
+  if ! sudo install -m 0644 "$tmp" /etc/hosts 2>/dev/null; then
+    rm -f "$tmp"
+    die "failed to write /etc/hosts (sudo) — re-run from an interactive terminal so sudo can prompt"
+  fi
+  rm -f "$tmp"
+
+  # macOS caches name lookups (including misses) for several seconds.
+  # Flush it so the new entry resolves immediately — without this, the
+  # browser keeps showing ERR_NAME_NOT_RESOLVED for a noticeable
+  # window after the deploy says "OK".
+  sudo dscacheutil -flushcache 2>/dev/null || true
+  sudo killall -HUP mDNSResponder 2>/dev/null || true
+
+  ok "/etc/hosts: ${hostname} → 127.0.0.1"
+}
+
+remove_app_host() {
+  local hostname="$1"
+  if ! grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${hostname}\b" /etc/hosts; then
+    return 0
+  fi
+  prime_sudo
+  local tmp; tmp="$(mktemp -t sandbox-hosts.XXXXXX)"
+  sed -E "s| ${hostname}\b||g" /etc/hosts > "$tmp"
+  sudo install -m 0644 "$tmp" /etc/hosts
+  rm -f "$tmp"
+}
+
+cmd_deploy() {
+  # Usage: sandboxctl deploy [path] [--env <name>] [--chart <dir>]
+  #                          [--values <file>] [--name <name>] [--no-build]
+  local target="" env="dev" do_build=1
+  local chart_override="" values_override="" name_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --env)      env="$2"; shift 2 ;;
+      --chart)    chart_override="$2"; shift 2 ;;
+      --values)   values_override="$2"; shift 2 ;;
+      --name)     name_override="$2"; shift 2 ;;
+      --no-build) do_build=0; shift ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl deploy [path] [--env <name>]
+                  [--chart <dir>] [--values <file>] [--name <name>]
+                  [--no-build]
+
+Run from your product directory (one that contains your Dockerfile(s)
+and chart). With no flags, walks <path> (default: cwd) for every
+Chart.yaml and rendered-manifest directory and deploys each as its own
+Argo CD Application.
+
+Pipeline (per discovered chart):
+  1. Build + push every Dockerfile listed in <path>/sandboxctl.yaml,
+     or auto-walk Dockerfiles when no manifest exists. Skip with
+     --no-build (useful when iterating only on chart edits).
+  2. Apply <path>/k8s/secrets.yaml to each chart's target namespace,
+     prompting to fill placeholders on first run.
+  3. Push the chart to the in-cluster Gitea, create one Argo CD
+     Application per chart syncing from Gitea, and route
+     <chart>.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT} to the
+     chart's primary Service.
+
+Auto-discovery:
+  <path>/chart/Chart.yaml                in-repo chart
+  <path>/helm/Chart.yaml                 in-repo chart
+  <path>/charts/<svc>/Chart.yaml         multi-service repo
+  any other Chart.yaml within depth 5    catch-all (e.g.
+                                         manifests/<svc>/chart/)
+  <path>/deploy/                         rendered manifests
+  <path>/k8s/                              (only when no chart found)
+
+Override flags (skip auto-discovery and deploy a single chart):
+  --chart <dir>     Path to a chart directory containing Chart.yaml.
+                    Relative paths resolve from <path>.
+  --values <file>   Values file inside <chart>. Defaults to
+                    values-sandbox.yaml, then values-local.yaml.
+  --name <name>     Override the Argo Application + routed hostname
+                    name. Defaults to the chart's "name:" field.
+
+Defaults:
+  --env  dev   (namespace = <chart>; URL = <chart>.${SANDBOX_DOMAIN})
+               # --env=staging puts the chart in <chart>-staging while
+               # the URL stays <chart>.${SANDBOX_DOMAIN}, so each env
+               # is one app slot — re-deploy with --env=<other> swaps
+               # which namespace the same hostname routes to.
+EOF
+        return 0
+        ;;
+      -*) die "unknown flag: $1" ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; shift
+        else die "unexpected argument: $1"
+        fi ;;
+    esac
+  done
+  require_running_cluster
+  target="${target:-.}"
+  target="$(cd "$target" && pwd)"
+
+  local entries
+  if [[ -n "$chart_override" ]]; then
+    # Resolve --chart against $target if it's relative.
+    local chart_dir
+    if [[ "$chart_override" == /* ]]; then
+      chart_dir="$chart_override"
+    else
+      chart_dir="${target}/${chart_override}"
+    fi
+    [[ -d "$chart_dir" ]] || die "--chart: directory not found: $chart_dir"
+    chart_dir="$(cd "$chart_dir" && pwd)"
+    [[ -f "${chart_dir}/Chart.yaml" ]] || die "--chart: no Chart.yaml in $chart_dir"
+
+    local cname
+    if [[ -n "$name_override" ]]; then
+      cname="$name_override"
+    else
+      cname="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "${chart_dir}/Chart.yaml" | head -n1)"
+      [[ -n "$cname" ]] || die "--chart: Chart.yaml has no readable name; pass --name to override"
+    fi
+
+    local vfile=""
+    if [[ -n "$values_override" ]]; then
+      [[ -f "${chart_dir}/${values_override}" ]] || die "--values: not found in chart: $values_override"
+      vfile="$values_override"
+    elif [[ -f "${chart_dir}/values-sandbox.yaml" ]]; then vfile="values-sandbox.yaml"
+    elif [[ -f "${chart_dir}/values-local.yaml"   ]]; then vfile="values-local.yaml"
+    fi
+
+    entries="$(printf 'helm\t%s\t%s\t%s\n' "$cname" "$chart_dir" "$vfile")"
+  else
+    [[ -z "$values_override" && -z "$name_override" ]] \
+      || die "--values and --name require --chart"
+    entries="$(discover_app_charts "$target")" || \
+      die "no chart, deploy/, or k8s/ dir under ${target} — pass --chart <dir> to point at one explicitly"
+  fi
+
+  log "discovered $(echo "$entries" | wc -l | tr -d ' ') app(s) under ${target}"
+
+  # Prime sudo once up-front (only if /etc/hosts will need new lines).
+  # add_app_host runs once per chart at the end and needs sudo to write
+  # /etc/hosts; primer here means a single prompt instead of one per
+  # chart later in the pipeline.
+  local needs_sudo=0
+  while IFS=$'\t' read -r kind cname _src _vals; do
+    [[ -n "$cname" ]] || continue
+    local _h; _h="$(deploy_hostname_for "$cname" "$env")"
+    if ! grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${_h}\b" /etc/hosts; then
+      needs_sudo=1
+    fi
+  done <<<"$entries"
+
+  # When at least one /etc/hosts entry needs writing, prime sudo now
+  # and keep it alive for the rest of the pipeline. cmd_build can take
+  # several minutes (multi-stage docker builds), and macOS's default
+  # sudo timestamp lifetime (~5 min) would otherwise expire before
+  # add_app_host runs at the end — turning the host write into a
+  # silent failure.
+  if (( needs_sudo )); then
+    prime_sudo
+    start_sudo_keepalive
+  fi
+
+  # Always rebuild + push every Dockerfile listed in sandboxctl.yaml so
+  # the registry matches what the just-pushed chart references. Skipped
+  # only on --no-build, which is useful when iterating on chart edits
+  # without touching code. cmd_build is a no-op if there's no manifest
+  # and no Dockerfiles under <target>.
+  if (( do_build )); then
+    if [[ -f "${target}/sandboxctl.yaml" || -f "${target}/sandboxctl.yml" ]] \
+        || find "$target" -type f -name Dockerfile -not -path '*/.git/*' \
+             -not -path '*/node_modules/*' -not -path '*/vendor/*' \
+             -not -path '*/dist/*' -print -quit 2>/dev/null | grep -q .; then
+      log "running 'sandboxctl build ${target}' first (use --no-build to skip)"
+      cmd_build "$target"
+    else
+      log "no Dockerfiles or sandboxctl.yaml under ${target} — skipping build step"
+    fi
+  fi
+
+  # Iterate every discovered chart. Each becomes one Argo Application
+  # synced from a dedicated Gitea repo (apps/<chart>-chart.git).
+  local kind cname src_dir values_file
+  while IFS=$'\t' read -r kind cname src_dir values_file; do
+    [[ -n "$cname" ]] || continue
+    cname="$(slugify "$cname")"
+
+    local namespace hostname
+    namespace="$(deploy_namespace_for "$cname" "$env")"
+    hostname="$(deploy_hostname_for  "$cname" "$env")"
+
+    log "[${cname}] ${kind} at ${src_dir} → ns ${namespace}, host ${hostname}"
+
+    # Apply secrets from the target repo to the chart's namespace.
+    # Convention: a single <target>/k8s/secrets.yaml at the repo root
+    # feeds every chart in the repo, applied separately into each
+    # chart's namespace. Repos that want per-chart secrets can keep
+    # the file empty and apply their own out-of-band.
+    ensure_secrets_for_namespace "$target" "$namespace"
+
+    kc create namespace "$namespace" --dry-run=client -o yaml | kc apply -f - >/dev/null
+
+    [[ "$kind" == "helm" && -n "$values_file" ]] && \
+      log "[${cname}] using values file: ${values_file}"
+
+    local repo_name="${cname}-chart"
+    local gitea_url
+    gitea_url="$(gitea_push_chart "$repo_name" "$src_dir")"
+    log "[${cname}] pushed chart → ${gitea_url}"
+
+    _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace"
+
+    _wait_argo_health "$cname"
+
+    _route_app_service "$cname" "$namespace" "$hostname"
+  done <<<"$entries"
+
+  _print_deploy_summary "$entries" "$env"
+}
+
+# End-of-deploy summary table. One row per app: name, namespace, Argo
+# sync/health, pods ready, URL. Reads live cluster state so it reflects
+# what actually came up — including charts that timed out before
+# becoming Healthy.
+_print_deploy_summary() {
+  local entries="$1" env="$2"
+  echo
+  log "deploy summary"
+  printf '  %-20s %-22s %-12s %-12s %-10s %s\n' \
+    "APP" "NAMESPACE" "SYNC" "HEALTH" "PODS" "URL"
+  printf '  %-20s %-22s %-12s %-12s %-10s %s\n' \
+    "---" "---------" "----" "------" "----" "---"
+
+  while IFS=$'\t' read -r _kind cname _src _vals; do
+    [[ -n "$cname" ]] || continue
+    cname="$(slugify "$cname")"
+    local ns hostname url sync health pods_ready pods_total
+    ns="$(deploy_namespace_for "$cname" "$env")"
+    hostname="$(deploy_hostname_for "$cname" "$env")"
+    url="https://${hostname}:${SANDBOX_HTTPS_PORT}"
+
+    sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+    health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
+    sync="${sync:--}"
+    health="${health:--}"
+
+    # Count Pods that report Ready=True against total Pods in the
+    # namespace. `wc -l` after filtering with awk avoids needing jq.
+    pods_total="$(kc -n "$ns" get pods --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+    pods_ready="$(kc -n "$ns" get pods --no-headers 2>/dev/null \
+      | awk '$2 ~ /^[0-9]+\/[0-9]+$/ { split($2, a, "/"); if (a[1] == a[2]) c++ } END { print c+0 }')"
+
+    printf '  %-20s %-22s %-12s %-12s %-10s %s\n' \
+      "$cname" "$ns" "$sync" "$health" "${pods_ready}/${pods_total}" "$url"
+  done <<<"$entries"
+
+  echo
+  echo "next:"
+  while IFS=$'\t' read -r _kind cname _src _vals; do
+    [[ -n "$cname" ]] || continue
+    cname="$(slugify "$cname")"
+    printf '  open https://%s:%s\n' "$(deploy_hostname_for "$cname" "$env")" "${SANDBOX_HTTPS_PORT}"
+  done <<<"$entries"
+  echo "  open https://${ARGO_HOST}:${SANDBOX_HTTPS_PORT}    # Argo CD UI"
+  echo "  sandboxctl undeploy --name <app> --env ${env}    # tear one down"
+}
+
+# Apply (or update) one Argo CD Application. Helper for cmd_deploy so
+# the per-chart loop body stays readable.
+_apply_argo_app() {
+  local cname="$1" kind="$2" gitea_url="$3" values_file="$4" namespace="$5"
+
+  log "[${cname}] creating Argo CD Application (source: ${gitea_url}@main)"
+  if [[ "$kind" == "helm" && -n "$values_file" ]]; then
+    kc apply -f - <<EOF >/dev/null
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${cname}
+  namespace: ${ARGOCD_NS}
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: ${gitea_url}
+    targetRevision: main
+    path: .
+    helm:
+      valueFiles: ["${values_file}"]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ${namespace}
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+EOF
+  elif [[ "$kind" == "helm" ]]; then
+    kc apply -f - <<EOF >/dev/null
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${cname}
+  namespace: ${ARGOCD_NS}
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: ${gitea_url}
+    targetRevision: main
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ${namespace}
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+EOF
+  else
+    kc apply -f - <<EOF >/dev/null
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${cname}
+  namespace: ${ARGOCD_NS}
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: ${gitea_url}
+    targetRevision: main
+    path: .
+    directory: { recurse: true }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ${namespace}
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+EOF
+  fi
+}
+
+# Poll Argo CD for an Application to become Synced + Healthy. Times out
+# after 180s with a warning rather than failing — the user can inspect
+# the Argo UI for details and re-run deploy.
+_wait_argo_health() {
+  local cname="$1"
+  log "[${cname}] waiting for Argo CD to sync (Healthy)"
+  local i sync health
+  for ((i=1; i<=60; i++)); do
+    sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+    health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
+    [[ "$sync" == "Synced" && "$health" == "Healthy" ]] && { ok "[${cname}] synced + healthy"; return 0; }
+    sleep 3
+  done
+  warn "[${cname}] did not become Healthy in 180s (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
+}
+
+# Wire one Istio VirtualService + /etc/hosts entry for the app's primary
+# Service. Heuristic: prefer a Service whose name matches the chart, fall
+# back to the first Service in the namespace.
+_route_app_service() {
+  local cname="$1" namespace="$2" hostname="$3"
+  local svc svc_port
+  svc="$(kc -n "$namespace" get svc -o jsonpath="{.items[?(@.metadata.name=='${cname}')].metadata.name}" 2>/dev/null || true)"
+  if [[ -z "$svc" ]]; then
+    svc="$(kc -n "$namespace" get svc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  fi
+  if [[ -n "$svc" ]]; then
+    svc_port="$(kc -n "$namespace" get svc "$svc" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo 80)"
+    add_app_route "$hostname" "$namespace" "$svc" "$svc_port"
+    add_app_host  "$hostname"
+    ok "[${cname}] routed https://${hostname}:${SANDBOX_HTTPS_PORT} → svc/${svc}:${svc_port}"
+  else
+    warn "[${cname}] no Service found in ${namespace} yet — Argo may still be syncing. Re-run 'sandboxctl deploy' once pods are up to wire the route."
+  fi
+}
+
+cmd_undeploy() {
+  require_running_cluster
+  local env="dev" name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --env)  env="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      *) die "unexpected argument: $1" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: sandboxctl undeploy --name <appname> [--env <name>]"
+
+  local namespace hostname
+  namespace="$(deploy_namespace_for "$name" "$env")"
+  hostname="$(deploy_hostname_for "$name" "$env")"
+
+  log "removing Argo Application + route for ${name} (env=${env})"
+  if kc -n "$ARGOCD_NS" get application "$name" >/dev/null 2>&1; then
+    kc -n "$ARGOCD_NS" patch application "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    kc -n "$ARGOCD_NS" delete application "$name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+  remove_app_route "$hostname" "$namespace"
+  remove_app_host  "$hostname"
+  ok "undeployed ${name} (namespace ${namespace} preserved — delete manually if desired)"
+}
+
+# ============================================================================
 # Usage + dispatcher
 # ============================================================================
 
@@ -1692,6 +2470,13 @@ usage:
   sandbox.sh images rm <ref>         delete an image (e.g. 'myapp:v1' or 'myapp' for all tags)
   sandbox.sh images prune            delete every image, then GC blobs
   sandbox.sh images gc               run registry garbage-collector to reclaim disk now
+  sandbox.sh deploy [path] [--env <name>] [--no-build]
+                                     auto-discover every chart under <path> (and sibling repos),
+                                     build + push every Dockerfile, apply k8s/secrets.yaml, push each chart
+                                     to in-cluster Gitea, create one Argo CD Application per chart, and
+                                     route <chart>.${SANDBOX_DOMAIN} per app
+  sandbox.sh undeploy --name <appname> [--env <name>]
+                                     remove the Argo Application, route, and hosts entry (namespace preserved)
 
 env overrides:
   SANDBOX_RUNTIME             podman (default) or docker
@@ -1713,6 +2498,9 @@ env overrides:
   KAGENT_OLLAMA_HOST          Ollama endpoint kagent connects to (default: host.docker.internal:11434)
   KAGENT_OLLAMA_MODEL         model kagent will pull from Ollama (default: llama3.2)
   KARGO_TOKEN_SIGNING_KEY     pin Kargo JWT signing key (default: random per install)
+  GITEA_CHART_VERSION         pin gitea helm chart version (default: 12.5.0)
+  GITEA_ADMIN_USER            admin user created in Gitea (default: sandbox)
+  GITEA_ORG                   org chart repos are pushed under (default: sandbox)
 EOF
 }
 
@@ -1732,6 +2520,8 @@ main() {
     kargo-ui)           cmd_kargo_ui ;;
     build)              shift; cmd_build "$@" ;;
     images)             shift; cmd_images "$@" ;;
+    deploy)             shift; cmd_deploy "$@" ;;
+    undeploy)           shift; cmd_undeploy "$@" ;;
     ""|-h|--help|help)  usage ;;
     *) die "unknown subcommand: $1 (try --help)" ;;
   esac
