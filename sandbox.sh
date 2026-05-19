@@ -1406,9 +1406,13 @@ slugify() {
 }
 
 cmd_build() {
-  # Walks down from the path argument (or cwd), finds Dockerfiles, builds
-  # each, tags as localhost:<port>/<dirname>:<tag>, pushes to the in-cluster
-  # registry. The image reference works identically inside the cluster.
+  # Two modes:
+  #   1. If a sandboxctl.yaml exists in the target dir or at cwd, the
+  #      manifest defines image names, contexts, dependencies, and tags.
+  #      Used for repos with build-order requirements (e.g. one image
+  #      FROMs another) or non-trivial build contexts.
+  #   2. Otherwise the auto-walk: find every Dockerfile under target,
+  #      build each with its own dir as the context, tag and push.
   local target="${1:-.}" tag="${2:-latest}" builder
   builder="$(detect_builder)"
 
@@ -1416,7 +1420,20 @@ cmd_build() {
     die "registry not reachable on localhost:${SANDBOX_REGISTRY_PORT} — run 'sandboxctl up' first"
   fi
 
-  log "scanning ${target} for Dockerfiles (excluding node_modules / vendor / dist / .git)"
+  local manifest=""
+  for candidate in "${target}/sandboxctl.yaml" "${target}/sandboxctl.yml" "$(pwd)/sandboxctl.yaml"; do
+    [[ -f "$candidate" ]] && { manifest="$candidate"; break; }
+  done
+  if [[ -n "$manifest" ]]; then
+    cmd_build_from_manifest "$manifest" "$target" "$tag" "$builder"
+  else
+    cmd_build_auto_walk "$target" "$tag" "$builder"
+  fi
+}
+
+cmd_build_auto_walk() {
+  local target="$1" tag="$2" builder="$3"
+  log "scanning ${target} for Dockerfiles (no sandboxctl.yaml found — using auto-walk)"
   local dockerfiles=()
   while IFS= read -r df; do
     dockerfiles+=("$df")
@@ -1439,9 +1456,9 @@ cmd_build() {
     [[ -n "$name" ]] || name="image"
     image="localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
     log "building ${image}  (context: ${ctx})"
-    "$builder" build -t "$image" -f "$df" "$ctx"
+    "$builder" build -t "$image" -f "$df" "$ctx" || die "build failed for ${df}"
     log "pushing ${image}"
-    "$builder" push "$image"
+    "$builder" push "$image" || die "push failed for ${image}"
     ok "${image}"
   done
 
@@ -1451,6 +1468,145 @@ cmd_build() {
     name="$(slugify "$(basename "$(cd "$(dirname "$df")" && pwd)")")"
     [[ -n "$name" ]] || name="image"
     echo "  image: localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
+  done
+}
+
+cmd_build_from_manifest() {
+  # Read sandboxctl.yaml and orchestrate the build. Format:
+  #
+  #   images:
+  #     - name: agent-sdk
+  #       context: docker/agent-sdk     # build context, relative to repo root
+  #       dockerfile: Dockerfile        # optional; default <context>/Dockerfile
+  #       tag: latest                   # optional; default latest
+  #       aliases: [fiber-agent-sdk:latest]   # optional; extra local tags
+  #                                            # so other Dockerfiles' FROMs
+  #                                            # (e.g. FROM fiber-agent-sdk)
+  #                                            # find the image we just built.
+  #     - name: quality
+  #       context: docker/quality
+  #       depends_on: [agent-sdk]       # optional; build order hint, used
+  #                                      # to fail fast if a dep wasn't built
+  #
+  # Order in the YAML IS the build order — we don't topologically sort.
+  # depends_on only validates that the named dep was built earlier.
+  local manifest="$1" target="$2" default_tag="$3" builder="$4"
+  command -v python3 >/dev/null 2>&1 || die "python3 required to parse $manifest"
+
+  log "building from $manifest"
+  # Walk the YAML, emit one tab-separated line per image:
+  #   name<TAB>context<TAB>dockerfile<TAB>tag<TAB>aliases-comma-sep<TAB>deps-comma-sep
+  # We use python's stdlib only (no PyYAML dependency on user machines).
+  # The parser below is intentionally tolerant — it only needs the four
+  # fields above and is not a full YAML implementation.
+  local entries
+  entries="$(python3 - "$manifest" <<'PY'
+import sys, re
+
+path = sys.argv[1]
+with open(path) as f:
+    raw = f.read()
+
+# Strip comments + collapse blank lines.
+lines = []
+for ln in raw.splitlines():
+    s = ln.split('#', 1)[0].rstrip()
+    if s.strip():
+        lines.append(s)
+
+# Find the 'images:' block and parse list items.
+in_images = False
+items = []
+cur = None
+for ln in lines:
+    if re.match(r'^images\s*:\s*$', ln):
+        in_images = True
+        continue
+    if not in_images:
+        continue
+    m = re.match(r'^(\s+)- (\w+)\s*:\s*(.*)$', ln)
+    if m:
+        if cur:
+            items.append(cur)
+        cur = {m.group(2): m.group(3).strip()}
+        continue
+    m = re.match(r'^(\s+)(\w+)\s*:\s*(.*)$', ln)
+    if m and cur is not None:
+        cur[m.group(2)] = m.group(3).strip()
+        continue
+if cur:
+    items.append(cur)
+
+def parse_list(s):
+    s = s.strip()
+    if not s:
+        return []
+    if s.startswith('['):
+        s = s.strip('[] ')
+        return [x.strip().strip('"\'') for x in s.split(',') if x.strip()]
+    return [s.strip('"\'')]
+
+for it in items:
+    name = it.get('name', '').strip('"\'')
+    if not name:
+        continue
+    ctx = it.get('context', '.').strip('"\'')
+    df = it.get('dockerfile', '').strip('"\'') or f'{ctx}/Dockerfile'
+    tag = it.get('tag', 'latest').strip('"\'')
+    aliases = ','.join(parse_list(it.get('aliases', '')))
+    deps = ','.join(parse_list(it.get('depends_on', '')))
+    print(f'{name}\t{ctx}\t{df}\t{tag}\t{aliases}\t{deps}')
+PY
+)"
+
+  if [[ -z "$entries" ]]; then
+    die "no images parsed from $manifest (check the file format)"
+  fi
+
+  # Resolve paths relative to the manifest's directory.
+  local manifest_dir; manifest_dir="$(cd "$(dirname "$manifest")" && pwd)"
+  local built=()    # names of images we've already built (for depends_on check)
+
+  while IFS=$'\t' read -r name ctx df tag aliases deps; do
+    [[ -n "$name" ]] || continue
+    local abs_ctx="${manifest_dir}/${ctx}"
+    [[ "$ctx" == /* ]] && abs_ctx="$ctx"
+    local abs_df="${manifest_dir}/${df}"
+    [[ "$df" == /* ]] && abs_df="$df"
+
+    # Validate depends_on: every dep must already be in $built.
+    if [[ -n "$deps" ]]; then
+      local dep
+      for dep in ${deps//,/ }; do
+        if [[ " ${built[*]:-} " != *" $dep "* ]]; then
+          die "image '$name' depends_on '$dep' but '$dep' wasn't built earlier in $manifest"
+        fi
+      done
+    fi
+
+    local image="localhost:${SANDBOX_REGISTRY_PORT}/${name}:${tag}"
+    local build_args=(-t "$image")
+    if [[ -n "$aliases" ]]; then
+      local alias
+      for alias in ${aliases//,/ }; do
+        build_args+=(-t "$alias")
+      done
+    fi
+
+    log "building ${image}  (context: ${abs_ctx}${aliases:+  aliases: ${aliases//,/, }})"
+    "$builder" build "${build_args[@]}" -f "$abs_df" "$abs_ctx" || die "build failed for $name"
+
+    log "pushing ${image}"
+    "$builder" push "$image" || die "push failed for $name"
+    ok "${image}"
+    built+=("$name")
+  done <<< "$entries"
+
+  echo
+  echo "Built and pushed ${#built[@]} image(s):"
+  local n
+  for n in "${built[@]}"; do
+    echo "  image: localhost:${SANDBOX_REGISTRY_PORT}/${n}:latest    (or override per Deployment)"
   done
 }
 
