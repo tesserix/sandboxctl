@@ -249,6 +249,193 @@ func TestGlobStaticPrefix(t *testing.T) {
 	}
 }
 
+// The headline fix: a manifest where one image's Dockerfile FROMs
+// another (with a project-name prefix that differs from the manifest
+// slug) should auto-pick up aliases + depends_on, and the build order
+// should put the producer first.
+func TestAutogen_CrossRef_PrefixedFromInfersAliasAndOrder(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fiber") // base name = "fiber"
+	must(t, os.MkdirAll(filepath.Join(root, "docker", "agent-sdk"), 0o755))
+	must(t, os.MkdirAll(filepath.Join(root, "docker", "quality"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "docker", "agent-sdk", "Dockerfile"),
+		[]byte("FROM python:3.12-slim\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "docker", "quality", "Dockerfile"),
+		[]byte("FROM fiber-agent-sdk:latest\nRUN echo hi\n"), 0o644))
+
+	dfs, err := findDockerfiles(root)
+	must(t, err)
+	imgs, warns := buildAutogenImages(root, dfs)
+	if len(warns) != 0 {
+		t.Fatalf("unexpected warnings: %v", warns)
+	}
+	// Producer must come first in the topo-sorted output.
+	if imgs[0].Name != "agent-sdk" {
+		t.Fatalf("expected agent-sdk first after topo sort, got order: %v", imageNames(imgs))
+	}
+	idx := indexByName(imgs)
+	prod := imgs[idx["agent-sdk"]]
+	cons := imgs[idx["quality"]]
+	if !contains(prod.Aliases, "fiber-agent-sdk:latest") {
+		t.Fatalf("producer agent-sdk missing alias 'fiber-agent-sdk:latest', got %v", prod.Aliases)
+	}
+	if !contains(cons.DependsOn, "agent-sdk") {
+		t.Fatalf("consumer quality missing depends_on 'agent-sdk', got %v", cons.DependsOn)
+	}
+}
+
+// External registry refs (docker.io/x, gcr.io/x, alpine, …) must NOT
+// match a sibling image, even when the bare name happens to overlap.
+func TestAutogen_CrossRef_RegistryRefsAreIgnored(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj")
+	must(t, os.MkdirAll(filepath.Join(root, "alpine"), 0o755)) // sibling slug = "alpine"
+	must(t, os.MkdirAll(filepath.Join(root, "user"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "alpine", "Dockerfile"),
+		[]byte("FROM scratch\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "user", "Dockerfile"),
+		[]byte("FROM docker.io/library/alpine:3.20\n"), 0o644))
+
+	dfs, err := findDockerfiles(root)
+	must(t, err)
+	imgs, _ := buildAutogenImages(root, dfs)
+	idx := indexByName(imgs)
+	if got := imgs[idx["alpine"]].Aliases; len(got) != 0 {
+		t.Fatalf("expected no alias on alpine sibling for registry-qualified FROM, got %v", got)
+	}
+	if got := imgs[idx["user"]].DependsOn; len(got) != 0 {
+		t.Fatalf("expected no depends_on for registry-qualified FROM, got %v", got)
+	}
+}
+
+// FROM stage names introduced by `AS` aren't real images.
+func TestAutogen_CrossRef_StageAliasesIgnored(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "p")
+	must(t, os.MkdirAll(filepath.Join(root, "tool"), 0o755))
+	must(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "build", "Dockerfile"),
+		[]byte("FROM scratch\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "tool", "Dockerfile"),
+		[]byte(`FROM golang:1.25 AS build
+RUN echo hi
+FROM scratch
+COPY --from=build /bin/x /x
+`), 0o644))
+
+	dfs, err := findDockerfiles(root)
+	must(t, err)
+	imgs, _ := buildAutogenImages(root, dfs)
+	idx := indexByName(imgs)
+	if got := imgs[idx["build"]].Aliases; len(got) != 0 {
+		t.Fatalf("`build` stage alias should not match sibling 'build', got %v", got)
+	}
+}
+
+// Cycles must not crash; manifest order is preserved with a warning.
+func TestTopoSort_CyclePreservesOrder(t *testing.T) {
+	imgs := []manifestImage{
+		{Name: "a", DependsOn: []string{"b"}},
+		{Name: "b", DependsOn: []string{"a"}},
+	}
+	out, warns := topoSortImages(imgs)
+	if len(warns) == 0 {
+		t.Fatalf("expected cycle warning")
+	}
+	if out[0].Name != "a" || out[1].Name != "b" {
+		t.Fatalf("expected original order preserved on cycle, got %v", imageNames(out))
+	}
+}
+
+// _parse-build-manifest applies the same inference, so a hand-edited
+// manifest gets the auto-fix without regenerating.
+func TestParseBuildManifest_InfersCrossRefsForExistingManifest(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fiber")
+	must(t, os.MkdirAll(filepath.Join(root, "docker", "agent-sdk"), 0o755))
+	must(t, os.MkdirAll(filepath.Join(root, "docker", "quality"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "docker", "agent-sdk", "Dockerfile"),
+		[]byte("FROM python:3.12-slim\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "docker", "quality", "Dockerfile"),
+		[]byte("FROM fiber-agent-sdk:latest\n"), 0o644))
+	manifest := filepath.Join(root, "sandboxctl.yaml")
+	// Hand-written manifest: WRONG order, no aliases, no depends_on.
+	must(t, os.WriteFile(manifest, []byte(`images:
+  - name: quality
+    context: docker/quality
+  - name: agent-sdk
+    context: docker/agent-sdk
+`), 0o644))
+
+	stdout := captureStdout(t, func() { runParseBuildManifest([]string{manifest}) })
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 output lines, got %d:\n%s", len(lines), stdout)
+	}
+	// Producer must come first; aliases on producer; depends_on on consumer.
+	first := strings.Split(lines[0], "\t")
+	second := strings.Split(lines[1], "\t")
+	if first[0] != "agent-sdk" {
+		t.Fatalf("expected agent-sdk first, got %s", first[0])
+	}
+	if first[4] != "fiber-agent-sdk:latest" {
+		t.Fatalf("expected agent-sdk aliases='fiber-agent-sdk:latest', got %q", first[4])
+	}
+	if second[0] != "quality" || second[5] != "agent-sdk" {
+		t.Fatalf("expected quality with depends_on=agent-sdk, got %v", second)
+	}
+}
+
+func indexByName(imgs []manifestImage) map[string]int {
+	out := map[string]int{}
+	for i, img := range imgs {
+		out[img.Name] = i
+	}
+	return out
+}
+
+func imageNames(imgs []manifestImage) []string {
+	out := make([]string, len(imgs))
+	for i, img := range imgs {
+		out[i] = img.Name
+	}
+	return out
+}
+
+func contains(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+	done := make(chan string)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				b.Write(buf[:n])
+			}
+			if err != nil {
+				done <- b.String()
+				return
+			}
+		}
+	}()
+	fn()
+	w.Close()
+	return <-done
+}
+
 func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {

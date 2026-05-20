@@ -97,9 +97,15 @@ func findDockerfiles(root string) ([]string, error) {
 // buildAutogenImages turns each Dockerfile into a manifestImage by
 // inferring its context, then deduplicates names with a -2 / -3 suffix.
 // Returned warnings are descriptive (e.g. "couldn't resolve <src>").
+//
+// After the per-file pass, runs resolveCrossRefs to detect Dockerfiles
+// that `FROM <sibling-image>` and fills in aliases on producers +
+// depends_on on consumers, then topologically sorts so producers come
+// before consumers (cmd_build_from_manifest validates that order).
 func buildAutogenImages(target string, dockerfiles []string) ([]manifestImage, []string) {
 	var (
 		imgs     []manifestImage
+		dfPaths  []string
 		warnings []string
 		taken    = map[string]int{}
 	)
@@ -120,10 +126,7 @@ func buildAutogenImages(target string, dockerfiles []string) ([]manifestImage, [
 		taken[base]++
 
 		ctxRel, err := filepath.Rel(target, ctx)
-		if err != nil {
-			ctxRel = "."
-		}
-		if ctxRel == "" {
+		if err != nil || ctxRel == "" {
 			ctxRel = "."
 		}
 		dfRel, err := filepath.Rel(ctx, df)
@@ -135,14 +138,255 @@ func buildAutogenImages(target string, dockerfiles []string) ([]manifestImage, [
 		// Only emit `dockerfile:` when it's not the default
 		// `<context>/Dockerfile`. Keeps output minimal.
 		if dfRel != "Dockerfile" {
-			// Store relative to manifest dir so the user can read it
-			// in context. manifest.go resolves dockerfile against the
-			// manifest dir, not the context dir.
 			img.Dockerfile = filepath.ToSlash(filepath.Join(ctxRel, dfRel))
 		}
 		imgs = append(imgs, img)
+		dfPaths = append(dfPaths, df)
+	}
+
+	imgs, crossWarn := resolveCrossRefs(imgs, dfPaths, filepath.Base(target))
+	warnings = append(warnings, crossWarn...)
+	imgs, sortWarn := topoSortImages(imgs)
+	warnings = append(warnings, sortWarn...)
+	return imgs, warnings
+}
+
+// resolveCrossRefs scans each image's Dockerfile for `FROM <ref>` lines
+// and, when ref points at a sibling image in the same manifest, fills
+// in:
+//
+//   - producer.Aliases   ← the bare ref (so `podman build -t <ref>`
+//     makes the consumer's FROM resolve locally)
+//   - consumer.DependsOn ← producer.Name (build-order enforcement)
+//
+// Sibling matching (against the bare repo portion of the ref, after
+// stripping registry/host/tag/digest):
+//
+//  1. exact slug match against an image's Name
+//  2. <projectBase>- prefix stripped, then exact slug match
+//     (so `fiber-agent-sdk` matches image `agent-sdk` when the
+//     project's top-level dir is `fiber`)
+//
+// Existing aliases / depends_on entries are preserved. Refs that look
+// like external registry images (docker.io/foo, gcr.io/bar, …) are
+// never matched.
+func resolveCrossRefs(imgs []manifestImage, dfPaths []string, projectBase string) ([]manifestImage, []string) {
+	var warnings []string
+	if len(imgs) != len(dfPaths) {
+		return imgs, warnings
+	}
+	byName := map[string]int{}
+	for i, img := range imgs {
+		byName[img.Name] = i
+	}
+	prefix := slugifyName(projectBase) + "-"
+
+	for i, df := range dfPaths {
+		refs, refWarn := parseDockerfileFromRefs(df)
+		warnings = append(warnings, refWarn...)
+		for _, ref := range refs {
+			producer, ok := matchSibling(ref, byName, prefix)
+			if !ok || producer == i {
+				continue
+			}
+			imgs[producer].Aliases = appendUnique(imgs[producer].Aliases, ref)
+			imgs[i].DependsOn = appendUnique(imgs[i].DependsOn, imgs[producer].Name)
+		}
 	}
 	return imgs, warnings
+}
+
+// matchSibling tries to identify an image in the manifest that produces
+// `ref`. Returns its index in `imgs` (the slice the byName map was
+// derived from). Registry-qualified refs are filtered out.
+func matchSibling(ref string, byName map[string]int, projectPrefix string) (int, bool) {
+	repo, _ := splitImageRef(ref)
+	if repo == "" {
+		return 0, false
+	}
+	// External registry refs (e.g. docker.io/x, gcr.io/x, localhost:5050/x)
+	// never match a sibling image. The first segment is the registry host
+	// when it contains a `.`, `:`, or is the literal "localhost".
+	if i := strings.Index(repo, "/"); i >= 0 {
+		host := repo[:i]
+		if host == "localhost" || strings.ContainsAny(host, ".:") {
+			return 0, false
+		}
+		// Otherwise treat as `org/name` and use the trailing segment
+		// for matching.
+		repo = repo[strings.LastIndex(repo, "/")+1:]
+	}
+	repo = strings.ToLower(repo)
+	if idx, ok := byName[repo]; ok {
+		return idx, true
+	}
+	if projectPrefix != "-" && strings.HasPrefix(repo, projectPrefix) {
+		if idx, ok := byName[strings.TrimPrefix(repo, projectPrefix)]; ok {
+			return idx, true
+		}
+	}
+	return 0, false
+}
+
+// splitImageRef returns (repo, tag-or-digest). Tag/digest is best-effort —
+// only the repo portion matters for cross-ref matching.
+func splitImageRef(ref string) (string, string) {
+	if i := strings.Index(ref, "@"); i >= 0 {
+		return ref[:i], ref[i+1:]
+	}
+	// Last `:` separates tag from repo, but only if it's after the last `/`
+	// (otherwise it's a registry port number).
+	slash := strings.LastIndex(ref, "/")
+	colon := strings.LastIndex(ref, ":")
+	if colon > slash {
+		return ref[:colon], ref[colon+1:]
+	}
+	return ref, ""
+}
+
+// parseDockerfileFromRefs returns external image refs from `FROM <ref>`
+// instructions. Stage names from `FROM x AS y` are excluded so a later
+// `FROM y` doesn't get treated as a real image. `scratch` and refs
+// containing ${VAR} are excluded.
+func parseDockerfileFromRefs(path string) ([]string, []string) {
+	instrs, err := readDockerfileInstructions(path)
+	if err != nil {
+		return nil, []string{fmt.Sprintf("read %s: %v", path, err)}
+	}
+	var (
+		refs   []string
+		stages = map[string]bool{}
+		varRe  = regexp.MustCompile(`\$\{?[A-Za-z_]`)
+	)
+	for _, instr := range instrs {
+		fields := strings.Fields(instr)
+		if len(fields) < 2 || strings.ToUpper(fields[0]) != "FROM" {
+			continue
+		}
+		// Drop leading flags (e.g. `--platform=$BUILDPLATFORM`).
+		args := fields[1:]
+		for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+			args = args[1:]
+		}
+		if len(args) == 0 {
+			continue
+		}
+		ref := args[0]
+		if len(args) >= 3 && strings.EqualFold(args[1], "AS") {
+			stages[strings.ToLower(args[2])] = true
+		}
+		if stages[strings.ToLower(ref)] || strings.EqualFold(ref, "scratch") {
+			continue
+		}
+		if varRe.MatchString(ref) {
+			continue
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+// readDockerfileInstructions reads a Dockerfile and returns one logical
+// instruction per element (line continuations joined, comments stripped).
+// Shared by parseDockerfileLocalSources and parseDockerfileFromRefs.
+func readDockerfileInstructions(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var (
+		out []string
+		buf strings.Builder
+		sc  = bufio.NewScanner(f)
+	)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasSuffix(line, "\\") {
+			buf.WriteString(strings.TrimSuffix(line, "\\"))
+			buf.WriteByte(' ')
+			continue
+		}
+		buf.WriteString(line)
+		if buf.Len() > 0 {
+			out = append(out, buf.String())
+		}
+		buf.Reset()
+	}
+	if buf.Len() > 0 {
+		out = append(out, buf.String())
+	}
+	return out, nil
+}
+
+// topoSortImages reorders imgs so each image's depends_on entries come
+// first. Stable: input order is preserved among nodes with no relative
+// dependency. Cycles produce a warning and the original order is kept
+// (cmd_build_from_manifest's validator will then surface the cycle as
+// a build-time error pointing at the offending pair).
+func topoSortImages(imgs []manifestImage) ([]manifestImage, []string) {
+	if len(imgs) <= 1 {
+		return imgs, nil
+	}
+	idx := map[string]int{}
+	for i, img := range imgs {
+		idx[img.Name] = i
+	}
+	const (
+		unseen   = 0
+		active   = 1
+		finished = 2
+	)
+	state := make([]int, len(imgs))
+	var (
+		out      []manifestImage
+		warnings []string
+		visit    func(i int, stack []string) bool
+	)
+	visit = func(i int, stack []string) bool {
+		switch state[i] {
+		case active:
+			warnings = append(warnings, fmt.Sprintf(
+				"dependency cycle: %s -> %s — leaving manifest order unchanged",
+				strings.Join(stack, " -> "), imgs[i].Name))
+			return false
+		case finished:
+			return true
+		}
+		state[i] = active
+		for _, dep := range imgs[i].DependsOn {
+			j, ok := idx[dep]
+			if !ok {
+				continue
+			}
+			if !visit(j, append(stack, imgs[i].Name)) {
+				return false
+			}
+		}
+		state[i] = finished
+		out = append(out, imgs[i])
+		return true
+	}
+	for i := range imgs {
+		if state[i] == unseen && !visit(i, nil) {
+			return imgs, warnings
+		}
+	}
+	return out, warnings
+}
+
+func appendUnique(xs []string, v string) []string {
+	for _, x := range xs {
+		if x == v {
+			return xs
+		}
+	}
+	return append(xs, v)
 }
 
 // imageNameFor picks a slug derived from the Dockerfile's parent dir.
@@ -152,9 +396,6 @@ func buildAutogenImages(target string, dockerfiles []string) ([]manifestImage, [
 func imageNameFor(target, dockerfile, context string) string {
 	dir := filepath.Dir(dockerfile)
 	base := filepath.Base(dir)
-	// dirname of a top-level Dockerfile is target itself; use the
-	// repo's own name so the image isn't called after the parent of
-	// the working tree.
 	if filepath.Clean(dir) == filepath.Clean(target) {
 		base = filepath.Base(target)
 	}
@@ -271,7 +512,6 @@ func globStaticPrefix(s string) string {
 	for i, r := range s {
 		switch r {
 		case '*', '?', '[':
-			// Trim back to last separator.
 			j := strings.LastIndex(s[:i], "/")
 			if j <= 0 {
 				return ""
@@ -296,54 +536,17 @@ func globStaticPrefix(s string) string {
 // auto-generated manifest is best-effort, and a clear "we couldn't tell
 // what this references" message beats a confidently-wrong context.
 func parseDockerfileLocalSources(path string) ([]string, []string) {
-	f, err := os.Open(path)
+	instrs, err := readDockerfileInstructions(path)
 	if err != nil {
 		return nil, []string{fmt.Sprintf("read %s: %v", path, err)}
 	}
-	defer f.Close()
-
-	// Join continuation lines first so we can parse instruction-by-instruction.
-	var (
-		lines []string
-		buf   strings.Builder
-		sc    = bufio.NewScanner(f)
-	)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
-	for sc.Scan() {
-		l := sc.Text()
-		// Strip comments first (full-line only — Dockerfiles don't allow
-		// trailing #-comments, # is only honored at the start of a line).
-		trim := strings.TrimSpace(l)
-		if strings.HasPrefix(trim, "#") {
-			continue
-		}
-		if strings.HasSuffix(trim, "\\") {
-			buf.WriteString(strings.TrimSuffix(trim, "\\"))
-			buf.WriteByte(' ')
-			continue
-		}
-		buf.WriteString(trim)
-		if buf.Len() > 0 {
-			lines = append(lines, buf.String())
-		}
-		buf.Reset()
-	}
-	if buf.Len() > 0 {
-		lines = append(lines, buf.String())
-	}
-
 	var (
 		srcs     []string
 		warnings []string
 		urlRe    = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+\-.]*://`)
-		// Pre-validate that we can find a static prefix. ${VAR} sources
-		// are unsafe to guess at — flag and skip.
-		varRe = regexp.MustCompile(`\$\{?[A-Za-z_]`)
+		varRe    = regexp.MustCompile(`\$\{?[A-Za-z_]`)
 	)
-
-	for _, instr := range lines {
-		// Match "COPY ..." or "ADD ..." case-insensitively. Anything else
-		// is irrelevant to context inference.
+	for _, instr := range instrs {
 		fields := strings.Fields(instr)
 		if len(fields) == 0 {
 			continue
@@ -354,8 +557,7 @@ func parseDockerfileLocalSources(path string) ([]string, []string) {
 		}
 		rest := strings.TrimSpace(strings.TrimPrefix(instr, fields[0]))
 
-		// Drop leading flags. They're whitespace-separated and always
-		// start with `--`. `--from=` means a stage/image ref, not the
+		// Drop leading flags. `--from=` means a stage/image ref, not the
 		// build context — we explicitly skip the whole instruction in
 		// that case (the Dockerfile is *not* claiming a context source).
 		hasFromFlag := false
@@ -364,7 +566,6 @@ func parseDockerfileLocalSources(path string) ([]string, []string) {
 			if !strings.HasPrefix(rest, "--") {
 				break
 			}
-			// Find end of flag.
 			sp := strings.IndexByte(rest, ' ')
 			tab := strings.IndexByte(rest, '\t')
 			end := sp
@@ -382,16 +583,13 @@ func parseDockerfileLocalSources(path string) ([]string, []string) {
 			}
 		}
 		if hasFromFlag {
-			// Stage/image-ref copy — does not consume context.
 			continue
 		}
-
 		// Heredoc form: `COPY <<EOF ... EOF`. Doesn't read context.
 		if strings.HasPrefix(strings.TrimSpace(rest), "<<") {
 			continue
 		}
 
-		// JSON-array form: `COPY ["src1","src2","dest"]`.
 		var parts []string
 		if strings.HasPrefix(strings.TrimSpace(rest), "[") {
 			var arr []string
@@ -411,10 +609,7 @@ func parseDockerfileLocalSources(path string) ([]string, []string) {
 		parts = parts[:len(parts)-1]
 		for _, p := range parts {
 			p = strings.Trim(p, `"'`)
-			if p == "" {
-				continue
-			}
-			if urlRe.MatchString(p) {
+			if p == "" || urlRe.MatchString(p) {
 				continue
 			}
 			if varRe.MatchString(p) {
@@ -422,9 +617,7 @@ func parseDockerfileLocalSources(path string) ([]string, []string) {
 					fmt.Sprintf("%s: source %q uses a variable — skipping for context inference", path, p))
 				continue
 			}
-			// Strip a leading `./` for prettier `os.Stat` paths.
-			p = strings.TrimPrefix(p, "./")
-			srcs = append(srcs, p)
+			srcs = append(srcs, strings.TrimPrefix(p, "./"))
 		}
 	}
 	return srcs, warnings
@@ -442,8 +635,8 @@ func writeAutogenManifest(path string, imgs []manifestImage) error {
 	b.WriteString("# pushed to the in-cluster registry at localhost:5050/<name>:latest.\n")
 	b.WriteString("#\n")
 	b.WriteString("# Edit freely — sandboxctl will not overwrite an existing file.\n")
-	b.WriteString("# Add `aliases:` if downstream Dockerfiles `FROM` this image, and\n")
-	b.WriteString("# `depends_on: [<name>]` to enforce build order.\n")
+	b.WriteString("# `aliases` + `depends_on` are inferred from FROM lines; override here\n")
+	b.WriteString("# if needed (manual entries are preserved across regeneration).\n")
 	b.WriteString("images:\n")
 	for _, img := range imgs {
 		fmt.Fprintf(&b, "  - name: %s\n", img.Name)
@@ -451,8 +644,22 @@ func writeAutogenManifest(path string, imgs []manifestImage) error {
 		if img.Dockerfile != "" {
 			fmt.Fprintf(&b, "    dockerfile: %s\n", yamlScalar(img.Dockerfile))
 		}
+		if len(img.Aliases) > 0 {
+			fmt.Fprintf(&b, "    aliases: [%s]\n", joinScalars(img.Aliases))
+		}
+		if len(img.DependsOn) > 0 {
+			fmt.Fprintf(&b, "    depends_on: [%s]\n", joinScalars(img.DependsOn))
+		}
 	}
 	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func joinScalars(xs []string) string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = yamlScalar(x)
+	}
+	return strings.Join(out, ", ")
 }
 
 // yamlScalar quotes a value when it contains characters that would
