@@ -82,6 +82,11 @@ SANDBOX_LAUNCHAGENT_DIR="${SANDBOX_LAUNCHAGENT_DIR:-$HOME/Library/LaunchAgents}"
 SANDBOX_LAUNCHAGENT_LABEL="${SANDBOX_LAUNCHAGENT_LABEL:-io.github.sandboxctl.portfwd}"
 SANDBOX_LAUNCHAGENT_PLIST="${SANDBOX_LAUNCHAGENT_DIR}/${SANDBOX_LAUNCHAGENT_LABEL}.plist"
 SANDBOX_PF_LOG="${SANDBOX_STATE_DIR}/portfwd.log"
+# Pinned kubeconfig for the LaunchAgent. launchd jobs don't inherit the
+# user's KUBECONFIG, so we can't rely on `kind` having written the
+# context to ~/.kube/config — kind writes to whatever the first entry
+# in $KUBECONFIG points to. Materialize a dedicated file we own.
+SANDBOX_KUBECONFIG="${SANDBOX_STATE_DIR}/kubeconfig"
 
 # socat container on kind network — bypass kubectl port-forward, which
 # stalls on Docker's 16-way parallel layer uploads.
@@ -365,6 +370,7 @@ bring_up_cluster() {
       warn "kind cluster '$CLUSTER_NAME' is registered but stopped — starting it"
       start_stopped_cluster
     fi
+    write_pinned_kubeconfig
     return
   fi
   if ! "$SANDBOX_RUNTIME" image exists "$KIND_NODE_IMAGE" >/dev/null 2>&1; then
@@ -373,7 +379,23 @@ bring_up_cluster() {
   fi
   log "creating kind cluster '$CLUSTER_NAME'"
   kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$KIND_CONFIG"
+  write_pinned_kubeconfig
   configure_node_registry_mirror
+}
+
+# Materialize a kubeconfig the LaunchAgent can use. kind respects the
+# user's $KUBECONFIG when it writes the new context, which means the
+# context may not be in ~/.kube/config — and launchd doesn't inherit
+# $KUBECONFIG from the shell. Pin our own file under $SANDBOX_STATE_DIR
+# so the port-forward agent doesn't depend on the user's environment.
+write_pinned_kubeconfig() {
+  mkdir -p "$SANDBOX_STATE_DIR"
+  if ! kind get kubeconfig --name "$CLUSTER_NAME" > "${SANDBOX_KUBECONFIG}.tmp" 2>/dev/null; then
+    rm -f "${SANDBOX_KUBECONFIG}.tmp"
+    die "kind get kubeconfig --name $CLUSTER_NAME failed — cluster may not be ready"
+  fi
+  chmod 600 "${SANDBOX_KUBECONFIG}.tmp"
+  mv "${SANDBOX_KUBECONFIG}.tmp" "$SANDBOX_KUBECONFIG"
 }
 
 configure_node_registry_mirror() {
@@ -1093,21 +1115,47 @@ LEGACY_LAUNCHAGENT_LABELS=(
   com.zendesk.sandboxctl.portfwd
 )
 
+# Stop a LaunchAgent and remove its plist. KeepAlive=true makes launchd
+# respawn the child immediately if we just `launchctl unload`, so the
+# child kubectl can be in a tight loop and unload appears to hang.
+# Order: bootout (preferred on macOS 10.11+), then unload, then remove
+# by label, then remove the plist file. Each step is bounded by a
+# timeout so a wedged launchd never blocks the script.
+launchagent_stop() {
+  local label="$1" plist="$2"
+  local uid; uid="$(id -u)"
+  # gtimeout (coreutils) preferred; falls back to a perl alarm wrapper.
+  local timeout
+  if command -v gtimeout >/dev/null 2>&1; then timeout=(gtimeout 10)
+  else timeout=(perl -e 'alarm shift; exec @ARGV' 10); fi
+
+  "${timeout[@]}" launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  if [[ -f "$plist" ]]; then
+    "${timeout[@]}" launchctl unload "$plist" >/dev/null 2>&1 || true
+  fi
+  "${timeout[@]}" launchctl remove "$label" >/dev/null 2>&1 || true
+  rm -f "$plist"
+}
+
 uninstall_portfwd() {
-  if [[ -f "$SANDBOX_LAUNCHAGENT_PLIST" ]]; then
+  # Kill child kubectl processes first, regardless of plist state.
+  # This unblocks `launchctl unload` if the child is in a respawn
+  # loop (e.g. after a previous run with a missing kube context).
+  pkill -f "port-forward.*svc/istio-ingress" >/dev/null 2>&1 || true
+
+  if [[ -f "$SANDBOX_LAUNCHAGENT_PLIST" ]] || \
+     launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "$SANDBOX_LAUNCHAGENT_LABEL"; then
     log "unloading + removing LaunchAgent ${SANDBOX_LAUNCHAGENT_LABEL}"
-    launchctl unload "$SANDBOX_LAUNCHAGENT_PLIST" >/dev/null 2>&1 || true
-    rm -f "$SANDBOX_LAUNCHAGENT_PLIST"
+    launchagent_stop "$SANDBOX_LAUNCHAGENT_LABEL" "$SANDBOX_LAUNCHAGENT_PLIST"
   fi
   local legacy
   for legacy in "${LEGACY_LAUNCHAGENT_LABELS[@]}"; do
     local legacy_plist="${SANDBOX_LAUNCHAGENT_DIR}/${legacy}.plist"
-    if [[ -f "$legacy_plist" ]]; then
+    if [[ -f "$legacy_plist" ]] || \
+       launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "$legacy"; then
       log "removing legacy LaunchAgent ${legacy}"
-      launchctl unload "$legacy_plist" >/dev/null 2>&1 || true
-      rm -f "$legacy_plist"
+      launchagent_stop "$legacy" "$legacy_plist"
     fi
-    launchctl remove "$legacy" >/dev/null 2>&1 || true
   done
   pkill -f "port-forward.*svc/istio-ingress" >/dev/null 2>&1 || true
 }
@@ -1121,13 +1169,14 @@ uninstall_registry_portfwd() {
   fi
   # Legacy registry-portfwd LaunchAgent (v1.3.0 / v1.3.1) — still installed
   # on machines that upgraded mid-stream.
-  local legacy_plist="${SANDBOX_LAUNCHAGENT_DIR}/io.github.sandboxctl.registry-portfwd.plist"
-  if [[ -f "$legacy_plist" ]]; then
+  local legacy_label="io.github.sandboxctl.registry-portfwd"
+  local legacy_plist="${SANDBOX_LAUNCHAGENT_DIR}/${legacy_label}.plist"
+  pkill -f "port-forward.*svc/registry" >/dev/null 2>&1 || true
+  if [[ -f "$legacy_plist" ]] || \
+     launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "$legacy_label"; then
     log "removing legacy registry LaunchAgent"
-    launchctl unload "$legacy_plist" >/dev/null 2>&1 || true
-    rm -f "$legacy_plist"
+    launchagent_stop "$legacy_label" "$legacy_plist"
   fi
-  launchctl remove io.github.sandboxctl.registry-portfwd >/dev/null 2>&1 || true
   pkill -f "port-forward.*svc/registry" >/dev/null 2>&1 || true
 }
 
@@ -1203,6 +1252,8 @@ write_portfwd_plist() {
   local kubectl_path
   kubectl_path="$(command -v kubectl)" || die "kubectl not found on PATH"
   mkdir -p "$SANDBOX_LAUNCHAGENT_DIR" "$SANDBOX_STATE_DIR"
+  [[ -f "$SANDBOX_KUBECONFIG" ]] || \
+    die "pinned kubeconfig ${SANDBOX_KUBECONFIG} missing — run 'sandboxctl restart'"
   cat > "$SANDBOX_LAUNCHAGENT_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
@@ -1212,6 +1263,7 @@ write_portfwd_plist() {
   <key>ProgramArguments</key>
   <array>
     <string>${kubectl_path}</string>
+    <string>--kubeconfig</string><string>${SANDBOX_KUBECONFIG}</string>
     <string>--context</string><string>$(kctx)</string>
     <string>port-forward</string>
     <string>--address</string><string>127.0.0.1</string>
@@ -1757,6 +1809,7 @@ cmd_down() {
   else
     ok "no kind cluster named '$CLUSTER_NAME' to delete"
   fi
+  rm -f "$SANDBOX_KUBECONFIG"
 
   uninstall_hosts
   uninstall_dnsmasq
