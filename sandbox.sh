@@ -56,6 +56,19 @@ ARCTL_VERSION="${ARCTL_VERSION:-latest}"
 ARCTL_INSTALL_DIR="${ARCTL_INSTALL_DIR:-/usr/local/bin}"
 INSTALL_ARCTL="${INSTALL_ARCTL:-1}"
 
+# agentregistry server — the agentregistry platform deployed *into the kind
+# cluster* by `up` (minimal, bundled-PostgreSQL "dev/eval" profile), reached
+# at https://agentregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}. The host
+# arctl CLI talks to it through that gateway route. `down` removes it with the
+# cluster; `purge` also drops the persisted JWT key. Chart pinned like every
+# other component. Skip with --no-agentregistry (or INSTALL_AGENTREGISTRY=0).
+AGENTREGISTRY_NS="${AGENTREGISTRY_NS:-agentregistry}"
+AGENTREGISTRY_CHART="${AGENTREGISTRY_CHART:-oci://ghcr.io/agentregistry-dev/agentregistry/charts/agentregistry}"
+AGENTREGISTRY_CHART_VERSION="${AGENTREGISTRY_CHART_VERSION:-0.3.3}"
+AGENTREGISTRY_IMAGE_TAG="${AGENTREGISTRY_IMAGE_TAG:-v0.3.3}"
+AGENTREGISTRY_STORAGE="${AGENTREGISTRY_STORAGE:-2Gi}"
+INSTALL_AGENTREGISTRY="${INSTALL_AGENTREGISTRY:-1}"
+
 # Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
 # pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
 # CD pulls from that URL — proper GitOps loop without needing external
@@ -78,6 +91,7 @@ ARGO_HOST="argo.${SANDBOX_DOMAIN}"
 KARGO_HOST="kargo.${SANDBOX_DOMAIN}"
 DEMO_HOST="demo-app.${SANDBOX_DOMAIN}"
 KAGENT_HOST="kagent.${SANDBOX_DOMAIN}"
+AGENTREGISTRY_HOST="agentregistry.${SANDBOX_DOMAIN}"
 ROOT_CA_CN="${SANDBOX_DOMAIN} sandbox root CA"
 
 # UI URLs use :8443 because binding :443 would need sudo on every launchd start.
@@ -162,6 +176,13 @@ kind_pinned() {
 # upgrades and across re-runs that flip the toggle.
 _kagent_present() {
   kc get ns "$KAGENT_NS" >/dev/null 2>&1
+}
+
+# Same idea for agentregistry: gate its route / hosts entry / status lines on
+# the namespace actually existing, so a `--no-agentregistry` run or a failed
+# install never leaves a dangling 503 route or a stray /etc/hosts name.
+_agentregistry_present() {
+  kc get ns "$AGENTREGISTRY_NS" >/dev/null 2>&1
 }
 
 prime_sudo() {
@@ -813,6 +834,57 @@ install_kagent() {
   ok "kagent ready (UI: https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT})"
 }
 
+# agentregistry — the open-source registry for MCP servers, agents, skills,
+# and prompts (https://aregistry.ai), deployed into the cluster with its
+# bundled PostgreSQL (the chart's documented dev/eval profile). The host-side
+# `arctl` CLI reaches it through the gateway route added by install_routes.
+#
+# Deliberately NON-FATAL: a slow image pull or a crash-looping pod here must
+# never abort `up` — every other component (Argo CD, Kargo, Gitea, demo) is
+# independent of it. We skip `helm --wait` and instead bound readiness with a
+# rollout-status check, mirroring install_registry.
+#
+# Note: embeddings (arctl embeddings) need PostgreSQL with the pgvector
+# extension; the bundled postgres:18 image doesn't ship it, so embeddings are
+# unavailable in this minimal profile. Point AGENTREGISTRY at an external
+# pgvector DB (helm value database.postgres.url) if you need them.
+install_agentregistry() {
+  (( INSTALL_AGENTREGISTRY )) || { log "skipping agentregistry (INSTALL_AGENTREGISTRY=0)"; return 0; }
+  log "installing agentregistry (ns: $AGENTREGISTRY_NS, chart $AGENTREGISTRY_CHART_VERSION, server $AGENTREGISTRY_IMAGE_TAG) — server + bundled PostgreSQL"
+
+  # JWT signing key (hex, per the chart's own validation): generate once,
+  # persist, and reuse on later `up` runs so issued tokens survive a
+  # re-bootstrap. Same pattern as the Gitea admin password. Removed by
+  # `purge` along with the rest of $SANDBOX_STATE_DIR.
+  mkdir -p "$SANDBOX_STATE_DIR"
+  local jwt_file="${SANDBOX_STATE_DIR}/agentregistry-jwt.key"
+  if [[ ! -s "$jwt_file" ]]; then
+    openssl rand -hex 32 > "$jwt_file"
+    chmod 600 "$jwt_file"
+  fi
+  local jwt_key; jwt_key="$(cat "$jwt_file")"
+
+  if ! helm upgrade --install agentregistry "$AGENTREGISTRY_CHART" \
+      --namespace "$AGENTREGISTRY_NS" --create-namespace \
+      --version "$AGENTREGISTRY_CHART_VERSION" \
+      --set "image.tag=${AGENTREGISTRY_IMAGE_TAG}" \
+      --set "config.jwtPrivateKey=${jwt_key}" \
+      --set 'database.postgres.bundled.enabled=true' \
+      --set "database.postgres.bundled.storage=${AGENTREGISTRY_STORAGE}" \
+      --set 'service.type=ClusterIP' 2>&1; then
+    warn "agentregistry helm install failed — skipping it; the rest of the sandbox is unaffected."
+    warn "debug: helm -n ${AGENTREGISTRY_NS} status agentregistry ; kc -n ${AGENTREGISTRY_NS} get pods"
+    return 0
+  fi
+
+  if kc -n "$AGENTREGISTRY_NS" rollout status deploy/agentregistry --timeout=300s >/dev/null 2>&1; then
+    ok "agentregistry ready (UI: https://${AGENTREGISTRY_HOST}:${SANDBOX_HTTPS_PORT})"
+  else
+    warn "agentregistry not ready within 300s — image pulls may still be in progress."
+    warn "check 'kc -n ${AGENTREGISTRY_NS} get pods'; the route is live at https://${AGENTREGISTRY_HOST}:${SANDBOX_HTTPS_PORT} once the pod is Ready."
+  fi
+}
+
 # In-cluster Gitea — the GitOps source for `sandboxctl deploy`.
 #
 # Why in-cluster instead of GitHub: Argo CD pulls the chart from this
@@ -1095,6 +1167,22 @@ spec:
     - route: [{ destination: { host: kagent-ui.${KAGENT_NS}.svc.cluster.local, port: { number: 8080 } } }]
 EOF
   fi
+
+  # agentregistry VS only when its namespace exists (same gating rationale as
+  # kagent: avoid a 503-ing route when the service isn't installed). The chart
+  # names the HTTP Service 'agentregistry' on port 12121 → container 8080.
+  if _agentregistry_present; then
+    kc apply -f - <<EOF >/dev/null
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: { name: agentregistry, namespace: ${AGENTREGISTRY_NS} }
+spec:
+  hosts: ["${AGENTREGISTRY_HOST}"]
+  gateways: ["${ISTIO_INGRESS_NS}/sandbox-gateway"]
+  http:
+    - route: [{ destination: { host: agentregistry.${AGENTREGISTRY_NS}.svc.cluster.local, port: { number: 12121 } } }]
+EOF
+  fi
   ok "routes applied"
 }
 
@@ -1108,6 +1196,7 @@ _managed_hosts() {
   # leak `kagent.sandbox.app` into /etc/hosts.
   local out=("$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST")
   if _kagent_present; then out+=("$KAGENT_HOST"); fi
+  if _agentregistry_present; then out+=("$AGENTREGISTRY_HOST"); fi
   printf '%s\n' "${out[@]}"
 }
 
@@ -1734,6 +1823,7 @@ cmd_up() {
     case "$1" in
       --with-kagent)    INSTALL_KAGENT=1; shift ;;
       --no-arctl)       INSTALL_ARCTL=0; shift ;;
+      --no-agentregistry) INSTALL_AGENTREGISTRY=0; shift ;;
       --install)
         case "${2:-}" in
           all)          INSTALL_KAGENT=1; shift 2 ;;
@@ -1741,11 +1831,16 @@ cmd_up() {
         esac ;;
       -h|--help)
         cat <<EOF
-sandboxctl up [--with-kagent] [--install all] [--no-arctl]
+sandboxctl up [--with-kagent] [--install all] [--no-arctl] [--no-agentregistry]
 
 Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
-Kargo + Istio + in-cluster registry + Gitea + a demo app, all wired
-behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+Kargo + Istio + in-cluster registry + Gitea + a demo app + agentregistry,
+all wired behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+
+In the cluster (on by default):
+  agentregistry    the agentregistry server (https://aregistry.ai) + a
+                   bundled PostgreSQL, at https://agentregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+                   Skip with --no-agentregistry (or INSTALL_AGENTREGISTRY=0).
 
 Also installs onto the Mac (not the cluster):
   arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
@@ -1794,6 +1889,7 @@ EOF
   else
     log "skipping kagent (pass --with-kagent or --install all to enable)"
   fi
+  install_agentregistry
   install_gitea
   install_istio_ambient
   install_routes
@@ -1813,6 +1909,9 @@ EOF
   printf '  open https://%s:%s\n' "$DEMO_HOST"  "$SANDBOX_HTTPS_PORT"
   if (( INSTALL_KAGENT )); then
     printf '  open https://%s:%s\n' "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  fi
+  if _agentregistry_present; then
+    printf '  open https://%s:%s\n' "$AGENTREGISTRY_HOST" "$SANDBOX_HTTPS_PORT"
   fi
   echo "  sandboxctl creds   # full login details"
 }
@@ -1839,7 +1938,7 @@ cmd_bootstrap() {
     case "$1" in
       --repo)
         repo_flag="${2:-}"; shift 2 ;;
-      --with-kagent|--no-arctl|--install)
+      --with-kagent|--no-arctl|--no-agentregistry|--install)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
           up_args+=("$1" "${2:-}"); shift 2
@@ -1867,6 +1966,7 @@ product repo is selected by:
   sandboxctl bootstrap --repo path/to/repo
   sandboxctl bootstrap --with-kagent         # forwarded to 'up'
   sandboxctl bootstrap --no-arctl            # forwarded to 'up'
+  sandboxctl bootstrap --no-agentregistry    # forwarded to 'up'
   sandboxctl bootstrap --chart custom/chart  # forwarded to 'deploy'
   sandboxctl bootstrap --no-build            # forwarded to 'deploy'
 
@@ -2042,6 +2142,9 @@ cmd_status() {
   if _kagent_present; then
     workload_summary "$KAGENT_NS"      "kagent"
   fi
+  if _agentregistry_present; then
+    workload_summary "$AGENTREGISTRY_NS" "agentreg"
+  fi
   echo
   echo "apps & URLs:"
   printf '  %-12s https://%s:%s\n' "argocd"   "$ARGO_HOST"   "$SANDBOX_HTTPS_PORT"
@@ -2049,6 +2152,9 @@ cmd_status() {
   printf '  %-12s https://%s:%s\n' "demo-app" "$DEMO_HOST"   "$SANDBOX_HTTPS_PORT"
   if _kagent_present; then
     printf '  %-12s https://%s:%s\n' "kagent" "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  fi
+  if _agentregistry_present; then
+    printf '  %-12s https://%s:%s\n' "agentreg" "$AGENTREGISTRY_HOST" "$SANDBOX_HTTPS_PORT"
   fi
   printf '  %-12s localhost:%s    (push: docker push localhost:%s/<image>:<tag>)\n' "registry" "$SANDBOX_REGISTRY_PORT" "$SANDBOX_REGISTRY_PORT"
 }
