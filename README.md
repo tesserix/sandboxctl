@@ -50,6 +50,7 @@ Open `https://<your-chart-name>.sandbox.app:8443` in your browser.
 | `https://kargo.sandbox.app:8443` | Kargo UI |
 | `https://kagent.sandbox.app:8443` | [kagent](https://github.com/kagent-dev/kagent) — agentic AI controller |
 | `https://demo-app.sandbox.app:8443` | a tiny demo deployment |
+| `nats://nats.sandbox.app:4222` | NATS + JetStream (TCP+TLS); also `wss://nats.sandbox.app:8443` |
 | `localhost:5050` | in-cluster Docker registry (push target for `sandboxctl build`) |
 
 `sandboxctl up` also installs the [`arctl`](https://aregistry.ai)
@@ -248,6 +249,7 @@ endpoint or model.
    │       ├── kagent-ui       (kagent ns)         │
    │       ├── demo-app        (demo-app ns)       │
    │       ├── gitea           (gitea ns)          │
+   │       ├── nats + JetStream (nats ns)          │
    │       ├── registry:30050  (sandboxctl-registry ns)
    │       └── your apps       (one ns each)       │
    │                                                │
@@ -266,6 +268,11 @@ The pieces:
 - **reflector** — mirrors annotated Secrets/ConfigMaps across namespaces
   (inert until a workload chart annotates something)
 - **In-cluster Gitea** — backs the GitOps loop for `sandboxctl deploy`
+- **NATS + JetStream** — single-replica messaging server with persistent
+  file store (2 GiB PVC). Reachable from the Mac at `nats://nats.sandbox.app:4222`
+  (TCP+TLS, served via an Istio TLS-passthrough listener and a second
+  LaunchAgent port-forward) and `wss://nats.sandbox.app:8443` for browser/JS
+  clients. Cert is signed by the same per-install CA as everything else.
 - **In-cluster registry** — `localhost:5050` push target, mirrored into
   the kind node's containerd via `hosts.toml`
 - **macOS LaunchAgent** — `kubectl port-forward` so the gateway is

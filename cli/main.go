@@ -38,7 +38,7 @@ var commands = []command{
 	{"down", "remove cluster + LaunchAgent + /etc/hosts + keychain CA + arctl CLI (keeps ~/.sandbox)"},
 	{"purge", "down + remove ~/.sandbox (prompts for confirmation)"},
 	{"status", "cluster + workload status + URLs"},
-	{"restart", "down + up"},
+	{"restart", "re-apply installers, keep cluster + state (--rebuild for full wipe)"},
 	{"validate", "curl each URL from the Mac and print HTTP codes"},
 	{"creds", "print login details (URLs + admin creds) for Argo CD + Kargo"},
 	{"argocd-ui", "print Argo CD URL + admin creds"},

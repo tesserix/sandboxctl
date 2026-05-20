@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIND_CONFIG="${SCRIPT_DIR}/kind-config.yaml"
+SANDBOX_LIB_DIR="${SCRIPT_DIR}/lib"
 
 WILDCARD_TLS_SECRET="${WILDCARD_TLS_SECRET:-sandbox-wildcard-tls}"
 ROOT_CA_SECRET="${ROOT_CA_SECRET:-sandbox-root-ca}"
@@ -135,6 +136,106 @@ warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1 (install via brew)"; }
 
+# ----- celebration / sad-trombone banners ----------------------------------
+#
+# Drop-in banners for the very end of cmd_up / cmd_bootstrap / cmd_restart.
+# ASCII fallback when LANG isn't UTF-8 so they don't garble in CI logs.
+celebrate() {
+  local headline="${1:-sandbox is up}"
+  local emoji='🎉 ✨ 🚀'
+  case "${LANG:-}${LC_ALL:-}" in
+    *UTF-8*|*utf8*|*UTF8*) ;;
+    *) emoji='*** ' ;;
+  esac
+  printf '\n' >&2
+  printf '\033[1;32m  %s  %s  %s\033[0m\n' "${emoji%% *}" "$headline" "${emoji##* }" >&2
+  printf '\033[1;32m  ────────────────────────────────────────\033[0m\n' >&2
+  printf '  \033[2mevery component is healthy and reachable from the Mac\033[0m\n' >&2
+  printf '\n' >&2
+}
+
+# Used by traps when something fatal happens so the user gets one
+# consistent failure card instead of a wall of red text scrolling by.
+sad_trombone() {
+  local headline="${1:-something went wrong}"
+  printf '\n' >&2
+  printf '\033[1;31m  ✗  %s\033[0m\n' "$headline" >&2
+  printf '\033[1;31m  ────────────────────────────────────────\033[0m\n' >&2
+  printf '  \033[2mscroll up for the failed step (look for ✗ rows).\033[0m\n' >&2
+  printf '  \033[2mlogs:    %s/spinner-logs/\033[0m\n' "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}" >&2
+  printf '  \033[2mre-run:  sandboxctl status   (then: sandboxctl restart)\033[0m\n' >&2
+  printf '\n' >&2
+}
+
+# ----- spinner -------------------------------------------------------------
+#
+# with_spinner LABEL CMD [ARGS...]
+#
+# Run CMD ARGS while showing a spinner with LABEL on stderr. The spinner
+# is suppressed when stderr isn't a TTY (CI logs stay clean) or when
+# SANDBOXCTL_NO_SPINNER=1. Output of the wrapped command is captured to
+# a per-run logfile under $SANDBOX_STATE_DIR/spinner-logs/ so failures
+# can be inspected after the fact; on success the file is removed.
+#
+# bash 3.2 compatible: no `wait -n`, no associative arrays, no
+# process-substitution requirements outside this block.
+SANDBOXCTL_NO_SPINNER="${SANDBOXCTL_NO_SPINNER:-0}"
+_SPINNER_FRAMES='⏳⌛'  # alternating; falls back to ASCII if locale is C
+_spinner_loop() {
+  # $1: label, $2: pid to watch, $3: start epoch
+  local label="$1" pid="$2" start="$3" frames="$_SPINNER_FRAMES"
+  case "${LANG:-}${LC_ALL:-}" in
+    *UTF-8*|*utf8*|*UTF8*) ;;
+    *) frames='|/-\\' ;;
+  esac
+  local i=0 now elapsed frame
+  while kill -0 "$pid" 2>/dev/null; do
+    now=$(date +%s)
+    elapsed=$(( now - start ))
+    # Pick a frame. Bash 3.2 lacks `${var:i:1}` index math friendliness
+    # for some unicode strings, so we cycle by a per-call modulo.
+    case $(( i % 2 )) in
+      0) frame="${frames:0:1}" ;;
+      *) frame="${frames:1:1}" ;;
+    esac
+    printf '\r\033[2K  %s %s ... \033[2m(%ds — please wait, do not Ctrl-C)\033[0m' "$frame" "$label" "$elapsed" >&2
+    i=$(( i + 1 ))
+    sleep 0.4
+  done
+}
+with_spinner() {
+  local label="$1"; shift
+  if [[ "$SANDBOXCTL_NO_SPINNER" == "1" || ! -t 2 ]]; then
+    "$@"
+    return $?
+  fi
+  mkdir -p "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs"
+  local logfile
+  logfile="$(mktemp "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs/$(date +%s).XXXXXX.log")"
+  local start; start=$(date +%s)
+  ( "$@" ) >"$logfile" 2>&1 &
+  local pid=$!
+  _spinner_loop "$label" "$pid" "$start"
+  # `wait` propagates the child's exit. Under `set -e`, a nonzero exit
+  # from `wait` would abort the function before we capture rc — disable
+  # errexit transiently around it.
+  local rc=0
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  local elapsed=$(( $(date +%s) - start ))
+  if (( rc == 0 )); then
+    printf '\r\033[2K  \033[1;32m✓\033[0m %s \033[2m(%ds)\033[0m\n' "$label" "$elapsed" >&2
+    rm -f "$logfile"
+  else
+    printf '\r\033[2K  \033[1;31m✗\033[0m %s \033[2m(%ds — log: %s)\033[0m\n' "$label" "$elapsed" "$logfile" >&2
+    # Surface the last 20 lines so the user sees the failure inline.
+    tail -20 "$logfile" >&2
+  fi
+  return $rc
+}
+
 # User-facing kubeconfig. We force kind's kubeconfig writes here
 # regardless of any $KUBECONFIG the user has set in their shell, so
 # `kubectl` "just works" in any new terminal without the user having
@@ -166,9 +267,41 @@ _kagent_present() {
 
 prime_sudo() {
   if ! sudo -n true 2>/dev/null; then
-    log "sudo required for /etc/hosts + macOS keychain trust — you'll be prompted once"
+    sudo_prompt_banner
     sudo -v || die "sudo required to configure /etc/hosts and System keychain"
+    printf '\033[1;32m  ✓ password accepted — continuing\033[0m\n' >&2
   fi
+}
+
+# Pre-prompt banner. macOS' sudo password prompt is a single line
+# ("Password:") with no context. Without a banner ahead of it, users
+# stare at the cursor wondering if sandboxctl froze. We make it
+# obvious *what* is asking, *why*, and that the password is handled
+# entirely by macOS' own sudo (never seen or stored by sandboxctl).
+#
+# Layout uses a left bar instead of a full box: rendering a perfectly-
+# aligned right border across mixed-width unicode (em dashes, bullets,
+# escape codes) is fiddly and wraps badly when terminals or fonts vary.
+# The left bar is simple and always renders cleanly.
+sudo_prompt_banner() {
+  local bar='\033[1;33m│\033[0m '
+  printf '\n' >&2
+  printf "${bar}\033[1;37mmacOS sudo prompt — your login password is needed once\033[0m\n" >&2
+  printf "${bar}\n" >&2
+  printf "${bar}Used for:\n" >&2
+  printf "${bar}  • adding *.%s to /etc/hosts\n" "${SANDBOX_DOMAIN:-sandbox.app}" >&2
+  printf "${bar}  • installing the per-machine root CA in the System keychain\n" >&2
+  printf "${bar}  • dropping arctl into /usr/local/bin\n" >&2
+  printf "${bar}\n" >&2
+  printf "${bar}\033[2mType your Mac login password and press Enter.\033[0m\n" >&2
+  printf "${bar}\033[2mNothing is echoed as you type — that is normal.\033[0m\n" >&2
+  printf "${bar}\n" >&2
+  printf "${bar}\033[1;32m🔒 \033[0m\033[2mThe prompt is from macOS' own \`sudo\`. Your password is\033[0m\n" >&2
+  printf "${bar}\033[2m   read directly into the kernel's auth cache (5-min TTL,\033[0m\n" >&2
+  printf "${bar}\033[2m   per-tty). sandboxctl never sees it, never stores it,\033[0m\n" >&2
+  printf "${bar}\033[2m   never sends it anywhere. Same model as 'brew', 'sudo apt',\033[0m\n" >&2
+  printf "${bar}\033[2m   etc.\033[0m\n" >&2
+  printf '\n' >&2
 }
 
 helm_uninstall_if_present() {
@@ -302,11 +435,13 @@ install_arctl() {
   local base="https://github.com/${ARCTL_REPO}/releases/download/${want}"
   local tmp; tmp="$(mktemp -d -t arctl.XXXXXX)"
 
-  if ! curl -fsSL "${base}/${dist}" -o "${tmp}/arctl"; then
+  if ! with_spinner "downloading arctl ${want} (${dist})" \
+       curl -fsSL "${base}/${dist}" -o "${tmp}/arctl"; then
     rm -rf "$tmp"; warn "arctl: download failed (${base}/${dist}) — skipping"; return 0
   fi
   # Verify the published sha256 when present; refuse to install on mismatch.
-  if curl -fsSL "${base}/${dist}.sha256" -o "${tmp}/sum" 2>/dev/null; then
+  if with_spinner "verifying arctl checksum" \
+       curl -fsSL "${base}/${dist}.sha256" -o "${tmp}/sum"; then
     local want_sum have_sum
     want_sum="$(awk '{print $1}' "${tmp}/sum")"
     have_sum="$(shasum -a 256 "${tmp}/arctl" | awk '{print $1}')"
@@ -497,11 +632,14 @@ bring_up_cluster() {
     return
   fi
   if ! "$SANDBOX_RUNTIME" image exists "$KIND_NODE_IMAGE" >/dev/null 2>&1; then
-    log "pre-pulling $KIND_NODE_IMAGE (one-time, ~750 MB — progress below)"
-    "$SANDBOX_RUNTIME" pull "$KIND_NODE_IMAGE" || warn "pre-pull failed; kind will retry the pull itself"
+    log "pre-pulling $KIND_NODE_IMAGE (one-time, ~750 MB)"
+    with_spinner "pulling kind node image (~750 MB, can take 2–4 min on first run)" \
+      "$SANDBOX_RUNTIME" pull "$KIND_NODE_IMAGE" \
+      || warn "pre-pull failed; kind will retry the pull itself"
   fi
   log "creating kind cluster '$CLUSTER_NAME'"
-  kind_pinned create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$KIND_CONFIG"
+  with_spinner "kind create cluster (typically 1–3 min)" \
+    kind_pinned create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$KIND_CONFIG"
   write_pinned_kubeconfig
   configure_node_registry_mirror
 }
@@ -560,11 +698,12 @@ install_cert_manager() {
   log "installing cert-manager (ns: $CERT_MANAGER_NS, chart $CERT_MANAGER_CHART_VERSION)"
   helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
   helm repo update jetstack >/dev/null
-  helm upgrade --install cert-manager jetstack/cert-manager \
-    --namespace "$CERT_MANAGER_NS" --create-namespace \
-    --version "$CERT_MANAGER_CHART_VERSION" \
-    --set crds.enabled=true \
-    --wait --timeout 5m
+  with_spinner "cert-manager helm install (typically 1–2 min)" \
+    helm upgrade --install cert-manager jetstack/cert-manager \
+      --namespace "$CERT_MANAGER_NS" --create-namespace \
+      --version "$CERT_MANAGER_CHART_VERSION" \
+      --set crds.enabled=true \
+      --wait --timeout 5m
   ok "cert-manager ready"
 }
 
@@ -627,11 +766,12 @@ install_argocd() {
   helm repo update argo >/dev/null
   # server.insecure=true makes argocd-server speak HTTP on :80 so the gateway
   # can terminate TLS without re-encrypting upstream.
-  helm upgrade --install argocd argo/argo-cd \
-    --namespace "$ARGOCD_NS" --create-namespace \
-    --version "$ARGOCD_CHART_VERSION" \
-    --set 'configs.params.server\.insecure=true' \
-    --wait --timeout 10m
+  with_spinner "Argo CD helm install (typically 2–5 min)" \
+    helm upgrade --install argocd argo/argo-cd \
+      --namespace "$ARGOCD_NS" --create-namespace \
+      --version "$ARGOCD_CHART_VERSION" \
+      --set 'configs.params.server\.insecure=true' \
+      --wait --timeout 10m
   ok "Argo CD ready"
 }
 
@@ -642,21 +782,23 @@ install_reflector() {
   log "installing reflector (ns: $REFLECTOR_NS, chart $REFLECTOR_CHART_VERSION)"
   helm repo add emberstack https://emberstack.github.io/helm-charts >/dev/null 2>&1 || true
   helm repo update emberstack >/dev/null
-  helm upgrade --install reflector emberstack/reflector \
-    --namespace "$REFLECTOR_NS" --create-namespace \
-    --version "$REFLECTOR_CHART_VERSION" \
-    --wait --timeout 5m
+  with_spinner "reflector helm install (typically 30–60s)" \
+    helm upgrade --install reflector emberstack/reflector \
+      --namespace "$REFLECTOR_NS" --create-namespace \
+      --version "$REFLECTOR_CHART_VERSION" \
+      --wait --timeout 5m
   ok "reflector ready"
 }
 
 install_kargo() {
   log "installing Kargo (ns: $KARGO_NS, chart $KARGO_CHART_VERSION)"
-  helm upgrade --install kargo oci://ghcr.io/akuity/kargo-charts/kargo \
-    --namespace "$KARGO_NS" --create-namespace \
-    --version "$KARGO_CHART_VERSION" \
-    --set api.adminAccount.passwordHash="$KARGO_ADMIN_PASSWORD_HASH" \
-    --set api.adminAccount.tokenSigningKey="$KARGO_TOKEN_SIGNING_KEY" \
-    --wait --timeout 10m
+  with_spinner "Kargo helm install (typically 2–4 min)" \
+    helm upgrade --install kargo oci://ghcr.io/akuity/kargo-charts/kargo \
+      --namespace "$KARGO_NS" --create-namespace \
+      --version "$KARGO_CHART_VERSION" \
+      --set api.adminAccount.passwordHash="$KARGO_ADMIN_PASSWORD_HASH" \
+      --set api.adminAccount.tokenSigningKey="$KARGO_TOKEN_SIGNING_KEY" \
+      --wait --timeout 10m
   ok "Kargo ready"
 }
 
@@ -795,21 +937,24 @@ install_kagent() {
   log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — provider: Ollama at ${KAGENT_OLLAMA_HOST}"
 
   # CRDs ship as a separate chart, must land first.
-  helm upgrade --install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
-    --namespace "$KAGENT_NS" --create-namespace \
-    --version "$KAGENT_CHART_VERSION" \
-    --wait --timeout 5m
+  with_spinner "kagent CRDs helm install (typically 30s)" \
+    helm upgrade --install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
+      --namespace "$KAGENT_NS" --create-namespace \
+      --version "$KAGENT_CHART_VERSION" \
+      --wait --timeout 5m
 
-  helm upgrade --install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
-    --namespace "$KAGENT_NS" \
-    --version "$KAGENT_CHART_VERSION" \
-    --set 'providers.default=ollama' \
-    --set "providers.ollama.model=${KAGENT_OLLAMA_MODEL}" \
-    --set "providers.ollama.config.host=${KAGENT_OLLAMA_HOST}" \
-    --wait --timeout 10m
+  with_spinner "kagent helm install (typically 3–5 min)" \
+    helm upgrade --install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
+      --namespace "$KAGENT_NS" \
+      --version "$KAGENT_CHART_VERSION" \
+      --set 'providers.default=ollama' \
+      --set "providers.ollama.model=${KAGENT_OLLAMA_MODEL}" \
+      --set "providers.ollama.config.host=${KAGENT_OLLAMA_HOST}" \
+      --wait --timeout 10m
 
-  kc -n "$KAGENT_NS" wait --for=condition=ready --timeout=180s \
-    pod -l app.kubernetes.io/component=ui >/dev/null
+  with_spinner "waiting for kagent UI pod to become Ready" \
+    kc -n "$KAGENT_NS" wait --for=condition=ready --timeout=180s \
+      pod -l app.kubernetes.io/component=ui
   ok "kagent ready (UI: https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT})"
 }
 
@@ -859,29 +1004,30 @@ install_gitea() {
   # subchart dependencies (valkey-cluster + postgresql-ha are enabled
   # by default in the gitea helm chart and are overkill for a one-user
   # sandbox).
-  log "running helm upgrade --install gitea (this can take ~3 min on first run)"
-  if ! helm upgrade --install gitea gitea-charts/gitea \
-      --namespace "$GITEA_NS" --create-namespace \
-      --version "$GITEA_CHART_VERSION" \
-      --set "gitea.admin.username=${GITEA_ADMIN_USER}" \
-      --set "gitea.admin.password=${admin_pass}" \
-      --set 'gitea.admin.email=sandbox@local' \
-      --set 'gitea.config.database.DB_TYPE=sqlite3' \
-      --set 'gitea.config.cache.ADAPTER=memory' \
-      --set 'gitea.config.session.PROVIDER=memory' \
-      --set 'gitea.config.queue.TYPE=level' \
-      --set 'gitea.config.indexer.ISSUE_INDEXER_TYPE=bleve' \
-      --set 'valkey-cluster.enabled=false' \
-      --set 'valkey.enabled=false' \
-      --set 'postgresql-ha.enabled=false' \
-      --set 'postgresql.enabled=false' \
-      --set 'redis-cluster.enabled=false' \
-      --set 'redis.enabled=false' \
-      --set 'memcached.enabled=false' \
-      --set 'persistence.size=1Gi' \
-      --set 'replicaCount=1' \
-      --set 'service.http.port=3000' \
-      --wait --timeout 8m 2>&1; then
+  log "running helm upgrade --install gitea"
+  if ! with_spinner "Gitea helm install (typically 2–4 min)" \
+        helm upgrade --install gitea gitea-charts/gitea \
+          --namespace "$GITEA_NS" --create-namespace \
+          --version "$GITEA_CHART_VERSION" \
+          --set "gitea.admin.username=${GITEA_ADMIN_USER}" \
+          --set "gitea.admin.password=${admin_pass}" \
+          --set 'gitea.admin.email=sandbox@local' \
+          --set 'gitea.config.database.DB_TYPE=sqlite3' \
+          --set 'gitea.config.cache.ADAPTER=memory' \
+          --set 'gitea.config.session.PROVIDER=memory' \
+          --set 'gitea.config.queue.TYPE=level' \
+          --set 'gitea.config.indexer.ISSUE_INDEXER_TYPE=bleve' \
+          --set 'valkey-cluster.enabled=false' \
+          --set 'valkey.enabled=false' \
+          --set 'postgresql-ha.enabled=false' \
+          --set 'postgresql.enabled=false' \
+          --set 'redis-cluster.enabled=false' \
+          --set 'redis.enabled=false' \
+          --set 'memcached.enabled=false' \
+          --set 'persistence.size=1Gi' \
+          --set 'replicaCount=1' \
+          --set 'service.http.port=3000' \
+          --wait --timeout 8m; then
     die "gitea helm install failed — see 'helm -n ${GITEA_NS} status gitea' and 'kc -n ${GITEA_NS} get events --sort-by=.lastTimestamp'"
   fi
 
@@ -983,11 +1129,12 @@ gitea_push_chart() {
 helm_istio() {
   # $1 release, $2 chart, rest passed verbatim to helm.
   local release="$1" chart="$2"; shift 2
-  helm upgrade --install "$release" "istio/$chart" \
-    --namespace "$ISTIO_SYSTEM_NS" --create-namespace \
-    --version "$ISTIO_CHART_VERSION" \
-    --wait --timeout 5m \
-    "$@"
+  with_spinner "${release} helm install (typically 30–90s)" \
+    helm upgrade --install "$release" "istio/$chart" \
+      --namespace "$ISTIO_SYSTEM_NS" --create-namespace \
+      --version "$ISTIO_CHART_VERSION" \
+      --wait --timeout 5m \
+      "$@"
 }
 
 install_istio_ambient() {
@@ -1004,17 +1151,18 @@ install_istio_ambient() {
   # port-forward. Ports are 8080/8443 (not 80/443) so Envoy can bind without
   # the unprivileged-port-start sysctl tweak. Gateway selector in
   # manifests/ingress.yaml is `istio: ingress` (the Helm chart's pod label).
-  helm upgrade --install istio-ingress istio/gateway \
-    --namespace "$ISTIO_INGRESS_NS" --create-namespace \
-    --version "$ISTIO_CHART_VERSION" \
-    --set service.type=ClusterIP \
-    --set 'service.ports[0].name=status-port'  --set 'service.ports[0].port=15021' --set 'service.ports[0].targetPort=15021' --set 'service.ports[0].protocol=TCP' \
-    --set 'service.ports[1].name=http2'        --set 'service.ports[1].port=8080'  --set 'service.ports[1].targetPort=8080'  --set 'service.ports[1].protocol=TCP' \
-    --set 'service.ports[2].name=https'        --set 'service.ports[2].port=8443'  --set 'service.ports[2].targetPort=8443'  --set 'service.ports[2].protocol=TCP' \
-    --wait --timeout 5m
+  with_spinner "istio-ingress gateway helm install (typically 1–2 min)" \
+    helm upgrade --install istio-ingress istio/gateway \
+      --namespace "$ISTIO_INGRESS_NS" --create-namespace \
+      --version "$ISTIO_CHART_VERSION" \
+      --set service.type=ClusterIP \
+      --set 'service.ports[0].name=status-port'  --set 'service.ports[0].port=15021' --set 'service.ports[0].targetPort=15021' --set 'service.ports[0].protocol=TCP' \
+      --set 'service.ports[1].name=http2'        --set 'service.ports[1].port=8080'  --set 'service.ports[1].targetPort=8080'  --set 'service.ports[1].protocol=TCP' \
+      --set 'service.ports[2].name=https'        --set 'service.ports[2].port=8443'  --set 'service.ports[2].targetPort=8443'  --set 'service.ports[2].protocol=TCP' \
+      --wait --timeout 5m
 
-  log "waiting for istio-ingress gateway pod"
-  kc -n "$ISTIO_INGRESS_NS" wait --for=condition=ready --timeout=180s pod -l app=istio-ingress >/dev/null
+  with_spinner "waiting for istio-ingress gateway pod to become Ready" \
+    kc -n "$ISTIO_INGRESS_NS" wait --for=condition=ready --timeout=180s pod -l app=istio-ingress
   ok "Istio ambient ready (istiod + ztunnel + ingress gateway)"
 }
 
@@ -1105,9 +1253,11 @@ EOF
 _managed_hosts() {
   # Hostnames sandboxctl manages on the marker line. Kagent appears
   # only when its namespace is live, so a default-off `up` doesn't
-  # leak `kagent.sandbox.app` into /etc/hosts.
+  # leak `kagent.sandbox.app` into /etc/hosts. NATS is default-on so
+  # always appears once the lib is sourced.
   local out=("$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST")
   if _kagent_present; then out+=("$KAGENT_HOST"); fi
+  if [[ -n "${NATS_HOST:-}" ]]; then out+=("$NATS_HOST"); fi
   printf '%s\n' "${out[@]}"
 }
 
@@ -1239,6 +1389,31 @@ portfwd_running() {
 LEGACY_LAUNCHAGENT_LABELS=(
   com.zendesk.sandboxctl.portfwd
 )
+
+# Add-on lib LaunchAgents — listed here so `cmd_down` can sweep them
+# even when the relevant lib/<tool>.sh isn't sourced (older binary,
+# manual `bash sandbox.sh down`, etc.). Each entry is a label →
+# corresponding plist filename pair. lib files that own these labels
+# also call launchagent_stop directly, so this is belt-and-braces.
+SANDBOX_ADDON_LAUNCHAGENT_LABELS=(
+  io.github.sandboxctl.nats-portfwd
+  # Future: io.github.sandboxctl.knative-portfwd
+)
+
+# Sweep every add-on LaunchAgent by label, regardless of plist
+# presence. Safe to call even when nothing is loaded — each step is
+# guarded.
+sweep_addon_launchagents() {
+  local label
+  for label in "${SANDBOX_ADDON_LAUNCHAGENT_LABELS[@]}"; do
+    local plist="${SANDBOX_LAUNCHAGENT_DIR}/${label}.plist"
+    if [[ -f "$plist" ]] || \
+       launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "$label"; then
+      log "removing add-on LaunchAgent ${label}"
+      launchagent_stop "$label" "$plist"
+    fi
+  done
+}
 
 # Stop a LaunchAgent and remove its plist. KeepAlive=true makes launchd
 # respawn the child immediately if we just `launchctl unload`, so the
@@ -1549,7 +1724,8 @@ trust_root_ca() {
   prime_sudo
   local tmp_pem; tmp_pem="$(mktemp -t sandbox-root-ca.XXXXXX.pem)"
   printf '%s\n' "$ca_pem" > "$tmp_pem"
-  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$tmp_pem"
+  with_spinner "trusting sandbox root CA in System keychain" \
+    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$tmp_pem"
   rm -f "$tmp_pem"
   ok "root CA trusted — browsers will accept *.${SANDBOX_DOMAIN} as valid"
 }
@@ -1644,13 +1820,32 @@ validate_urls() {
     code="$(curl -sk -o /dev/null -w '%{http_code}' \
       --max-time 8 --retry 8 --retry-delay 2 --retry-connrefused \
       "$url" 2>/dev/null | tail -c 3 || echo 000)"
+    # The WSS endpoint accepts only WebSocket-upgrade traffic; a plain
+    # GET returns 400 Bad Request from nats-server. Treat that as a
+    # successful proof-of-life — the connection reached upstream.
+    local ok_code=0
     if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]; then
+      ok_code=1
+    elif [[ -n "${NATS_HOST:-}" && "$host" == "$NATS_HOST" && "$code" == "400" ]]; then
+      ok_code=1
+    fi
+    if (( ok_code )); then
       printf '  %-50s OK (%s)\n' "$url" "$code"
     else
       printf '  %-50s FAIL (%s)\n' "$url" "$code"
       failed=1
     fi
   done < <(_managed_hosts)
+  # NATS TCP is on a separate port so it doesn't share the loop above.
+  if [[ -n "${NATS_HOST:-}" && -n "${SANDBOX_NATS_PORT:-}" ]]; then
+    local ntag="nats://${NATS_HOST}:${SANDBOX_NATS_PORT}"
+    if nc -z 127.0.0.1 "$SANDBOX_NATS_PORT" 2>/dev/null; then
+      printf '  %-50s OK (tcp)\n' "$ntag"
+    else
+      printf '  %-50s FAIL (tcp)\n' "$ntag"
+      failed=1
+    fi
+  fi
   if (( failed )); then
     warn "one or more URLs are not reachable from the Mac — see ${SANDBOX_PF_LOG} and 'sandboxctl status'"
     return 1
@@ -1734,6 +1929,7 @@ cmd_up() {
     case "$1" in
       --with-kagent)    INSTALL_KAGENT=1; shift ;;
       --no-arctl)       INSTALL_ARCTL=0; shift ;;
+      --no-nats-cli)    INSTALL_NATS_CLI=0; shift ;;
       --install)
         case "${2:-}" in
           all)          INSTALL_KAGENT=1; shift 2 ;;
@@ -1741,11 +1937,12 @@ cmd_up() {
         esac ;;
       -h|--help)
         cat <<EOF
-sandboxctl up [--with-kagent] [--install all] [--no-arctl]
+sandboxctl up [--with-kagent] [--install all] [--no-arctl] [--no-nats-cli]
 
 Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
-Kargo + Istio + in-cluster registry + Gitea + a demo app, all wired
-behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+Kargo + Istio + in-cluster registry + Gitea + NATS (JetStream) + a demo
+app, all wired behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+NATS is also reachable at nats://${NATS_HOST:-nats.${SANDBOX_DOMAIN}}:${SANDBOX_NATS_PORT:-4222}.
 
 Also installs onto the Mac (not the cluster):
   arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
@@ -1766,8 +1963,9 @@ EOF
   ensure_tooling
 
   if up_needs_sudo; then
-    log "sudo required for /etc/hosts + System keychain — prompting once now"
+    sudo_prompt_banner
     sudo -v || die "sudo required to configure /etc/hosts and System keychain"
+    printf '\033[1;32m  ✓ password accepted — continuing\033[0m\n' >&2
     start_sudo_keepalive
   fi
 
@@ -1797,14 +1995,15 @@ EOF
   install_gitea
   install_istio_ambient
   install_routes
+  install_nats
   install_hosts
   install_dnsmasq
   install_portfwd
+  install_nats_portfwd
   trust_root_ca
   write_state_file
   validate_urls
 
-  log "sandbox is up"
   cmd_status
   echo
   echo "next:"
@@ -1814,7 +2013,11 @@ EOF
   if (( INSTALL_KAGENT )); then
     printf '  open https://%s:%s\n' "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
   fi
+  if [[ -n "${NATS_HOST:-}" ]]; then
+    printf '  nats:  nats://%s:%s   (or wss://%s)\n' "$NATS_HOST" "$SANDBOX_NATS_PORT" "$NATS_HOST"
+  fi
   echo "  sandboxctl creds   # full login details"
+  celebrate "sandbox is up"
 }
 
 # `sandboxctl bootstrap` — one-shot wrapper for first-time users:
@@ -1912,6 +2115,7 @@ EOF
   cmd_deploy "$target" ${deploy_args[@]+"${deploy_args[@]}"}
 
   trap - ERR
+  celebrate "sandbox bootstrapped + product deployed"
 }
 
 # Loud failure panel for bootstrap — print what's up vs. what's broken
@@ -1935,6 +2139,7 @@ _bootstrap_failure_panel() {
     echo "    sandboxctl up"
     echo "    sandboxctl bootstrap   # then re-run the deploy half"
   fi
+  sad_trombone "bootstrap aborted"
   exit "$rc"
 }
 
@@ -1958,11 +2163,23 @@ cmd_down() {
   log "tearing down sandbox '$CLUSTER_NAME'"
   uninstall_portfwd
   uninstall_registry_portfwd
+  # Lib-aware cleanup: each add-on lib registers an uninstaller. If the
+  # lib was sourced, prefer its tool-specific path (kills child procs,
+  # specific log lines, etc.). Otherwise fall through to the generic
+  # sweep below by label, which always runs.
+  if declare -F uninstall_nats_portfwd >/dev/null; then
+    uninstall_nats_portfwd
+  fi
+  if declare -F uninstall_knative >/dev/null; then
+    uninstall_knative
+  fi
+  sweep_addon_launchagents
   clean_legacy_state
 
   if cluster_registered; then
     log "deleting kind cluster '$CLUSTER_NAME'"
-    kind_pinned delete cluster --name "$CLUSTER_NAME"
+    with_spinner "kind delete cluster (typically 30–60s)" \
+      kind_pinned delete cluster --name "$CLUSTER_NAME"
   else
     ok "no kind cluster named '$CLUSTER_NAME' to delete"
   fi
@@ -1972,6 +2189,9 @@ cmd_down() {
   uninstall_dnsmasq
   untrust_root_ca
   uninstall_arctl
+  if declare -F uninstall_nats_cli >/dev/null; then
+    uninstall_nats_cli
+  fi
 
   ok "sandbox down (cluster, LaunchAgent, /etc/hosts, dnsmasq config, root CA trust, arctl removed)"
   echo "Preserved: ${SANDBOX_STATE_DIR} (logs/state) — use 'sandboxctl purge' to also remove it."
@@ -1998,6 +2218,102 @@ EOF
     rm -rf "$SANDBOX_STATE_DIR"
   fi
   ok "purge complete"
+}
+
+# `sandboxctl restart` — non-destructive re-apply.
+#
+# Earlier versions did `cmd_down && cmd_up` which deleted the kind
+# cluster and rebuilt it from scratch (5–8 min, lost stream state,
+# lost in-cluster registry blobs, lost user secrets). The new behaviour
+# keeps the cluster + PVCs + Argo apps intact and just reapplies
+# everything that's idempotent: helm upgrades, Istio routes, /etc/hosts,
+# dnsmasq, LaunchAgents.
+#
+# When you genuinely want a wipe-and-rebuild, use:
+#   sandboxctl down && sandboxctl up
+# or:
+#   sandboxctl restart --rebuild   (alias for down + up)
+cmd_restart() {
+  local rebuild=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rebuild|--full) rebuild=1; shift ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl restart [--rebuild]
+
+Non-destructive: keeps the kind cluster, all PVCs (incl. NATS JetStream
+state and the in-cluster registry), Argo Apps, and Gitea repos.
+Re-runs every helm install (idempotent), reapplies Istio routes,
+refreshes /etc/hosts and dnsmasq, and reloads the LaunchAgents.
+
+  --rebuild   wipe-and-rebuild: equivalent to 'sandboxctl down && sandboxctl up'.
+              Use only when you suspect cluster-level corruption — recreating
+              kind takes 5–8 min and erases stream state.
+EOF
+        return 0 ;;
+      *) die "unknown flag: $1 (try 'sandboxctl restart --help')" ;;
+    esac
+  done
+
+  if (( rebuild )); then
+    log "restart --rebuild: full down + up (this will take 5–8 min)"
+    cmd_down
+    cmd_up
+    return
+  fi
+
+  if ! cluster_registered; then
+    warn "no kind cluster to restart — running full 'up' instead"
+    cmd_up
+    return
+  fi
+
+  log "restart: keeping kind cluster '$CLUSTER_NAME', re-applying everything else"
+  require_tools
+  ensure_tooling
+
+  # The cluster might be stopped (machine reboot). Bring it back to
+  # Ready before any kc/helm calls.
+  if ! cluster_api_reachable; then
+    log "kind cluster '$CLUSTER_NAME' is registered but stopped — starting it"
+    start_stopped_cluster
+  fi
+  write_pinned_kubeconfig
+  KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config use-context "$(kctx)" >/dev/null
+  kc cluster-info >/dev/null
+
+  load_or_generate_secrets
+  install_cert_manager
+  install_pki
+  clean_legacy_state
+  install_argocd
+  install_reflector
+  install_kargo
+  install_registry
+  install_demo_app
+  if (( ${INSTALL_KAGENT:-0} )) || _kagent_present; then
+    install_kagent
+  fi
+  install_gitea
+  install_istio_ambient
+  install_routes
+  if declare -F install_nats >/dev/null; then
+    install_nats
+  fi
+  install_hosts
+  install_dnsmasq
+  install_portfwd
+  if declare -F install_nats_portfwd >/dev/null; then
+    install_nats_portfwd
+  fi
+  trust_root_ca
+  write_state_file
+  validate_urls
+
+  ok "restart complete (cluster preserved)"
+  cmd_status
+  celebrate "sandbox restarted"
 }
 
 # ----- Status -----
@@ -2042,6 +2358,13 @@ cmd_status() {
   if _kagent_present; then
     workload_summary "$KAGENT_NS"      "kagent"
   fi
+  if [[ -n "${NATS_NS:-}" ]] && kc get namespace "$NATS_NS" >/dev/null 2>&1; then
+    workload_summary "$NATS_NS"        "nats"
+  fi
+  if declare -F nats_status >/dev/null; then
+    echo
+    nats_status | sed 's/^/  /'
+  fi
   echo
   echo "apps & URLs:"
   printf '  %-12s https://%s:%s\n' "argocd"   "$ARGO_HOST"   "$SANDBOX_HTTPS_PORT"
@@ -2049,6 +2372,10 @@ cmd_status() {
   printf '  %-12s https://%s:%s\n' "demo-app" "$DEMO_HOST"   "$SANDBOX_HTTPS_PORT"
   if _kagent_present; then
     printf '  %-12s https://%s:%s\n' "kagent" "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
+  fi
+  if [[ -n "${NATS_HOST:-}" ]]; then
+    printf '  %-12s nats://%s:%s   (also wss: https://%s)\n' \
+      "nats" "$NATS_HOST" "$SANDBOX_NATS_PORT" "$NATS_HOST"
   fi
   printf '  %-12s localhost:%s    (push: docker push localhost:%s/<image>:<tag>)\n' "registry" "$SANDBOX_REGISTRY_PORT" "$SANDBOX_REGISTRY_PORT"
 }
@@ -3222,6 +3549,15 @@ cmd_undeploy() {
 }
 
 # ============================================================================
+# Optional add-on libs. Sourced after every helper above so the libs can
+# call into log/ok/die, the kc helper, launchagent_stop, etc. without
+# worrying about ordering. Each lib is responsible for its own idempotency.
+# ============================================================================
+
+# shellcheck source=lib/nats.sh
+[[ -f "${SANDBOX_LIB_DIR}/nats.sh" ]] && . "${SANDBOX_LIB_DIR}/nats.sh"
+
+# ============================================================================
 # Usage + dispatcher
 # ============================================================================
 
@@ -3234,11 +3570,11 @@ usage:
   sandbox.sh trust-ca       trust the sandbox root CA in macOS System keychain (sudo)
   sandbox.sh untrust-ca     remove the sandbox root CA from System keychain (sudo)
   sandbox.sh up [--with-kagent | --install all]
-                            create cluster + install argocd/kargo/demo/registry/gitea + ingress + PKI + hosts + portfwd
-                            (kagent is opt-in: --with-kagent or --install all)
+                            create cluster + install argocd/kargo/demo/registry/gitea/nats + ingress + PKI + hosts + portfwd
+                            (NATS is default-on; kagent is opt-in: --with-kagent or --install all)
   sandbox.sh down           remove cluster + LaunchAgent + /etc/hosts + keychain CA (keeps ~/.sandbox)
   sandbox.sh purge          down + remove ~/.sandbox (prompts for confirmation)
-  sandbox.sh restart        down + up
+  sandbox.sh restart        re-apply installers, keep kind cluster + state (use 'restart --rebuild' for full wipe)
   sandbox.sh status         cluster + workload status + URLs
   sandbox.sh validate       curl each URL from the Mac and print HTTP codes
   sandbox.sh creds          print login details (URLs + admin creds)
@@ -3284,6 +3620,10 @@ env overrides:
   GITEA_CHART_VERSION         pin gitea helm chart version (default: 12.5.0)
   GITEA_ADMIN_USER            admin user created in Gitea (default: sandbox)
   GITEA_ORG                   org chart repos are pushed under (default: sandbox)
+  NATS_CHART_VERSION          pin nats helm chart version (default: 2.14.0)
+  NATS_HOST                   user-facing NATS hostname (default: nats.\${SANDBOX_DOMAIN})
+  NATS_JETSTREAM_SIZE         PVC size for JetStream file store (default: 2Gi)
+  SANDBOX_NATS_PORT           Mac-side TCP port for nats:// (default: 4222)
 EOF
 }
 
@@ -3296,7 +3636,7 @@ main() {
     down)               cmd_down ;;
     purge)              cmd_purge ;;
     status)             cmd_status ;;
-    restart)            cmd_down; cmd_up ;;
+    restart)            shift; cmd_restart "$@" ;;
     validate)           require_running_cluster; validate_urls ;;
     creds)              cmd_creds ;;
     argocd-ui)          cmd_argocd_ui ;;

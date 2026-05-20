@@ -48,6 +48,8 @@ archives:
       - kind-config.yaml
       - src: manifests
         dst: manifests
+      - src: lib
+        dst: lib
       - install.sh
       - README.md
       - LICENSE
@@ -105,7 +107,7 @@ brews:
     # the binary with a tiny shim that exports the path.
     install: |
       libexec.install "sandboxctl" => "sandboxctl-bin"
-      libexec.install "sandbox.sh", "kind-config.yaml", "manifests"
+      libexec.install "sandbox.sh", "kind-config.yaml", "manifests", "lib"
       (bin/"sandboxctl").write <<~EOS
         #!/bin/bash
         export SANDBOXCTL_ASSETS="#{libexec}"
