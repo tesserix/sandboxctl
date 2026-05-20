@@ -121,8 +121,26 @@ warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1 (install via brew)"; }
 
+# User-facing kubeconfig. We force kind's kubeconfig writes here
+# regardless of any $KUBECONFIG the user has set in their shell, so
+# `kubectl` "just works" in any new terminal without the user having
+# to know where kind dropped the context. kind merges into this file
+# rather than replacing it, so existing entries are preserved.
+SANDBOX_USER_KUBECONFIG="${HOME}/.kube/config"
+
 kctx() { echo "kind-$CLUSTER_NAME"; }
-kc()   { kubectl --context "$(kctx)" "$@"; }
+# Internal kubectl helper. Pins KUBECONFIG to the canonical user file
+# we just wrote into, so sandbox.sh keeps working even if the caller
+# has a custom $KUBECONFIG that doesn't include ~/.kube/config.
+kc()   { KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl --context "$(kctx)" "$@"; }
+
+# kind_pinned runs `kind` with KUBECONFIG forced to the canonical
+# user kubeconfig, so create/delete operations always touch the same
+# file regardless of what the surrounding shell exported.
+kind_pinned() {
+  mkdir -p "$(dirname "$SANDBOX_USER_KUBECONFIG")"
+  KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kind "$@"
+}
 
 # Truth source for "is kagent installed in this cluster?" — checked
 # at runtime against the live API rather than a flag in state, so
@@ -378,19 +396,21 @@ bring_up_cluster() {
     "$SANDBOX_RUNTIME" pull "$KIND_NODE_IMAGE" || warn "pre-pull failed; kind will retry the pull itself"
   fi
   log "creating kind cluster '$CLUSTER_NAME'"
-  kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$KIND_CONFIG"
+  kind_pinned create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$KIND_CONFIG"
   write_pinned_kubeconfig
   configure_node_registry_mirror
 }
 
-# Materialize a kubeconfig the LaunchAgent can use. kind respects the
-# user's $KUBECONFIG when it writes the new context, which means the
-# context may not be in ~/.kube/config — and launchd doesn't inherit
-# $KUBECONFIG from the shell. Pin our own file under $SANDBOX_STATE_DIR
-# so the port-forward agent doesn't depend on the user's environment.
+# Materialize a kubeconfig the LaunchAgent can use. We force kind to
+# write the cluster's context to ~/.kube/config (see kind_pinned), so
+# the user's `kubectl` works in any new shell without an env-var dance.
+# But launchd jobs don't inherit $KUBECONFIG, so we ALSO pin a copy
+# under $SANDBOX_STATE_DIR for the port-forward agent — that path is
+# baked into the plist and immune to whatever the user later does to
+# their shell environment.
 write_pinned_kubeconfig() {
   mkdir -p "$SANDBOX_STATE_DIR"
-  if ! kind get kubeconfig --name "$CLUSTER_NAME" > "${SANDBOX_KUBECONFIG}.tmp" 2>/dev/null; then
+  if ! kind_pinned get kubeconfig --name "$CLUSTER_NAME" > "${SANDBOX_KUBECONFIG}.tmp" 2>/dev/null; then
     rm -f "${SANDBOX_KUBECONFIG}.tmp"
     die "kind get kubeconfig --name $CLUSTER_NAME failed — cluster may not be ready"
   fi
@@ -1641,7 +1661,10 @@ EOF
   fi
 
   bring_up_cluster
-  kubectl config use-context "$(kctx)" >/dev/null
+  # Set current-context in the canonical user kubeconfig so plain
+  # `kubectl` (no flags) targets the sandbox in any new shell. Pinning
+  # to ~/.kube/config matches where kind_pinned writes the context.
+  KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config use-context "$(kctx)" >/dev/null
   kc cluster-info >/dev/null
 
   load_or_generate_secrets
@@ -1820,7 +1843,7 @@ cmd_down() {
 
   if cluster_registered; then
     log "deleting kind cluster '$CLUSTER_NAME'"
-    kind delete cluster --name "$CLUSTER_NAME"
+    kind_pinned delete cluster --name "$CLUSTER_NAME"
   else
     ok "no kind cluster named '$CLUSTER_NAME' to delete"
   fi
