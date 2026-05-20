@@ -2003,13 +2003,13 @@ EOF
     _ensure_registry_reachable
   else
     log "bringing the sandbox platform up (first run takes ~5–8 min)"
-    cmd_up "${up_args[@]}"
+    cmd_up ${up_args[@]+"${up_args[@]}"}
   fi
 
   # Deploy the product's chart. cmd_deploy is responsible for
   # validating that <target> actually contains something deployable.
   log "deploying from product dir: ${target}"
-  cmd_deploy "$target" "${deploy_args[@]}"
+  cmd_deploy "$target" ${deploy_args[@]+"${deploy_args[@]}"}
 
   trap - ERR
 }
@@ -2439,7 +2439,10 @@ cmd_build_from_manifest() {
       done
     fi
 
-    build_and_push "$image" "$abs_df" "$abs_ctx" "${extra_tags[@]}"
+    # Bash 3.2 (macOS system bash) trips `set -u` on `"${arr[@]}"` when
+    # the array is empty; the `${arr[@]+...}` guard expands to nothing
+    # in that case and to the elements otherwise.
+    build_and_push "$image" "$abs_df" "$abs_ctx" ${extra_tags[@]+"${extra_tags[@]}"}
     built+=("$name")
   done <<< "$entries"
 
