@@ -958,7 +958,10 @@ install_dnsmasq() {
   prime_sudo
   if [[ ! -f "$resolver_file" ]] || ! grep -q "^nameserver 127.0.0.1" "$resolver_file" 2>/dev/null; then
     sudo mkdir -p /etc/resolver
-    printf 'nameserver 127.0.0.1\nport 53\n' | sudo install -m 0644 /dev/stdin "$resolver_file"
+    local tmp; tmp="$(mktemp -t sandbox-resolver.XXXXXX)"
+    printf 'nameserver 127.0.0.1\nport 53\n' > "$tmp"
+    sudo install -m 0644 "$tmp" "$resolver_file"
+    rm -f "$tmp"
   fi
 
   # dnsmasq must run with privileges to bind :53. The standard pattern is
