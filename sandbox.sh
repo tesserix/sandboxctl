@@ -1252,6 +1252,9 @@ write_portfwd_plist() {
   local kubectl_path
   kubectl_path="$(command -v kubectl)" || die "kubectl not found on PATH"
   mkdir -p "$SANDBOX_LAUNCHAGENT_DIR" "$SANDBOX_STATE_DIR"
+  # write_pinned_kubeconfig already ran via install_portfwd; this guard
+  # only catches the case where someone calls write_portfwd_plist
+  # directly without going through the install path.
   [[ -f "$SANDBOX_KUBECONFIG" ]] || \
     die "pinned kubeconfig ${SANDBOX_KUBECONFIG} missing — run 'sandboxctl restart'"
   cat > "$SANDBOX_LAUNCHAGENT_PLIST" <<EOF
@@ -1287,6 +1290,18 @@ install_portfwd() {
   uninstall_portfwd
   uninstall_registry_portfwd
   free_port_or_die        # fail fast on foreign conflicts; clean up our own stale state
+
+  # Self-heal: regenerate the pinned kubeconfig and validate it works
+  # BEFORE handing it to launchd. Without this, an earlier failed run
+  # could leave a stale or missing $SANDBOX_KUBECONFIG, kubectl would
+  # crash on every respawn, and `KeepAlive=true` would burn CPU in a
+  # tight loop while emitting `context "kind-..." does not exist`.
+  write_pinned_kubeconfig
+  if ! kubectl --kubeconfig "$SANDBOX_KUBECONFIG" --context "$(kctx)" \
+        cluster-info >/dev/null 2>&1; then
+    die "kubectl can't reach the cluster with ${SANDBOX_KUBECONFIG} (context $(kctx)) — refusing to install a LaunchAgent that will respawn-loop. Try: sandboxctl restart"
+  fi
+
   write_portfwd_plist
   launchctl load "$SANDBOX_LAUNCHAGENT_PLIST" || \
     die "launchctl load failed for ${SANDBOX_LAUNCHAGENT_PLIST} — check the file then 'sandboxctl restart'"
