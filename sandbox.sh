@@ -57,6 +57,16 @@ ARCTL_VERSION="${ARCTL_VERSION:-latest}"
 ARCTL_INSTALL_DIR="${ARCTL_INSTALL_DIR:-/usr/local/bin}"
 INSTALL_ARCTL="${INSTALL_ARCTL:-1}"
 
+# agentregistry server — deployed *into* the cluster and exposed at
+# https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}. Backed by a
+# CloudNativePG-managed Postgres with the pgvector extension preloaded
+# (so embeddings + semantic search work, unlike the chart's bundled
+# postgres:18 which has no pgvector). All knobs live in lib/aregistry.sh;
+# only the gate flag belongs here so cmd_up can read it before the lib
+# is sourced.
+#   INSTALL_AGENTREGISTRY=0   skip agentregistry + CNPG entirely
+INSTALL_AGENTREGISTRY="${INSTALL_AGENTREGISTRY:-1}"
+
 # Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
 # pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
 # CD pulls from that URL — proper GitOps loop without needing external
@@ -1243,6 +1253,13 @@ spec:
     - route: [{ destination: { host: kagent-ui.${KAGENT_NS}.svc.cluster.local, port: { number: 8080 } } }]
 EOF
   fi
+
+  # agentregistry route is owned by lib/aregistry.sh so the chart's
+  # service name + port don't have to be duplicated here. Same gating
+  # rationale as kagent: skip when the namespace doesn't exist.
+  if declare -F install_aregistry_routes >/dev/null; then
+    install_aregistry_routes
+  fi
   ok "routes applied"
 }
 
@@ -1258,6 +1275,9 @@ _managed_hosts() {
   local out=("$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST")
   if _kagent_present; then out+=("$KAGENT_HOST"); fi
   if [[ -n "${NATS_HOST:-}" ]]; then out+=("$NATS_HOST"); fi
+  if declare -F aregistry_present >/dev/null && aregistry_present; then
+    out+=("$AREGISTRY_HOST")
+  fi
   printf '%s\n' "${out[@]}"
 }
 
@@ -1930,6 +1950,7 @@ cmd_up() {
       --with-kagent)    INSTALL_KAGENT=1; shift ;;
       --no-arctl)       INSTALL_ARCTL=0; shift ;;
       --no-nats-cli)    INSTALL_NATS_CLI=0; shift ;;
+      --no-agentregistry) INSTALL_AGENTREGISTRY=0; shift ;;
       --install)
         case "${2:-}" in
           all)          INSTALL_KAGENT=1; shift 2 ;;
@@ -1937,12 +1958,19 @@ cmd_up() {
         esac ;;
       -h|--help)
         cat <<EOF
-sandboxctl up [--with-kagent] [--install all] [--no-arctl] [--no-nats-cli]
+sandboxctl up [--with-kagent] [--install all] [--no-arctl] [--no-nats-cli] [--no-agentregistry]
 
 Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
 Kargo + Istio + in-cluster registry + Gitea + NATS (JetStream) + a demo
-app, all wired behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+app + agentregistry, all wired behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
 NATS is also reachable at nats://${NATS_HOST:-nats.${SANDBOX_DOMAIN}}:${SANDBOX_NATS_PORT:-4222}.
+
+In the cluster (default-on):
+  agentregistry    https://aregistry.ai server backed by a CloudNativePG
+                   Postgres with pgvector preloaded (so embeddings +
+                   semantic search work). Reached at
+                   https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+                   Skip with --no-agentregistry (or INSTALL_AGENTREGISTRY=0).
 
 Also installs onto the Mac (not the cluster):
   arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
@@ -1995,6 +2023,9 @@ EOF
   else
     log "skipping kagent (pass --with-kagent or --install all to enable)"
   fi
+  if declare -F install_aregistry >/dev/null; then
+    install_aregistry
+  fi
   install_gitea
   install_istio_ambient
   install_routes
@@ -2018,6 +2049,9 @@ EOF
   fi
   if [[ -n "${NATS_HOST:-}" ]]; then
     printf '  nats:  nats://%s:%s   (or wss://%s)\n' "$NATS_HOST" "$SANDBOX_NATS_PORT" "$NATS_HOST"
+  fi
+  if declare -F aregistry_present >/dev/null && aregistry_present; then
+    printf '  open https://%s:%s\n' "$AREGISTRY_HOST" "$SANDBOX_HTTPS_PORT"
   fi
   echo "  sandboxctl creds   # full login details"
   celebrate "sandbox is up"
@@ -2045,7 +2079,7 @@ cmd_bootstrap() {
     case "$1" in
       --repo)
         repo_flag="${2:-}"; shift 2 ;;
-      --with-kagent|--no-arctl|--install)
+      --with-kagent|--no-arctl|--no-agentregistry|--install)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
           up_args+=("$1" "${2:-}"); shift 2
@@ -2073,6 +2107,7 @@ product repo is selected by:
   sandboxctl bootstrap --repo path/to/repo
   sandboxctl bootstrap --with-kagent         # forwarded to 'up'
   sandboxctl bootstrap --no-arctl            # forwarded to 'up'
+  sandboxctl bootstrap --no-agentregistry    # forwarded to 'up'
   sandboxctl bootstrap --chart custom/chart  # forwarded to 'deploy'
   sandboxctl bootstrap --no-build            # forwarded to 'deploy'
 
@@ -2298,6 +2333,9 @@ EOF
   if (( ${INSTALL_KAGENT:-0} )) || _kagent_present; then
     install_kagent
   fi
+  if declare -F install_aregistry >/dev/null; then
+    install_aregistry
+  fi
   install_gitea
   install_istio_ambient
   install_routes
@@ -2364,9 +2402,15 @@ cmd_status() {
   if [[ -n "${NATS_NS:-}" ]] && kc get namespace "$NATS_NS" >/dev/null 2>&1; then
     workload_summary "$NATS_NS"        "nats"
   fi
+  if declare -F aregistry_present >/dev/null && aregistry_present; then
+    workload_summary "$AREGISTRY_NS"   "aregistry"
+  fi
   if declare -F nats_status >/dev/null; then
     echo
     nats_status | sed 's/^/  /'
+  fi
+  if declare -F aregistry_status >/dev/null; then
+    aregistry_status | sed 's/^/  /'
   fi
   echo
   echo "apps & URLs:"
@@ -2379,6 +2423,9 @@ cmd_status() {
   if [[ -n "${NATS_HOST:-}" ]]; then
     printf '  %-12s nats://%s:%s   (also wss: https://%s)\n' \
       "nats" "$NATS_HOST" "$SANDBOX_NATS_PORT" "$NATS_HOST"
+  fi
+  if declare -F aregistry_present >/dev/null && aregistry_present; then
+    printf '  %-12s https://%s:%s\n' "aregistry" "$AREGISTRY_HOST" "$SANDBOX_HTTPS_PORT"
   fi
   printf '  %-12s localhost:%s    (push: docker push localhost:%s/<image>:<tag>)\n' "registry" "$SANDBOX_REGISTRY_PORT" "$SANDBOX_REGISTRY_PORT"
 }
@@ -2432,6 +2479,10 @@ kagent
                ollama pull ${KAGENT_OLLAMA_MODEL}
              or set KAGENT_OLLAMA_HOST to a remote endpoint and re-run 'sandboxctl up'.
 EOF
+  fi
+  if declare -F aregistry_print_creds >/dev/null && aregistry_present; then
+    echo
+    aregistry_print_creds
   fi
   printf '\nkubectl context: %s\n' "$(kctx)"
 }
@@ -3560,6 +3611,9 @@ cmd_undeploy() {
 # shellcheck source=lib/nats.sh
 [[ -f "${SANDBOX_LIB_DIR}/nats.sh" ]] && . "${SANDBOX_LIB_DIR}/nats.sh"
 
+# shellcheck source=lib/aregistry.sh
+[[ -f "${SANDBOX_LIB_DIR}/aregistry.sh" ]] && . "${SANDBOX_LIB_DIR}/aregistry.sh"
+
 # ============================================================================
 # Usage + dispatcher
 # ============================================================================
@@ -3572,9 +3626,9 @@ usage:
   sandbox.sh setup-podman   install/configure rootful podman machine (one-time)
   sandbox.sh trust-ca       trust the sandbox root CA in macOS System keychain (sudo)
   sandbox.sh untrust-ca     remove the sandbox root CA from System keychain (sudo)
-  sandbox.sh up [--with-kagent | --install all]
-                            create cluster + install argocd/kargo/demo/registry/gitea/nats + ingress + PKI + hosts + portfwd
-                            (NATS is default-on; kagent is opt-in: --with-kagent or --install all)
+  sandbox.sh up [--with-kagent | --install all] [--no-agentregistry]
+                            create cluster + install argocd/kargo/demo/registry/gitea/nats/agentregistry+CNPG + ingress + PKI + hosts + portfwd
+                            (NATS + agentregistry default-on; kagent is opt-in: --with-kagent or --install all)
   sandbox.sh down           remove cluster + LaunchAgent + /etc/hosts + keychain CA (keeps ~/.sandbox)
   sandbox.sh purge          down + remove ~/.sandbox (prompts for confirmation)
   sandbox.sh restart        re-apply installers, keep kind cluster + state (use 'restart --rebuild' for full wipe)
@@ -3627,6 +3681,12 @@ env overrides:
   NATS_HOST                   user-facing NATS hostname (default: nats.\${SANDBOX_DOMAIN})
   NATS_JETSTREAM_SIZE         PVC size for JetStream file store (default: 2Gi)
   SANDBOX_NATS_PORT           Mac-side TCP port for nats:// (default: 4222)
+  INSTALL_AGENTREGISTRY       set to 0 (or pass --no-agentregistry) to skip agentregistry + CNPG
+  AREGISTRY_CHART_VERSION     pin agentregistry helm chart version (default: 0.3.3)
+  AREGISTRY_IMAGE_TAG         pin agentregistry server image tag (default: v0.3.3)
+  AREGISTRY_PG_IMAGE          CNPG postgres image with pgvector (default: ghcr.io/cloudnative-pg/postgresql:17.9-standard-trixie)
+  AREGISTRY_PG_STORAGE        PVC size for the CNPG cluster (default: 2Gi)
+  CNPG_CHART_VERSION          pin cloudnative-pg operator chart version (default: 0.28.2)
 EOF
 }
 
