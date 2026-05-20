@@ -148,6 +148,52 @@ helm_uninstall_if_present() {
 
 require_tools() { need kind; need kubectl; need helm; ensure_runtime; }
 
+# _looks_like_product_repo <dir>
+# A "product repo" for sandboxctl is anything with at least one
+# Dockerfile, a Chart.yaml, or a sandboxctl.yaml within reasonable
+# depth. Used to fail fast when the user runs build/deploy/bootstrap
+# from an unrelated directory.
+_looks_like_product_repo() {
+  local target="$1"
+  [[ -f "${target}/sandboxctl.yaml" || -f "${target}/sandboxctl.yml" ]] && return 0
+  if find "$target" -maxdepth 5 -type d \
+        \( -name node_modules -o -name vendor -o -name dist -o -name .git \) -prune \
+      -o \( -type f \( -name Dockerfile -o -name Chart.yaml \) -print \) 2>/dev/null \
+      | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
+# _resolve_product_repo <flag-value> <positional-value> <cmd-name>
+# Pick the product repo directory: --repo flag, then positional path,
+# then cwd. Validates the result is a directory and looks repo-shaped.
+# Echoes the absolute path on stdout; dies on any problem.
+_resolve_product_repo() {
+  local flag_repo="$1" positional="$2" cmd="$3"
+  if [[ -n "$flag_repo" && -n "$positional" ]]; then
+    die "${cmd}: pass either --repo <dir> or a positional path, not both"
+  fi
+  local target="${flag_repo:-${positional:-.}}"
+  local explicit=0
+  [[ -n "$flag_repo" || -n "$positional" ]] && explicit=1
+
+  [[ -d "$target" ]] || die "${cmd}: '${target}' is not a directory"
+  target="$(cd "$target" && pwd)"
+
+  if ! _looks_like_product_repo "$target"; then
+    if (( explicit )); then
+      die "${cmd}: '${target}' doesn't look like a product repo
+       (no Dockerfile, Chart.yaml, or sandboxctl.yaml found)"
+    else
+      die "${cmd}: current directory doesn't look like a product repo
+       (no Dockerfile, Chart.yaml, or sandboxctl.yaml found).
+       cd into your product repo, or pass --repo <dir>"
+    fi
+  fi
+  printf '%s\n' "$target"
+}
+
 # ensure_tooling brew-installs developer tools that are commonly needed by
 # apps deployed onto the sandbox (Go, Node, mise for runtime versions,
 # fswatch for hot-reload). Skips anything already on PATH.
@@ -1585,9 +1631,11 @@ EOF
 # wraps them so a fresh-checkout user runs one command instead of
 # remembering the order.
 cmd_bootstrap() {
-  local target="" up_args=() deploy_args=()
+  local positional="" repo_flag="" up_args=() deploy_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --repo)
+        repo_flag="${2:-}"; shift 2 ;;
       --with-kagent|--install)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
@@ -1601,17 +1649,19 @@ cmd_bootstrap() {
         deploy_args+=("$1"); shift ;;
       -h|--help)
         cat <<EOF
-sandboxctl bootstrap [path] [up flags] [deploy flags]
+sandboxctl bootstrap [path] [--repo <dir>] [up flags] [deploy flags]
 
 One-shot for first-time users: brings the sandbox cluster up if it
-isn't already, then deploys the chart in the current product
-directory.
-
-Run this from your product repo root — the directory that holds your
-Dockerfile(s), chart, and k8s/secrets.yaml.
+isn't already, then deploys the chart in the product repo. The
+product repo is selected by:
+  --repo <dir>   explicit pointer to the repo root
+  [path]         positional form of the same
+  (default)      current working directory (must contain Dockerfile/
+                 Chart.yaml/sandboxctl.yaml)
 
   sandboxctl bootstrap                       # cwd = product dir
   sandboxctl bootstrap path/to/repo
+  sandboxctl bootstrap --repo path/to/repo
   sandboxctl bootstrap --with-kagent         # forwarded to 'up'
   sandboxctl bootstrap --chart custom/chart  # forwarded to 'deploy'
   sandboxctl bootstrap --no-build            # forwarded to 'deploy'
@@ -1623,12 +1673,13 @@ EOF
         return 0 ;;
       -*) die "unknown flag: $1 (try 'sandboxctl bootstrap --help')" ;;
       *)
-        if [[ -z "$target" ]]; then target="$1"; shift
+        if [[ -z "$positional" ]]; then positional="$1"; shift
         else die "unexpected argument: $1"
         fi ;;
     esac
   done
-  target="${target:-.}"
+  local target
+  target="$(_resolve_product_repo "$repo_flag" "$positional" bootstrap)" || return 1
 
   # Print a final status panel even if bootstrap aborts midway. Users
   # reported that earlier failures left them with no signal about what
@@ -1918,7 +1969,35 @@ cmd_build() {
   #      header comment, so it lands in `git status` and can be edited.
   #   3. no Dockerfiles at all → fall through to the legacy auto-walk
   #      (which dies with a clear "no Dockerfile found" message).
-  local target="${1:-.}" tag="${2:-latest}"
+  local repo_flag="" positional="" tag="latest"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) repo_flag="${2:-}"; shift 2 ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl build [path] [--repo <dir>]
+
+Find Dockerfiles under the product repo, build them, and push to the
+in-cluster registry. The product repo can be specified by:
+  --repo <dir>   explicit pointer to the repo root
+  [path]         positional form of the same
+  (default)      current working directory
+
+Build precedence inside the repo:
+  1. existing sandboxctl.yaml/.yml — used as-is
+  2. Dockerfiles only              — auto-generates sandboxctl.yaml
+EOF
+        return 0 ;;
+      -*) die "build: unknown flag: $1" ;;
+      *)
+        if [[ -z "$positional" ]]; then positional="$1"; shift
+        elif [[ "$tag" == "latest" ]]; then tag="$1"; shift
+        else die "build: unexpected argument: $1"
+        fi ;;
+    esac
+  done
+  local target
+  target="$(_resolve_product_repo "$repo_flag" "$positional" build)" || return 1
 
   _ensure_registry_reachable
 
@@ -2534,12 +2613,13 @@ remove_app_host() {
 }
 
 cmd_deploy() {
-  # Usage: sandboxctl deploy [path] [--env <name>] [--chart <dir>]
+  # Usage: sandboxctl deploy [path] [--repo <dir>] [--env <name>] [--chart <dir>]
   #                          [--values <file>] [--name <name>] [--no-build]
-  local target="" env="dev" do_build=1
+  local positional="" repo_flag="" env="dev" do_build=1
   local chart_override="" values_override="" name_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --repo)     repo_flag="$2"; shift 2 ;;
       --env)      env="$2"; shift 2 ;;
       --chart)    chart_override="$2"; shift 2 ;;
       --values)   values_override="$2"; shift 2 ;;
@@ -2547,20 +2627,22 @@ cmd_deploy() {
       --no-build) do_build=0; shift ;;
       -h|--help)
         cat <<EOF
-sandboxctl deploy [path] [--env <name>]
+sandboxctl deploy [path] [--repo <dir>] [--env <name>]
                   [--chart <dir>] [--values <file>] [--name <name>]
                   [--no-build]
 
-Run from your product directory (one that contains your Dockerfile(s)
-and chart). Builds + pushes images, applies secrets, pushes the chart
-to the in-cluster Gitea, creates one Argo CD Application per chart,
-and routes a stable URL to each.
+Builds + pushes images, applies secrets, pushes the chart to the
+in-cluster Gitea, creates one Argo CD Application per chart, and
+routes a stable URL to each. The product repo is selected by:
+  --repo <dir>   explicit pointer to the repo root
+  [path]         positional form of the same
+  (default)      current working directory
 
 Pipeline (per chart):
-  1. Build + push every Dockerfile listed in <path>/sandboxctl.yaml,
+  1. Build + push every Dockerfile listed in <repo>/sandboxctl.yaml,
      or auto-walk Dockerfiles when no manifest exists. Skip with
      --no-build (useful when iterating only on chart edits).
-  2. Apply <path>/k8s/secrets.yaml to each chart's target namespace,
+  2. Apply <repo>/k8s/secrets.yaml to each chart's target namespace,
      prompting to fill placeholders on first run.
   3. Push the chart to the in-cluster Gitea, create one Argo CD
      Application per chart syncing from Gitea, and route
@@ -2568,15 +2650,15 @@ Pipeline (per chart):
      chart's primary Service.
 
 Chart resolution order (no --chart):
-  1. <path>/k8s/chart/Chart.yaml         the recommended layout
-  2. Auto-discovery walks <path> for any Chart.yaml within depth 5
+  1. <repo>/k8s/chart/Chart.yaml         the recommended layout
+  2. Auto-discovery walks <repo> for any Chart.yaml within depth 5
      (skipping vendor / node_modules / dist / .git).
   3. Interactive prompt asks for an absolute or relative chart path
      when nothing is found.
 
 Override flags (skip auto-discovery and deploy a single chart):
   --chart <dir>     Path to a chart directory containing Chart.yaml.
-                    Relative paths resolve from <path>.
+                    Relative paths resolve from <repo>.
   --values <file>   Values file inside <chart>. Defaults to
                     values-sandbox.yaml, then values-local.yaml.
   --name <name>     Override the Argo Application + routed hostname
@@ -2593,14 +2675,14 @@ EOF
         ;;
       -*) die "unknown flag: $1" ;;
       *)
-        if [[ -z "$target" ]]; then target="$1"; shift
+        if [[ -z "$positional" ]]; then positional="$1"; shift
         else die "unexpected argument: $1"
         fi ;;
     esac
   done
   require_running_cluster
-  target="${target:-.}"
-  target="$(cd "$target" && pwd)"
+  local target
+  target="$(_resolve_product_repo "$repo_flag" "$positional" deploy)" || return 1
 
   local entries
   if [[ -n "$chart_override" ]]; then
@@ -2948,19 +3030,21 @@ usage:
   sandbox.sh creds          print login details (URLs + admin creds)
   sandbox.sh argocd-ui      print Argo CD URL + admin creds
   sandbox.sh kargo-ui       print Kargo URL + admin creds
-  sandbox.sh build [path]            find Dockerfiles under <path>, build + push to the cluster registry
+  sandbox.sh build [path] [--repo <dir>]
+                                     find Dockerfiles under the product repo (path/--repo/cwd),
+                                     build + push to the cluster registry
   sandbox.sh images                  list images in the cluster registry
   sandbox.sh images rm <ref>         delete an image (e.g. 'myapp:v1' or 'myapp' for all tags)
   sandbox.sh images prune            delete every image, then GC blobs
   sandbox.sh images gc               run registry garbage-collector to reclaim disk now
-  sandbox.sh deploy [path] [--env <name>] [--no-build]
-                                     auto-discover every chart under <path> (and sibling repos),
+  sandbox.sh deploy [path] [--repo <dir>] [--env <name>] [--no-build]
+                                     auto-discover every chart under the product repo,
                                      build + push every Dockerfile, apply k8s/secrets.yaml, push each chart
                                      to in-cluster Gitea, create one Argo CD Application per chart, and
                                      route <chart>.${SANDBOX_DOMAIN} per app
   sandbox.sh undeploy --name <appname> [--env <name>]
                                      remove the Argo Application, route, and hosts entry (namespace preserved)
-  sandbox.sh bootstrap [path] [up flags] [deploy flags]
+  sandbox.sh bootstrap [path] [--repo <dir>] [up flags] [deploy flags]
                                      run 'up' (if not already up) + 'deploy' in one shot — handy first-run wrapper
 
 env overrides:
