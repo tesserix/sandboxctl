@@ -52,6 +52,12 @@ Open `https://<your-chart-name>.sandbox.app:8443` in your browser.
 | `https://demo-app.sandbox.app:8443` | a tiny demo deployment |
 | `localhost:5050` | in-cluster Docker registry (push target for `sandboxctl build`) |
 
+`sandboxctl up` also installs the [`arctl`](https://aregistry.ai)
+(agentregistry) CLI onto your Mac — for building, publishing, and running
+MCP servers, agents, skills, and prompts. Skip it with `sandboxctl up
+--no-arctl` (or `INSTALL_ARCTL=0`); pin a version with `ARCTL_VERSION=v0.3.3`.
+`sandboxctl down` / `purge` remove it again (keep it with `SANDBOX_KEEP_ARCTL=1`).
+
 All TLS is signed by a per-install root CA that `sandboxctl up` trusts in
 your macOS System keychain — no browser warnings, no manual port-forwards.
 
@@ -292,6 +298,10 @@ Defaults work for most people. Override via env vars:
 | `GITEA_CHART_VERSION` | `12.5.0` | Gitea chart version |
 | `KAGENT_OLLAMA_HOST` | `host.docker.internal:11434` | Ollama endpoint |
 | `KAGENT_OLLAMA_MODEL` | `llama3.2` | Ollama model |
+| `ARCTL_VERSION` | `latest` | `arctl` release to install (`latest` or a tag like `v0.3.3`) |
+| `INSTALL_ARCTL` | `1` | install `arctl` during `up`; set `0` to skip |
+| `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
+| `ARCTL_INSTALL_DIR` | `/usr/local/bin` | where the `arctl` binary is installed |
 
 ## Secrets
 

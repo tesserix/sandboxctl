@@ -42,6 +42,20 @@ KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
 KAGENT_OLLAMA_HOST="${KAGENT_OLLAMA_HOST:-host.docker.internal:11434}"
 KAGENT_OLLAMA_MODEL="${KAGENT_OLLAMA_MODEL:-llama3.2}"
 
+# arctl — the agentregistry CLI (https://aregistry.ai). Installed onto the
+# *Mac* (not the cluster) by `up`/`bootstrap` so the sandbox can build,
+# publish, and run MCP servers, agents, skills + prompts; removed again by
+# `down`/`purge`. We fetch the release binary directly and verify its
+# sha256 rather than piping the upstream installer to a shell.
+#   ARCTL_VERSION   tag to install (default 'latest' tracks the newest
+#                   GitHub release; pin e.g. v0.3.3 for reproducibility)
+#   INSTALL_ARCTL=0      skip the install during up/bootstrap
+#   SANDBOX_KEEP_ARCTL=1 keep the binary on down/purge
+ARCTL_REPO="${ARCTL_REPO:-agentregistry-dev/agentregistry}"
+ARCTL_VERSION="${ARCTL_VERSION:-latest}"
+ARCTL_INSTALL_DIR="${ARCTL_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_ARCTL="${INSTALL_ARCTL:-1}"
+
 # Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
 # pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
 # CD pulls from that URL — proper GitOps loop without needing external
@@ -233,6 +247,97 @@ ensure_tooling() {
   if (( ${#installed[@]} > 0 )); then
     ok "installed: ${installed[*]}"
   fi
+}
+
+# ----- arctl (agentregistry CLI) -------------------------------------------
+# arctl is host-side tooling, installed alongside kind/kubectl/helm rather
+# than into the cluster. We download the release binary and verify its
+# sha256 ourselves (idempotent + version-aware) instead of piping the
+# upstream get-arctl installer to a shell.
+
+arctl_installed_version() {
+  # Prefer the binary we manage; fall back to whatever is on PATH. Checking
+  # $ARCTL_INSTALL_DIR directly keeps the idempotency check correct even when
+  # that dir isn't on the caller's PATH.
+  local bin="${ARCTL_INSTALL_DIR}/arctl"
+  [[ -x "$bin" ]] || bin="$(command -v arctl 2>/dev/null || true)"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  "$bin" version --json 2>/dev/null | jq -r '.arctl_version' 2>/dev/null
+}
+
+arctl_resolve_version() {
+  if [[ "$ARCTL_VERSION" == "latest" ]]; then
+    curl -fsSL "https://api.github.com/repos/${ARCTL_REPO}/releases/latest" 2>/dev/null \
+      | jq -r '.tag_name' 2>/dev/null
+  else
+    echo "$ARCTL_VERSION"
+  fi
+}
+
+install_arctl() {
+  (( INSTALL_ARCTL )) || { log "skipping arctl install (INSTALL_ARCTL=0)"; return 0; }
+  command -v curl >/dev/null 2>&1 || { warn "arctl: curl not found — skipping install"; return 0; }
+  command -v jq   >/dev/null 2>&1 || { warn "arctl: jq not found (brew install jq) — skipping install"; return 0; }
+
+  local arch
+  case "$(uname -m)" in
+    arm64|aarch64) arch=arm64 ;;
+    x86_64|amd64)  arch=amd64 ;;
+    *) warn "arctl: unsupported architecture $(uname -m) — skipping"; return 0 ;;
+  esac
+  local os; os="$(uname | tr '[:upper:]' '[:lower:]')"
+
+  local want; want="$(arctl_resolve_version || true)"
+  if [[ -z "$want" || "$want" == "null" ]]; then
+    warn "arctl: could not resolve a release version (offline?) — skipping"; return 0
+  fi
+
+  local have; have="$(arctl_installed_version || true)"
+  if [[ -n "$have" && "$have" == "$want" ]]; then
+    ok "arctl ${have} already installed (${ARCTL_INSTALL_DIR}/arctl)"; return 0
+  fi
+
+  log "installing arctl ${want} -> ${ARCTL_INSTALL_DIR}/arctl"
+  local dist="arctl-${os}-${arch}"
+  local base="https://github.com/${ARCTL_REPO}/releases/download/${want}"
+  local tmp; tmp="$(mktemp -d -t arctl.XXXXXX)"
+
+  if ! curl -fsSL "${base}/${dist}" -o "${tmp}/arctl"; then
+    rm -rf "$tmp"; warn "arctl: download failed (${base}/${dist}) — skipping"; return 0
+  fi
+  # Verify the published sha256 when present; refuse to install on mismatch.
+  if curl -fsSL "${base}/${dist}.sha256" -o "${tmp}/sum" 2>/dev/null; then
+    local want_sum have_sum
+    want_sum="$(awk '{print $1}' "${tmp}/sum")"
+    have_sum="$(shasum -a 256 "${tmp}/arctl" | awk '{print $1}')"
+    if [[ -n "$want_sum" && "$want_sum" != "$have_sum" ]]; then
+      rm -rf "$tmp"; warn "arctl: checksum mismatch — refusing to install"; return 0
+    fi
+  fi
+  chmod +x "${tmp}/arctl"
+
+  # /usr/local/bin is root-owned on macOS — use sudo only when the target
+  # directory isn't already writable by the current user.
+  if [[ -w "$ARCTL_INSTALL_DIR" ]]; then
+    mv -f "${tmp}/arctl" "${ARCTL_INSTALL_DIR}/arctl"
+  else
+    prime_sudo
+    sudo mkdir -p "$ARCTL_INSTALL_DIR"
+    sudo install -m 0755 "${tmp}/arctl" "${ARCTL_INSTALL_DIR}/arctl"
+  fi
+  rm -rf "$tmp"
+  ok "arctl ${want} installed — run 'arctl version', then open http://localhost:12121"
+}
+
+uninstall_arctl() {
+  [[ "${SANDBOX_KEEP_ARCTL:-0}" == "1" ]] && { ok "keeping arctl (SANDBOX_KEEP_ARCTL=1)"; return 0; }
+  local bin="${ARCTL_INSTALL_DIR}/arctl"
+  if [[ -e "$bin" ]]; then
+    log "removing arctl ($bin)"
+    if [[ -w "$ARCTL_INSTALL_DIR" ]]; then rm -f "$bin"
+    else prime_sudo; sudo rm -f "$bin"; fi
+  fi
+  ok "arctl removed (no-op if it wasn't installed)"
 }
 
 runtime_fallback() {
@@ -1628,6 +1733,7 @@ cmd_up() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with-kagent)    INSTALL_KAGENT=1; shift ;;
+      --no-arctl)       INSTALL_ARCTL=0; shift ;;
       --install)
         case "${2:-}" in
           all)          INSTALL_KAGENT=1; shift 2 ;;
@@ -1635,11 +1741,16 @@ cmd_up() {
         esac ;;
       -h|--help)
         cat <<EOF
-sandboxctl up [--with-kagent] [--install all]
+sandboxctl up [--with-kagent] [--install all] [--no-arctl]
 
 Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
 Kargo + Istio + in-cluster registry + Gitea + a demo app, all wired
 behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+
+Also installs onto the Mac (not the cluster):
+  arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
+                   run MCP servers, agents, skills + prompts. Skip with
+                   --no-arctl (or INSTALL_ARCTL=0); pin with ARCTL_VERSION.
 
 Add-ons (off by default — they take longer and use more memory):
   --with-kagent    Install kagent (agentic AI controller + UI).
@@ -1659,6 +1770,8 @@ EOF
     sudo -v || die "sudo required to configure /etc/hosts and System keychain"
     start_sudo_keepalive
   fi
+
+  install_arctl
 
   bring_up_cluster
   # Set current-context in the canonical user kubeconfig so plain
@@ -1726,7 +1839,7 @@ cmd_bootstrap() {
     case "$1" in
       --repo)
         repo_flag="${2:-}"; shift 2 ;;
-      --with-kagent|--install)
+      --with-kagent|--no-arctl|--install)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
           up_args+=("$1" "${2:-}"); shift 2
@@ -1753,6 +1866,7 @@ product repo is selected by:
   sandboxctl bootstrap path/to/repo
   sandboxctl bootstrap --repo path/to/repo
   sandboxctl bootstrap --with-kagent         # forwarded to 'up'
+  sandboxctl bootstrap --no-arctl            # forwarded to 'up'
   sandboxctl bootstrap --chart custom/chart  # forwarded to 'deploy'
   sandboxctl bootstrap --no-build            # forwarded to 'deploy'
 
@@ -1834,6 +1948,11 @@ cmd_down() {
   if security find-certificate -c "$ROOT_CA_CN" /Library/Keychains/System.keychain >/dev/null 2>&1; then
     need_sudo=1
   fi
+  # arctl lives in (root-owned) /usr/local/bin — fold its removal into the
+  # single up-front sudo prompt instead of prompting again mid-teardown.
+  if [[ "${SANDBOX_KEEP_ARCTL:-0}" != "1" && -e "${ARCTL_INSTALL_DIR}/arctl" && ! -w "$ARCTL_INSTALL_DIR" ]]; then
+    need_sudo=1
+  fi
   (( need_sudo )) && prime_sudo
 
   log "tearing down sandbox '$CLUSTER_NAME'"
@@ -1852,8 +1971,9 @@ cmd_down() {
   uninstall_hosts
   uninstall_dnsmasq
   untrust_root_ca
+  uninstall_arctl
 
-  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, dnsmasq config, root CA trust removed)"
+  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, dnsmasq config, root CA trust, arctl removed)"
   echo "Preserved: ${SANDBOX_STATE_DIR} (logs/state) — use 'sandboxctl purge' to also remove it."
   echo "Leaves alone: kindest/node image cache, podman machine."
 }
