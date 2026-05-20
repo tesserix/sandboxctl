@@ -1958,6 +1958,9 @@ EOF
     esac
   done
   export INSTALL_KAGENT
+  # INSTALL_NATS_CLI is consumed by lib/nats.sh (shellcheck can't see
+  # the cross-file reference, hence the explicit export).
+  export INSTALL_NATS_CLI
 
   require_tools
   ensure_tooling
