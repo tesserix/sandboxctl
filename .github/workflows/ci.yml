@@ -13,13 +13,13 @@ jobs:
     name: bash syntax + shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: bash -n
         run: |
           bash -n sandbox.sh
           bash -n install.sh
       - name: shellcheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@2.0.0
         with:
           severity: warning
           ignore_paths: cli
@@ -28,10 +28,10 @@ jobs:
     name: go build + vet + smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.22'
+          go-version: '1.25'
           cache-dependency-path: cli/go.sum
       - name: go vet
         working-directory: cli
@@ -55,7 +55,7 @@ jobs:
     name: kubeconform manifests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: install kubeconform
         run: |
           curl -sSLo kubeconform.tgz \
@@ -70,15 +70,15 @@ jobs:
     name: goreleaser check (no release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.22'
+          go-version: '1.25'
           cache-dependency-path: cli/go.sum
       - name: validate config + build snapshot
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: '~> v2'
