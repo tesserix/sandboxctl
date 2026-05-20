@@ -30,6 +30,8 @@ ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-9.5.13}"
 KARGO_CHART_VERSION="${KARGO_CHART_VERSION:-1.1.1}"
 REFLECTOR_NS="${REFLECTOR_NS:-reflector}"
 REFLECTOR_CHART_VERSION="${REFLECTOR_CHART_VERSION:-9.1.7}"
+RELOADER_NS="${RELOADER_NS:-reloader}"
+RELOADER_CHART_VERSION="${RELOADER_CHART_VERSION:-2.2.11}"
 CERT_MANAGER_NS="${CERT_MANAGER_NS:-cert-manager}"
 CERT_MANAGER_CHART_VERSION="${CERT_MANAGER_CHART_VERSION:-v1.16.2}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.29.2}"
@@ -798,6 +800,25 @@ install_reflector() {
       --version "$REFLECTOR_CHART_VERSION" \
       --wait --timeout 5m
   ok "reflector ready"
+}
+
+install_reloader() {
+  # stakater/Reloader watches Secrets + ConfigMaps and rolls the
+  # workloads that consume them whenever a value changes. Workloads opt
+  # in via either:
+  #   reloader.stakater.com/auto: "true"            (rolls on any used CM/Secret change)
+  #   secret.reloader.stakater.com/reload: "<name>" (only when <name> changes)
+  # No further configuration needed — chart defaults watch all
+  # namespaces.
+  log "installing stakater/Reloader (ns: $RELOADER_NS, chart $RELOADER_CHART_VERSION)"
+  helm repo add stakater https://stakater.github.io/stakater-charts >/dev/null 2>&1 || true
+  helm repo update stakater >/dev/null
+  with_spinner "Reloader helm install (typically 30–60s)" \
+    helm upgrade --install reloader stakater/reloader \
+      --namespace "$RELOADER_NS" --create-namespace \
+      --version "$RELOADER_CHART_VERSION" \
+      --wait --timeout 5m
+  ok "reloader ready (annotate workloads with reloader.stakater.com/auto: \"true\")"
 }
 
 install_kargo() {
@@ -2015,6 +2036,7 @@ EOF
   clean_legacy_state
   install_argocd
   install_reflector
+  install_reloader
   install_kargo
   install_registry
   install_demo_app
@@ -2327,6 +2349,7 @@ EOF
   clean_legacy_state
   install_argocd
   install_reflector
+  install_reloader
   install_kargo
   install_registry
   install_demo_app
@@ -2393,6 +2416,7 @@ cmd_status() {
   workload_summary "$ISTIO_INGRESS_NS" "istio-gw"
   workload_summary "$CERT_MANAGER_NS"  "cert-mgr"
   workload_summary "$ARGOCD_NS"        "argocd"
+  workload_summary "$RELOADER_NS"      "reloader"
   workload_summary "$KARGO_NS"         "kargo"
   workload_summary "$REGISTRY_NS"      "registry"
   workload_summary "$DEMO_NS"          "demo-app"
@@ -2520,6 +2544,39 @@ detect_pusher() {
   die "podman is required for pushing — try 'sandboxctl setup-podman'"
 }
 
+# Delete the live manifest behind <repo>:<tag> in the in-cluster
+# registry, if any. Used right before a push so the freshly-built
+# manifest replaces the old one cleanly instead of leaving the prior
+# digest as an orphaned blob (which would otherwise pile up on the
+# registry PVC until `sandboxctl images gc`). Best-effort: any failure
+# falls through and the push proceeds.
+registry_drop_tag_if_present() {
+  local image="$1"
+  # Strip the host prefix to get <repo>:<tag>. We only manage tags that
+  # live in OUR registry.
+  case "$image" in
+    "localhost:${SANDBOX_REGISTRY_PORT}/"*) ;;
+    *) return 0 ;;
+  esac
+  local ref="${image#localhost:${SANDBOX_REGISTRY_PORT}/}"
+  local repo="${ref%:*}" tag
+  if [[ "$ref" == *:* ]]; then tag="${ref##*:}"; else tag="latest"; fi
+
+  # Cheap reachability probe — if the registry isn't up we can't (and
+  # shouldn't) try to delete; the upcoming push will surface the real
+  # error.
+  curl -sf --max-time 2 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/" >/dev/null 2>&1 || return 0
+
+  local digest
+  digest="$(registry_manifest_digest "$repo" "$tag" 2>/dev/null || true)"
+  if [[ -n "$digest" ]]; then
+    log "dropping previous ${repo}:${tag} (digest ${digest:0:19}...) before push"
+    curl -s -X DELETE --max-time 5 \
+      "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/${repo}/manifests/${digest}" >/dev/null 2>&1 || true
+    registry_filesystem_remove_tag "$repo" "$tag" >/dev/null 2>&1 || true
+  fi
+}
+
 # build_and_push <image> <dockerfile> <context> [extra build args]
 build_and_push() {
   local image="$1" dockerfile="$2" context="$3"; shift 3
@@ -2538,6 +2595,8 @@ build_and_push() {
     "$builder" save "$image" 2>/dev/null | "$pusher" load 2>&1 | tail -3 || \
       die "could not transfer ${image} from ${builder} to ${pusher}"
   fi
+
+  registry_drop_tag_if_present "$image"
 
   log "pushing ${image}  (pusher: ${pusher})"
   "$pusher" push --tls-verify=false "$image" || die "push failed for ${image}"
@@ -3412,6 +3471,8 @@ EOF
 
     _wait_argo_health "$cname"
 
+    _restart_app_workloads "$cname" "$namespace"
+
     _route_app_service "$cname" "$namespace" "$hostname"
   done <<<"$entries"
 
@@ -3556,6 +3617,53 @@ _wait_argo_health() {
   warn "[${cname}] did not become Healthy in 180s (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
 }
 
+# Roll every Deployment / StatefulSet / DaemonSet that Argo CD owns for
+# this app. Argo tags every managed resource with
+# `app.kubernetes.io/instance=<application-name>` (its default tracking
+# label), so a label selector hits exactly the workloads in this chart
+# and nothing else.
+#
+# Why we do this even when the manifests didn't change: deploys often
+# rebuild the same `:latest` (or env-suffixed) image, so the manifest
+# template is byte-identical and Argo sees no diff — but the container
+# bytes behind that tag have changed and pods need to roll to pick them
+# up. `rollout restart` bumps the pod template's
+# kubectl.kubernetes.io/restartedAt annotation, which forces a new
+# ReplicaSet without touching the Argo-managed spec.
+_restart_app_workloads() {
+  local cname="$1" namespace="$2"
+  local sel="app.kubernetes.io/instance=${cname}"
+  local kinds=(deployment statefulset daemonset)
+  local kind names rolled_any=0
+  for kind in "${kinds[@]}"; do
+    names="$(kc -n "$namespace" get "$kind" -l "$sel" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+    [[ -n "$names" ]] || continue
+    local n
+    while IFS= read -r n; do
+      [[ -n "$n" ]] || continue
+      log "[${cname}] rollout restart ${kind}/${n}"
+      kc -n "$namespace" rollout restart "${kind}/${n}" >/dev/null 2>&1 || \
+        warn "[${cname}] failed to restart ${kind}/${n}"
+      rolled_any=1
+    done <<<"$names"
+  done
+  if (( rolled_any )); then
+    for kind in "${kinds[@]}"; do
+      names="$(kc -n "$namespace" get "$kind" -l "$sel" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+      [[ -n "$names" ]] || continue
+      local n
+      while IFS= read -r n; do
+        [[ -n "$n" ]] || continue
+        kc -n "$namespace" rollout status "${kind}/${n}" --timeout=180s >/dev/null 2>&1 || \
+          warn "[${cname}] ${kind}/${n} did not finish rolling within 180s"
+      done <<<"$names"
+    done
+    ok "[${cname}] workloads restarted"
+  fi
+}
+
 # Wire one Istio VirtualService + /etc/hosts entry for the app's primary
 # Service. Heuristic: prefer a Service whose name matches the chart, fall
 # back to the first Service in the namespace.
@@ -3667,6 +3775,7 @@ env overrides:
   PODMAN_MACHINE_DISK_GIB     disk in GiB for podman machine init (default: 60)
   KIND_NODE_IMAGE             kind node image (default: kindest/node:v1.35.0)
   ARGOCD_CHART_VERSION        pin argo-cd helm chart version
+  RELOADER_CHART_VERSION      pin stakater/reloader helm chart version (default: 2.2.11)
   KARGO_CHART_VERSION         pin kargo helm chart version
   CERT_MANAGER_CHART_VERSION  pin cert-manager chart version
   ISTIO_CHART_VERSION         pin istio version
