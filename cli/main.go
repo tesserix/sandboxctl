@@ -34,7 +34,7 @@ var commands = []command{
 	{"setup-podman", "install/configure rootful podman machine (one-time)"},
 	{"trust-ca", "trust the sandbox root CA in macOS System keychain (sudo)"},
 	{"untrust-ca", "remove the sandbox root CA from System keychain (sudo)"},
-	{"up", "create cluster + install argocd/kargo/demo + gitea + ingress + PKI + agentregistry + arctl CLI (kagent opt-in via --with-kagent or --install all; skip with --no-arctl / --no-agentregistry)"},
+	{"up", "create cluster + install argocd/kargo/demo + gitea + ingress + PKI + arctl CLI (kagent opt-in via --with-kagent or --install all; skip arctl via --no-arctl)"},
 	{"down", "remove cluster + LaunchAgent + /etc/hosts + keychain CA + arctl CLI (keeps ~/.sandbox)"},
 	{"purge", "down + remove ~/.sandbox (prompts for confirmation)"},
 	{"status", "cluster + workload status + URLs"},

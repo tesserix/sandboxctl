@@ -49,22 +49,13 @@ Open `https://<your-chart-name>.sandbox.app:8443` in your browser.
 | `https://argo.sandbox.app:8443` | Argo CD UI |
 | `https://kargo.sandbox.app:8443` | Kargo UI |
 | `https://kagent.sandbox.app:8443` | [kagent](https://github.com/kagent-dev/kagent) — agentic AI controller |
-| `https://agentregistry.sandbox.app:8443` | [agentregistry](https://aregistry.ai) — registry for MCP servers, agents, skills, prompts (+ bundled PostgreSQL) |
 | `https://demo-app.sandbox.app:8443` | a tiny demo deployment |
 | `localhost:5050` | in-cluster Docker registry (push target for `sandboxctl build`) |
 
-[**agentregistry**](https://aregistry.ai) is deployed into the cluster (with a
-bundled PostgreSQL — the chart's dev/eval profile) so you have a registry for
-MCP servers, agents, skills, and prompts out of the box. Skip it with
-`sandboxctl up --no-agentregistry` (or `INSTALL_AGENTREGISTRY=0`). It's a
-non-fatal step — if its images are slow to pull, the rest of the sandbox still
-comes up. Embeddings (`arctl embeddings`) need a pgvector PostgreSQL and are
-not available in the bundled profile. `down`/`purge` remove it with the cluster.
-
-`sandboxctl up` also installs the matching [`arctl`](https://aregistry.ai) CLI
-onto your Mac — for building, publishing, and running those artifacts and for
-talking to the in-cluster registry. Skip it with `sandboxctl up --no-arctl`
-(or `INSTALL_ARCTL=0`); pin a version with `ARCTL_VERSION=v0.3.3`.
+`sandboxctl up` also installs the [`arctl`](https://aregistry.ai)
+(agentregistry) CLI onto your Mac — for building, publishing, and running
+MCP servers, agents, skills, and prompts. Skip it with `sandboxctl up
+--no-arctl` (or `INSTALL_ARCTL=0`); pin a version with `ARCTL_VERSION=v0.3.3`.
 `sandboxctl down` / `purge` remove it again (keep it with `SANDBOX_KEEP_ARCTL=1`).
 
 All TLS is signed by a per-install root CA that `sandboxctl up` trusts in
@@ -311,10 +302,6 @@ Defaults work for most people. Override via env vars:
 | `INSTALL_ARCTL` | `1` | install `arctl` during `up`; set `0` to skip |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
 | `ARCTL_INSTALL_DIR` | `/usr/local/bin` | where the `arctl` binary is installed |
-| `INSTALL_AGENTREGISTRY` | `1` | install the agentregistry server in-cluster during `up`; set `0` to skip |
-| `AGENTREGISTRY_CHART_VERSION` | `0.3.3` | agentregistry Helm chart version |
-| `AGENTREGISTRY_IMAGE_TAG` | `v0.3.3` | agentregistry server image tag |
-| `AGENTREGISTRY_STORAGE` | `2Gi` | bundled PostgreSQL PVC size |
 
 ## Secrets
 
