@@ -264,6 +264,9 @@ The pieces:
   the kind node's containerd via `hosts.toml`
 - **macOS LaunchAgent** — `kubectl port-forward` so the gateway is
   reachable on `127.0.0.1:8443` across reboots
+- **dnsmasq + `/etc/resolver/sandbox.app`** — wildcard `*.sandbox.app →
+  127.0.0.1` so any product chart can add a VirtualService on a new
+  subdomain (e.g. `mcp.fiber.sandbox.app`) without touching `/etc/hosts`
 
 ## Configuration
 

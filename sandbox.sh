@@ -925,6 +925,83 @@ hosts_line_present() {
   done < <(_managed_hosts)
 }
 
+install_dnsmasq() {
+  # Wildcard *.${SANDBOX_DOMAIN} → 127.0.0.1 via macOS's per-domain
+  # resolver. Lets product charts add VirtualServices on any subdomain
+  # (mcp.fiber.sandbox.app, foo.fiber.sandbox.app, …) without touching
+  # /etc/hosts. install_hosts still maintains the named entries as a
+  # fallback in case dnsmasq is uninstalled.
+  if [[ "$(uname -s)" != "Darwin" ]]; then return 0; fi
+  if ! command -v brew >/dev/null 2>&1; then
+    warn "brew unavailable — skipping dnsmasq wildcard DNS"
+    return 0
+  fi
+
+  log "configuring dnsmasq wildcard *.${SANDBOX_DOMAIN} → 127.0.0.1"
+
+  local brew_prefix; brew_prefix="$(brew --prefix)"
+  local dnsmasq_conf="${brew_prefix}/etc/dnsmasq.d/sandbox-${SANDBOX_DOMAIN}.conf"
+  local dnsmasq_dir; dnsmasq_dir="$(dirname "$dnsmasq_conf")"
+  local resolver_file="/etc/resolver/${SANDBOX_DOMAIN}"
+  local desired_addr="address=/.${SANDBOX_DOMAIN}/127.0.0.1"
+
+  if ! brew list --formula dnsmasq >/dev/null 2>&1; then
+    log "installing dnsmasq via brew"
+    brew install dnsmasq >/dev/null
+  fi
+
+  mkdir -p "$dnsmasq_dir"
+  if [[ ! -f "$dnsmasq_conf" ]] || ! grep -qxF "$desired_addr" "$dnsmasq_conf"; then
+    printf '%s\n' "$desired_addr" > "$dnsmasq_conf"
+  fi
+
+  prime_sudo
+  if [[ ! -f "$resolver_file" ]] || ! grep -q "^nameserver 127.0.0.1" "$resolver_file" 2>/dev/null; then
+    sudo mkdir -p /etc/resolver
+    printf 'nameserver 127.0.0.1\nport 53\n' | sudo install -m 0644 /dev/stdin "$resolver_file"
+  fi
+
+  # dnsmasq must run with privileges to bind :53. The standard pattern is
+  # `sudo brew services start dnsmasq`, which loads it under launchd's
+  # system domain. Idempotent — no-op if already loaded.
+  if ! sudo brew services list 2>/dev/null | awk '$1=="dnsmasq" && $2=="started" {found=1} END {exit !found}'; then
+    log "starting dnsmasq under sudo brew services"
+    sudo brew services restart dnsmasq >/dev/null 2>&1 || sudo brew services start dnsmasq >/dev/null 2>&1 || true
+  fi
+
+  # Smoke-test: resolve a guaranteed-fake subdomain and confirm 127.0.0.1.
+  local probe; probe="$(dscacheutil -q host -a name "probe.${SANDBOX_DOMAIN}" 2>/dev/null | awk '/ip_address:/ {print $2; exit}')"
+  if [[ "$probe" == "127.0.0.1" ]]; then
+    ok "wildcard DNS *.${SANDBOX_DOMAIN} → 127.0.0.1"
+  else
+    warn "dnsmasq installed but probe returned '${probe:-<empty>}' — /etc/hosts entries still cover known subdomains"
+  fi
+}
+
+uninstall_dnsmasq() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then return 0; fi
+  command -v brew >/dev/null 2>&1 || return 0
+  local brew_prefix; brew_prefix="$(brew --prefix)"
+  local dnsmasq_conf="${brew_prefix}/etc/dnsmasq.d/sandbox-${SANDBOX_DOMAIN}.conf"
+  local resolver_file="/etc/resolver/${SANDBOX_DOMAIN}"
+
+  if [[ ! -f "$dnsmasq_conf" && ! -f "$resolver_file" ]]; then
+    return 0
+  fi
+
+  log "removing dnsmasq wildcard for ${SANDBOX_DOMAIN}"
+  prime_sudo
+  [[ -f "$dnsmasq_conf"  ]] && rm -f      "$dnsmasq_conf"  2>/dev/null || true
+  [[ -f "$resolver_file" ]] && sudo rm -f "$resolver_file" 2>/dev/null || true
+
+  # Reload dnsmasq so it forgets *.${SANDBOX_DOMAIN}. Leave the brew
+  # service running — other domains may still use it.
+  if sudo brew services list 2>/dev/null | awk '$1=="dnsmasq" && $2=="started" {found=1} END {exit !found}'; then
+    sudo brew services restart dnsmasq >/dev/null 2>&1 || true
+  fi
+  ok "dnsmasq wildcard removed"
+}
+
 install_hosts() {
   log "configuring /etc/hosts entries for ${SANDBOX_DOMAIN}"
   if hosts_line_present; then
@@ -1375,18 +1452,12 @@ clean_legacy_state() {
     kc delete namespace "$LEGACY_GUESTBOOK_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
 
-  # Host-side: stale socat forwarder containers, orphan kubectl port-forward,
-  # leftover dnsmasq config from earlier architectures.
+  # Host-side: stale socat forwarder containers, orphan kubectl port-forward.
   local proto
   for proto in http https; do
     "$SANDBOX_RUNTIME" rm -f "${CLUSTER_NAME}-portfwd-${proto}" >/dev/null 2>&1 || true
   done
   pkill -f "port-forward.*svc/(istio-ingress|traefik)" >/dev/null 2>&1 || true
-  local brew_prefix dnsmasq_conf="" resolver_file="/etc/resolver/${SANDBOX_DOMAIN}"
-  brew_prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
-  dnsmasq_conf="${brew_prefix}/etc/dnsmasq.d/sandbox-${SANDBOX_DOMAIN}.conf"
-  [[ -f "$dnsmasq_conf"  ]] && rm -f      "$dnsmasq_conf"  2>/dev/null || true
-  [[ -f "$resolver_file" ]] && sudo rm -f "$resolver_file" 2>/dev/null || true
 }
 
 # ============================================================================
@@ -1396,6 +1467,10 @@ clean_legacy_state() {
 up_needs_sudo() {
   hosts_line_present || return 0
   ca_already_trusted || return 0
+  # Resolver file under /etc/resolver/ is owned by root and so is
+  # `sudo brew services` (system-domain launchd). If either is missing,
+  # install_dnsmasq will need a sudo prompt.
+  [[ -f "/etc/resolver/${SANDBOX_DOMAIN}" ]] || return 0
   return 1
 }
 
@@ -1471,6 +1546,7 @@ EOF
   install_istio_ambient
   install_routes
   install_hosts
+  install_dnsmasq
   install_portfwd
   trust_root_ca
   write_state_file
@@ -1629,9 +1705,10 @@ cmd_down() {
   fi
 
   uninstall_hosts
+  uninstall_dnsmasq
   untrust_root_ca
 
-  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, root CA trust removed)"
+  ok "sandbox down (cluster, LaunchAgent, /etc/hosts, dnsmasq config, root CA trust removed)"
   echo "Preserved: ${SANDBOX_STATE_DIR} (logs/state) — use 'sandboxctl purge' to also remove it."
   echo "Leaves alone: kindest/node image cache, podman machine."
 }
