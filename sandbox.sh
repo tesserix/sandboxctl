@@ -2057,6 +2057,9 @@ EOF
   install_portfwd
   install_nats_portfwd
   trust_root_ca
+  if declare -F trust_nats_ca >/dev/null; then
+    trust_nats_ca
+  fi
   write_state_file
   validate_urls
 
@@ -2247,6 +2250,9 @@ cmd_down() {
 
   uninstall_hosts
   uninstall_dnsmasq
+  if declare -F untrust_nats_ca >/dev/null; then
+    untrust_nats_ca
+  fi
   untrust_root_ca
   uninstall_arctl
   if declare -F uninstall_nats_cli >/dev/null; then
@@ -2372,6 +2378,9 @@ EOF
     install_nats_portfwd
   fi
   trust_root_ca
+  if declare -F trust_nats_ca >/dev/null; then
+    trust_nats_ca
+  fi
   write_state_file
   validate_urls
 

@@ -99,7 +99,9 @@ EOF
   #   config.jetstream.enabled       - on
   #   config.jetstream.fileStore     - PVC-backed storage
   #   config.websocket.enabled       - on for browser/JS clients
-  #   config.nats.tls / websocket.tls - reuse our cert-manager Secret
+  #   config.nats.tls / websocket.tls - reuse our cert-manager Secret;
+  #   both are forced on so neither the :4222 client port nor the :8080
+  #   websocket port ever speaks plaintext, even within the cluster.
   # `maxSize` matches the PVC so JetStream's `max_file_store` doesn't
   # promise more disk than the PVC actually backs. Without this the
   # chart sets max_file_store to its 10Gi default and JetStream errors
@@ -116,7 +118,8 @@ EOF
       --set "config.nats.tls.enabled=true" \
       --set "config.nats.tls.secretName=${NATS_TLS_SECRET}" \
       --set "config.websocket.enabled=true" \
-      --set "config.websocket.tls.enabled=false" \
+      --set "config.websocket.tls.enabled=true" \
+      --set "config.websocket.tls.secretName=${NATS_TLS_SECRET}" \
       --set "config.monitor.enabled=true" \
       --wait --timeout 5m
 
@@ -127,20 +130,25 @@ EOF
   install_nats_routes
   write_nats_ca_bundle
   install_nats_cli
-  ok "NATS ready (TCP+TLS at nats://${NATS_HOST}:${SANDBOX_NATS_PORT}, WSS at https://${NATS_HOST})"
+  ok "NATS ready (TLS-only — tls://${NATS_HOST}:${SANDBOX_NATS_PORT} + wss://${NATS_HOST}:${SANDBOX_HTTPS_PORT})"
 }
 
 # install_nats_routes — applies a VirtualService for the WebSocket
 # endpoint on the existing :8443 HTTPS listener so https://${NATS_HOST}
-# routes to nats:8080. Istio terminates TLS at the gateway; upstream is
-# plain WebSocket (config.websocket.tls.enabled=false in install_nats).
+# routes to nats:8080. Istio terminates client TLS at the gateway and
+# re-originates TLS upstream via the DestinationRule below
+# (insecureSkipVerify because the cert is signed by our in-cluster
+# sandbox-ca, which Envoy doesn't load by default; sniHost still
+# pins the upstream identity).
 #
 # TCP+TLS at :4222 is currently delivered to the Mac via a direct
 # kubectl port-forward LaunchAgent (install_nats_portfwd) that bypasses
-# the gateway. The TLS-PASSTHROUGH route through Istio is functional
-# in Envoy's listener config but the upstream traversal under ambient
-# mesh deadlocks; getting it working is a follow-up. The direct
-# port-forward gives the same user-facing endpoint without the gap.
+# the gateway. nats-server presents the same nats-server-tls cert there,
+# so the Mac always speaks TLS — `tls://` is the only supported scheme.
+# The TLS-PASSTHROUGH route through Istio is functional in Envoy's
+# listener config but the upstream traversal under ambient mesh
+# deadlocks; getting it working is a follow-up. The direct port-forward
+# gives the same user-facing endpoint without the gap.
 install_nats_routes() {
   kc apply -f - <<EOF >/dev/null
 apiVersion: networking.istio.io/v1
@@ -156,6 +164,19 @@ spec:
         - destination:
             host: ${NATS_RELEASE}.${NATS_NS}.svc.cluster.local
             port: { number: 8080 }
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: nats-ws-tls
+  namespace: ${NATS_NS}
+spec:
+  host: ${NATS_RELEASE}.${NATS_NS}.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      sni: ${NATS_HOST}
+      insecureSkipVerify: true
 EOF
 }
 
@@ -307,7 +328,7 @@ install_nats_cli() {
     if brew install nats-io/nats-tools/nats >/dev/null 2>&1; then
       mkdir -p "$SANDBOX_STATE_DIR"
       echo "brew" > "$NATS_CLI_MARKER"
-      ok "nats CLI installed — try: nats --tlsca <path> --server tls://${NATS_HOST}:${SANDBOX_NATS_PORT} server check connection"
+      ok "nats CLI installed — try: source ${NATS_ENV_FILE}; nats server check connection"
       return 0
     fi
     warn "brew install nats failed — falling back to direct download"
@@ -391,34 +412,101 @@ uninstall_nats_cli() {
 # Mac-side connection hint, called from cmd_up and cmd_creds
 # ============================================================================
 nats_print_creds() {
-  local ca; ca="${SANDBOX_STATE_DIR}/sandbox-ca.crt"
-  echo "NATS:"
-  echo "  TCP+TLS:    nats://${NATS_HOST}:${SANDBOX_NATS_PORT}"
+  echo "NATS (TLS-only — both :4222 client and :8080 websocket reject plaintext):"
+  echo "  TCP+TLS:    tls://${NATS_HOST}:${SANDBOX_NATS_PORT}"
   echo "  WebSocket:  wss://${NATS_HOST}:${SANDBOX_HTTPS_PORT}"
-  if [[ -f "$ca" ]]; then
-    echo "  CA bundle:  ${ca}"
-    echo "  smoke test: nats --tlsca ${ca} --server tls://${NATS_HOST}:${SANDBOX_NATS_PORT} server check connection"
+  if [[ -f "$NATS_CA_FILE" ]]; then
+    echo "  CA bundle:  ${NATS_CA_FILE}  (also mirrored at ${NATS_CA_FILE_LEGACY})"
+    echo "  env file:   source ${NATS_ENV_FILE}   # exports NATS_URL + NATS_CA"
+    echo "  smoke test: nats --tlsca ${NATS_CA_FILE} --server tls://${NATS_HOST}:${SANDBOX_NATS_PORT} server check connection"
+    echo "              (CA is also trusted in the System keychain — '--tlsca' optional)"
   else
-    echo "  CA bundle:  (run 'sandboxctl up' to materialise; the system keychain is also trusted)"
+    echo "  CA bundle:  (run 'sandboxctl up' to materialise)"
   fi
 }
 
-# write_nats_ca_bundle dumps the cluster's nats-server CA into
-# $SANDBOX_STATE_DIR so users have a canonical path to point clients
-# at. Uses the same secret cert-manager issued.
+# Canonical on-disk paths for the CA that signs the nats-server cert.
+# nats-ca.crt is the source-of-truth (named after its origin secret);
+# sandbox-ca.crt is kept as an identical copy because earlier docs and
+# `nats_print_creds` referenced it.
+NATS_CA_FILE="${NATS_CA_FILE:-${SANDBOX_STATE_DIR}/nats-ca.crt}"
+NATS_CA_FILE_LEGACY="${SANDBOX_STATE_DIR}/sandbox-ca.crt"
+NATS_ENV_FILE="${NATS_ENV_FILE:-${SANDBOX_STATE_DIR}/nats.env}"
+
+# write_nats_ca_bundle pulls data.ca\.crt from the nats-server-tls
+# Secret and lands it on disk so clients (the `nats` CLI, openssl
+# s_client, anything that wants to verify tls://${NATS_HOST}:4222) have
+# a canonical path. Also writes a `source`-able env file with NATS_URL
+# / NATS_CA so users don't have to memorise either flag.
 write_nats_ca_bundle() {
-  local ca_path="${SANDBOX_STATE_DIR}/sandbox-ca.crt"
   mkdir -p "$SANDBOX_STATE_DIR"
-  if kc -n "$NATS_NS" get secret "$NATS_TLS_SECRET" >/dev/null 2>&1; then
-    kc -n "$NATS_NS" get secret "$NATS_TLS_SECRET" -o jsonpath='{.data.ca\.crt}' 2>/dev/null \
-      | base64 -d > "${ca_path}.tmp" 2>/dev/null || true
-    if [[ -s "${ca_path}.tmp" ]]; then
-      mv "${ca_path}.tmp" "$ca_path"
-      chmod 644 "$ca_path"
-    else
-      rm -f "${ca_path}.tmp"
-    fi
+  kc -n "$NATS_NS" get secret "$NATS_TLS_SECRET" >/dev/null 2>&1 || return 0
+
+  local tmp="${NATS_CA_FILE}.tmp"
+  kc -n "$NATS_NS" get secret "$NATS_TLS_SECRET" -o jsonpath='{.data.ca\.crt}' 2>/dev/null \
+    | base64 -d > "$tmp" 2>/dev/null || true
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 0
   fi
+  mv "$tmp" "$NATS_CA_FILE"
+  chmod 644 "$NATS_CA_FILE"
+  cp -f "$NATS_CA_FILE" "$NATS_CA_FILE_LEGACY"
+  chmod 644 "$NATS_CA_FILE_LEGACY"
+
+  cat > "$NATS_ENV_FILE" <<EOF
+# Generated by sandboxctl. \`source\` this file to point clients at the
+# sandbox NATS endpoint with TLS verification enabled.
+export NATS_URL="tls://${NATS_HOST}:${SANDBOX_NATS_PORT}"
+export NATS_CA="${NATS_CA_FILE}"
+export NATS_TLSCA="${NATS_CA_FILE}"
+EOF
+  chmod 644 "$NATS_ENV_FILE"
+}
+
+# trust_nats_ca adds the nats-server-tls CA to the macOS System keychain
+# so plain `nats --server tls://${NATS_HOST}:${SANDBOX_NATS_PORT} …` and
+# `openssl s_client -connect …` validate without needing --tlsca. The
+# cert is the sandbox-ca intermediate (same one trust_root_ca chains
+# from), so this is belt-and-braces — but it removes one failure mode
+# where a fresh macOS user's certificate-bundle scan picks up the
+# intermediate before the root chain is fully wired.
+_nats_ca_fp() {
+  [[ -s "$NATS_CA_FILE" ]] || return 1
+  openssl x509 -in "$NATS_CA_FILE" -noout -fingerprint -sha256 2>/dev/null \
+    | cut -d= -f2 | tr -d ':'
+}
+
+nats_ca_already_trusted() {
+  local fp; fp="$(_nats_ca_fp)" || return 1
+  [[ -n "$fp" ]] || return 1
+  security find-certificate -a -Z /Library/Keychains/System.keychain 2>/dev/null \
+    | grep -qi "SHA-256 hash: $fp"
+}
+
+trust_nats_ca() {
+  [[ -s "$NATS_CA_FILE" ]] || { warn "nats-server CA not yet on disk — skipping keychain trust"; return 0; }
+  if nats_ca_already_trusted; then
+    ok "nats-server CA already trusted in System keychain"
+    return 0
+  fi
+  log "trusting nats-server CA in macOS System keychain"
+  prime_sudo
+  with_spinner "trusting nats-server CA in System keychain" \
+    sudo security add-trusted-cert -d -r trustRoot \
+      -k /Library/Keychains/System.keychain "$NATS_CA_FILE"
+  ok "nats-server CA trusted — tls://${NATS_HOST}:${SANDBOX_NATS_PORT} verifies without --tlsca"
+}
+
+untrust_nats_ca() {
+  [[ -s "$NATS_CA_FILE" ]] || return 0
+  local cn
+  cn="$(openssl x509 -in "$NATS_CA_FILE" -noout -subject -nameopt RFC2253 2>/dev/null \
+    | sed -nE 's/.*CN=([^,]+).*/\1/p')"
+  [[ -n "$cn" ]] || return 0
+  log "removing nats-server CA from macOS System keychain (if present)"
+  prime_sudo
+  sudo security delete-certificate -c "$cn" /Library/Keychains/System.keychain 2>/dev/null || true
 }
 
 # ============================================================================
