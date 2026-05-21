@@ -1,5 +1,9 @@
 # sandboxctl
 
+[![ci](https://github.com/tesserix/sandboxctl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tesserix/sandboxctl/actions/workflows/ci.yml)
+[![release](https://github.com/tesserix/sandboxctl/actions/workflows/release.yml/badge.svg)](https://github.com/tesserix/sandboxctl/actions/workflows/release.yml)
+[![latest](https://img.shields.io/github/v/release/zendesk/sandboxctl?label=latest&logo=github)](https://github.com/tesserix/sandboxctl/releases/latest)
+
 A one-command local Kubernetes sandbox for macOS — kind + Argo CD + Kargo +
 Istio + an in-cluster Docker registry + an in-cluster Gitea, all wired up
 behind a single wildcard cert and a stable `*.sandbox.app:8443` URL.
@@ -191,15 +195,47 @@ sandboxctl images gc                      # garbage-collect blobs only
 ## Cluster lifecycle
 
 ```sh
-sandboxctl up                             # bring everything up
+sandboxctl up                             # bring everything up (1 worker, ~5 GB RAM)
+sandboxctl up --workers 2                 # 2 workers, more headroom for concurrent pods
+sandboxctl up --workers 3                 # 3 workers, recommended for 32 GB+ Macs
 sandboxctl status                         # cluster + workload status + URLs
 sandboxctl validate                       # curl each URL and report HTTP codes
 sandboxctl creds                          # admin passwords for Argo CD + Kargo
-sandboxctl restart                        # down + up
+sandboxctl restart                        # re-apply installers, keep cluster + state
+sandboxctl restart --workers 3            # resize the cluster (implies --rebuild)
 sandboxctl down                           # remove cluster + LaunchAgent + /etc/hosts + CA
 sandboxctl purge                          # down + remove ~/.sandboxctl (prompts)
 sandboxctl tui                            # live status dashboard
 ```
+
+### Sizing the cluster
+
+`--workers N` picks how many kind worker nodes you get alongside the
+control-plane. Range is `1`–`3`; anything else fails fast with a clean
+message before any cluster work starts.
+
+| Workers | Best for | Approx. RAM | Concurrent sandbox pods (rough) |
+|---|---|---|---|
+| `1` (default) | Single-task experiments, low memory | ~5 GB | 3–4 |
+| `2` | Day-to-day on a 16 GB Mac | ~8 GB | 6–8 |
+| `3` | 32 GB+ Mac running heavy workloads | ~12 GB | 10–12 |
+
+Why the cap at 3: each kind worker is its own Docker container with its
+own image cache and kubelet. Beyond 3 the Mac itself starts swapping —
+the cluster is happy, the host isn't, and the dev loop gets slower not
+faster. If you really need more, file an issue with your use case.
+
+You can also set the count via env var:
+
+```sh
+SANDBOX_WORKER_COUNT=2 sandboxctl up
+SANDBOX_WORKER_COUNT=3 sandboxctl bootstrap path/to/repo
+```
+
+The flag wins over the env var when both are set. `bootstrap` accepts
+`--workers` and forwards it to `up`. `restart --workers N` rebuilds the
+cluster with the new count (kind doesn't support adding nodes to an
+existing cluster — recreating the kind cluster is the only path).
 
 ## Reclaiming disk
 
@@ -321,6 +357,7 @@ Defaults work for most people. Override via env vars:
 | `PODMAN_MACHINE_CPUS` | `4` | CPUs the podman VM gets at init |
 | `PODMAN_MACHINE_MEMORY_MIB` | `6144` | RAM in MiB |
 | `KIND_NODE_IMAGE` | `kindest/node:v1.35.0` | kind node image |
+| `SANDBOX_WORKER_COUNT` | `1` | kind worker nodes (1–3). Same as `--workers N`. |
 | `ARGOCD_CHART_VERSION` | `9.5.13` | argo-cd chart version |
 | `KARGO_CHART_VERSION` | `1.1.1` | kargo chart version |
 | `REFLECTOR_CHART_VERSION` | `9.1.7` | emberstack/reflector chart version |
