@@ -3617,51 +3617,50 @@ _wait_argo_health() {
   warn "[${cname}] did not become Healthy in 180s (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
 }
 
-# Roll every Deployment / StatefulSet / DaemonSet that Argo CD owns for
-# this app. Argo tags every managed resource with
-# `app.kubernetes.io/instance=<application-name>` (its default tracking
-# label), so a label selector hits exactly the workloads in this chart
-# and nothing else.
-#
-# Why we do this even when the manifests didn't change: deploys often
-# rebuild the same `:latest` (or env-suffixed) image, so the manifest
-# template is byte-identical and Argo sees no diff — but the container
-# bytes behind that tag have changed and pods need to roll to pick them
-# up. `rollout restart` bumps the pod template's
-# kubectl.kubernetes.io/restartedAt annotation, which forces a new
-# ReplicaSet without touching the Argo-managed spec.
+# Roll the workloads Argo owns for this app so pods pick up rebuilt
+# images even when the manifest is byte-identical. Sources workloads
+# from status.resources because our Argo install tracks via annotation,
+# not the legacy app.kubernetes.io/instance label.
 _restart_app_workloads() {
-  local cname="$1" namespace="$2"
-  local sel="app.kubernetes.io/instance=${cname}"
-  local kinds=(deployment statefulset daemonset)
-  local kind names rolled_any=0
-  for kind in "${kinds[@]}"; do
-    names="$(kc -n "$namespace" get "$kind" -l "$sel" \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
-    [[ -n "$names" ]] || continue
-    local n
-    while IFS= read -r n; do
-      [[ -n "$n" ]] || continue
-      log "[${cname}] rollout restart ${kind}/${n}"
-      kc -n "$namespace" rollout restart "${kind}/${n}" >/dev/null 2>&1 || \
-        warn "[${cname}] failed to restart ${kind}/${n}"
-      rolled_any=1
-    done <<<"$names"
-  done
-  if (( rolled_any )); then
-    for kind in "${kinds[@]}"; do
-      names="$(kc -n "$namespace" get "$kind" -l "$sel" \
-        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
-      [[ -n "$names" ]] || continue
-      local n
-      while IFS= read -r n; do
-        [[ -n "$n" ]] || continue
-        kc -n "$namespace" rollout status "${kind}/${n}" --timeout=180s >/dev/null 2>&1 || \
-          warn "[${cname}] ${kind}/${n} did not finish rolling within 180s"
-      done <<<"$names"
-    done
-    ok "[${cname}] workloads restarted"
+  local cname="$1" fallback_ns="$2"
+  local resources
+  resources="$(kc -n "$ARGOCD_NS" get application "$cname" \
+    -o jsonpath='{range .status.resources[?(@.group=="apps")]}{.kind}{"\t"}{.namespace}{"\t"}{.name}{"\n"}{end}' \
+    2>/dev/null || true)"
+  if [[ -z "$resources" ]]; then
+    warn "[${cname}] no workloads found in Argo Application status — skipping rollout restart"
+    return 0
   fi
+
+  local kind ns name lower_kind rolled_any=0
+  while IFS=$'\t' read -r kind ns name; do
+    [[ -n "$kind" && -n "$name" ]] || continue
+    case "$kind" in
+      Deployment|StatefulSet|DaemonSet) ;;
+      *) continue ;;
+    esac
+    [[ -n "$ns" ]] || ns="$fallback_ns"
+    lower_kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')"
+    log "[${cname}] rollout restart ${lower_kind}/${name} (ns ${ns})"
+    kc -n "$ns" rollout restart "${lower_kind}/${name}" >/dev/null 2>&1 || \
+      warn "[${cname}] failed to restart ${lower_kind}/${name} in ${ns}"
+    rolled_any=1
+  done <<<"$resources"
+
+  (( rolled_any )) || return 0
+
+  while IFS=$'\t' read -r kind ns name; do
+    [[ -n "$kind" && -n "$name" ]] || continue
+    case "$kind" in
+      Deployment|StatefulSet|DaemonSet) ;;
+      *) continue ;;
+    esac
+    [[ -n "$ns" ]] || ns="$fallback_ns"
+    lower_kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')"
+    kc -n "$ns" rollout status "${lower_kind}/${name}" --timeout=180s >/dev/null 2>&1 || \
+      warn "[${cname}] ${lower_kind}/${name} in ${ns} did not finish rolling within 180s"
+  done <<<"$resources"
+  ok "[${cname}] workloads restarted"
 }
 
 # Wire one Istio VirtualService + /etc/hosts entry for the app's primary
