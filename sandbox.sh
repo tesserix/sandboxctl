@@ -3710,6 +3710,336 @@ cmd_undeploy() {
 }
 
 # ============================================================================
+# Disk diagnose + prune
+# ============================================================================
+#
+# `sandboxctl prune` (alias: `cleanup`) walks the four storage surfaces that
+# typically obstruct a sandboxctl workflow when something refuses to push or
+# build with "no space left on device":
+#
+#   1. macOS host disk            (read-only diagnosis — never auto-cleaned)
+#   2. mounted DMG installers     (`/Volumes/*` — eject-only)
+#   3. container-runtime VM disk  (podman machine / docker daemon)
+#   4. in-cluster registry blobs  (registry GC + optional full prune)
+#
+# Each surface is explained out loud BEFORE any destructive step, and every
+# destructive step is gated on an explicit y/N prompt (or `--yes` to take
+# the recommended action everywhere). Read-only when invoked with `--dry-run`.
+
+# Bytes -> human (GiB, MiB, KiB). Avoids depending on numfmt (not on stock macOS).
+_prune_human_bytes() {
+  awk -v b="$1" 'BEGIN{
+    split("B KiB MiB GiB TiB", u, " ");
+    i=1; v=b+0;
+    while (v>=1024 && i<5) { v/=1024; i++ }
+    printf "%.1f %s", v, u[i];
+  }'
+}
+
+# y/N prompt that auto-accepts when SANDBOX_PRUNE_ASSUME_YES=1 (set by --yes).
+# Returns 0 on yes, 1 on no. Never reads from stdin if it's not a TTY — that
+# avoids hangs when prune is invoked from a script without --yes.
+_prune_confirm() {
+  local question="$1"
+  if [[ "${SANDBOX_PRUNE_ASSUME_YES:-0}" == "1" ]]; then
+    printf '  \033[2m> %s — auto-yes (--yes)\033[0m\n' "$question" >&2
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    printf '  \033[2m> %s — skipped (no TTY; pass --yes to accept)\033[0m\n' "$question" >&2
+    return 1
+  fi
+  local reply=""
+  read -r -p "  > ${question} [y/N] " reply
+  case "${reply:-N}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# Section banner used to keep the four prune stages visually distinct.
+_prune_section() {
+  printf '\n\033[1;36m━━━ %s ━━━\033[0m\n' "$1" >&2
+}
+
+_prune_explain() {
+  printf '  \033[2m%s\033[0m\n' "$1" >&2
+}
+
+# ----- stage 1: Mac host disk ----------------------------------------------
+#
+# We never touch the user's real disk. The output is a reassurance card so
+# the user can tell whether a generic macOS "disk full" alert is about
+# their actual SSD or about something we *can* clean (DMG, podman VM,
+# in-cluster registry).
+_prune_stage_host_disk() {
+  _prune_section "1/4 macOS host disk (your real SSD)"
+  _prune_explain "What: the volume backing your home directory + apps."
+  _prune_explain "Why we look: macOS shows a single 'disk full' alert that doesn't say *which* disk. We rule the host out first."
+  _prune_explain "Action: read-only — sandboxctl never deletes user files."
+
+  if ! command -v df >/dev/null 2>&1; then
+    warn "df not found — skipping host disk check"
+    return 0
+  fi
+
+  local line size used avail capacity
+  line="$(df -H / 2>/dev/null | awk 'NR==2 {print $2, $3, $4, $5}')"
+  if [[ -z "$line" ]]; then
+    warn "could not read host disk usage"
+    return 0
+  fi
+  read -r size used avail capacity <<<"$line"
+
+  printf '  /  %s used of %s (%s free, %s)\n' "$used" "$size" "$avail" "$capacity" >&2
+
+  # Strip trailing % for arithmetic.
+  local pct="${capacity%\%}"
+  if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 90 )); then
+    warn "host disk is ${capacity} full — sandboxctl can't help with that, but Finder > About This Mac > Storage can."
+  else
+    ok "host disk has plenty of room — any 'disk full' alert is about something else below."
+  fi
+}
+
+# ----- stage 2: mounted DMGs / external volumes ----------------------------
+#
+# Every mounted DMG appears as a 100%-full disk in `df` (it's sized to its
+# contents). They commonly trigger the macOS "disk full" alert when the user
+# leaves an installer mounted. We list them and offer to detach.
+_prune_stage_mounted_dmgs() {
+  _prune_section "2/4 mounted DMG installers (under /Volumes)"
+  _prune_explain "What: each line below is a separate filesystem mounted under /Volumes — usually an unejected installer DMG."
+  _prune_explain "Why they look 'full': DMGs are sized exactly to their contents, so df always reports 100%. That's normal — not a problem to fix."
+  _prune_explain "Action: offered as eject-only (hdiutil detach). Your apps are *not* uninstalled by ejecting."
+
+  if ! command -v df >/dev/null 2>&1; then
+    warn "df not found — skipping DMG check"
+    return 0
+  fi
+
+  # Collect the list of /Volumes/* mounts (excluding the boot volume).
+  local mounts=() mount
+  while IFS= read -r mount; do
+    [[ -n "$mount" ]] || continue
+    mounts+=("$mount")
+  done < <(df 2>/dev/null | awk '$NF ~ "^/Volumes/" {for (i=9; i<=NF; i++) printf "%s%s", $i, (i==NF ? RS : OFS); }' OFS=' ')
+
+  if (( ${#mounts[@]} == 0 )); then
+    ok "nothing extra mounted under /Volumes — skipping."
+    return 0
+  fi
+
+  printf '\n  found %d extra volume(s) mounted:\n' "${#mounts[@]}" >&2
+  local m
+  for m in "${mounts[@]}"; do
+    printf '    • %s\n' "$m" >&2
+  done
+
+  if ! command -v hdiutil >/dev/null 2>&1; then
+    warn "hdiutil not found — cannot eject (manually drag the volume to Trash to eject)"
+    return 0
+  fi
+
+  if ! _prune_confirm "Eject all of the above? (Safe — they're installer DMGs, not your real disk.)"; then
+    _prune_explain "skipped — leaving volumes mounted."
+    return 0
+  fi
+
+  for m in "${mounts[@]}"; do
+    if hdiutil detach "$m" >/dev/null 2>&1; then
+      ok "ejected $m"
+    else
+      warn "could not eject $m — it may be in use by a Finder window or a running installer"
+    fi
+  done
+}
+
+# ----- stage 3: container runtime VM (podman / docker) ---------------------
+#
+# This is the surface most likely to bite — `podman build` and `podman push`
+# both fail with "no space left on device" when the *VM* fills up, even if
+# the Mac disk has 200 GiB free. We diagnose, then offer a graduated cleanup
+# (dangling-only first, then optionally include unused tagged images).
+_prune_stage_runtime_vm() {
+  _prune_section "3/4 container runtime VM (the disk podman/docker actually use)"
+
+  case "$SANDBOX_RUNTIME" in
+    podman)
+      _prune_explain "What: podman runs Linux containers inside a small VM. That VM has its own virtual disk — typically ${PODMAN_MACHINE_DISK_GIB} GiB."
+      _prune_explain "Why it fills: every 'podman build' / 'podman pull' writes layers into the VM, not your Mac SSD. Old build artifacts stack up fast."
+      _prune_explain "Action: 'podman system prune' removes stopped containers + dangling images + build cache. Tagged images you still use are NOT touched."
+
+      if ! command -v podman >/dev/null 2>&1; then
+        warn "podman not installed — skipping runtime check"
+        return 0
+      fi
+
+      local machine_running=0
+      if podman machine inspect --format '{{.State}}' 2>/dev/null | grep -qx running; then
+        machine_running=1
+      fi
+      if (( ! machine_running )); then
+        warn "podman machine not running — start it with 'podman machine start' to run prune"
+        return 0
+      fi
+
+      printf '\n  podman VM disk usage:\n' >&2
+      podman machine ssh -- df -h / 2>/dev/null | sed 's/^/    /' >&2 || warn "could not read VM disk usage"
+
+      printf '\n  podman storage breakdown:\n' >&2
+      podman system df 2>/dev/null | sed 's/^/    /' >&2 || true
+
+      if ! _prune_confirm "Run 'podman system prune -f' (dangling images + stopped containers + build cache)?"; then
+        _prune_explain "skipped — leaving runtime storage untouched."
+        return 0
+      fi
+
+      log "running: podman system prune -f"
+      podman system prune -f 2>&1 | tail -3 | sed 's/^/    /' >&2 || true
+      ok "podman pruned"
+
+      if _prune_confirm "Also prune *unused tagged* images? (Removes images with no running container — re-pulled on next use.)"; then
+        log "running: podman image prune -af"
+        podman image prune -af 2>&1 | tail -3 | sed 's/^/    /' >&2 || true
+        ok "podman tagged-but-unused images removed"
+      fi
+
+      printf '\n  podman VM disk after prune:\n' >&2
+      podman machine ssh -- df -h / 2>/dev/null | sed 's/^/    /' >&2 || true
+      ;;
+
+    docker)
+      _prune_explain "What: Docker Desktop runs containers inside a Linux VM that has its own raw disk image (~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw)."
+      _prune_explain "Why it fills: every 'docker build' / 'docker pull' writes layers into the VM, not your Mac SSD."
+      _prune_explain "Action: 'docker system prune' removes stopped containers + dangling images + build cache. Tagged images you still use are NOT touched."
+
+      if ! command -v docker >/dev/null 2>&1; then
+        warn "docker not installed — skipping runtime check"
+        return 0
+      fi
+      if ! docker info >/dev/null 2>&1; then
+        warn "docker daemon not reachable — start Docker Desktop to run prune"
+        return 0
+      fi
+
+      printf '\n  docker storage breakdown:\n' >&2
+      docker system df 2>/dev/null | sed 's/^/    /' >&2 || true
+
+      if ! _prune_confirm "Run 'docker system prune -f' (dangling images + stopped containers + build cache)?"; then
+        _prune_explain "skipped — leaving runtime storage untouched."
+        return 0
+      fi
+
+      log "running: docker system prune -f"
+      docker system prune -f 2>&1 | tail -3 | sed 's/^/    /' >&2 || true
+      ok "docker pruned"
+
+      if _prune_confirm "Also prune *unused tagged* images?"; then
+        log "running: docker image prune -af"
+        docker image prune -af 2>&1 | tail -3 | sed 's/^/    /' >&2 || true
+        ok "docker tagged-but-unused images removed"
+      fi
+      ;;
+    *)
+      warn "unknown SANDBOX_RUNTIME=$SANDBOX_RUNTIME — skipping runtime check"
+      ;;
+  esac
+}
+
+# ----- stage 4: in-cluster registry blobs ----------------------------------
+#
+# The kind cluster ships a registry:2 Pod backed by a PVC inside the VM.
+# `sandboxctl build` pushes here, and over time GC'd manifests can leave
+# dangling blobs. We always offer the safe option (gc only); a full prune
+# is gated behind a separate confirmation.
+_prune_stage_cluster_registry() {
+  _prune_section "4/4 in-cluster registry (sandboxctl build / images)"
+  _prune_explain "What: a registry:2 Pod inside the kind cluster, backed by a ${SANDBOX_REGISTRY_STORAGE} PVC. 'sandboxctl build' pushes layers here."
+  _prune_explain "Why it fills: deleted/replaced image tags leave their blobs behind until the registry's garbage-collector runs."
+  _prune_explain "Action offered: 'gc' (safe — only reclaims orphaned blobs). 'prune all' is asked separately and removes every image."
+
+  if ! cluster_registered; then
+    _prune_explain "no kind cluster registered — skipping (run 'sandboxctl up' first if you wanted to clean it)."
+    return 0
+  fi
+  if ! cluster_api_reachable; then
+    _prune_explain "kind cluster registered but not reachable — skipping."
+    return 0
+  fi
+
+  if _prune_confirm "Run registry GC (reclaim orphaned blobs only — keeps every tagged image)?"; then
+    cmd_images gc || warn "registry gc failed — see output above"
+  else
+    _prune_explain "skipped registry gc."
+  fi
+
+  if _prune_confirm "Also delete *every* image from the cluster registry? (You'll need to 'sandboxctl build' again to redeploy.)"; then
+    cmd_images prune || warn "registry prune failed — see output above"
+  else
+    _prune_explain "skipped full registry prune — tagged images preserved."
+  fi
+}
+
+cmd_prune() {
+  local assume_yes=0 only=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes)            assume_yes=1; shift ;;
+      --only)              only="${2:-}"; shift 2 ;;
+      host|dmgs|runtime|registry)
+                           only="$1"; shift ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl prune  (alias: cleanup)
+
+Walks the four storage surfaces that typically obstruct sandboxctl
+when builds/pushes start failing with "no space left on device":
+
+  1. macOS host disk            (read-only diagnosis)
+  2. mounted DMG installers     (offers hdiutil detach)
+  3. container runtime VM       (podman/docker system prune)
+  4. in-cluster registry        (registry GC, optional full prune)
+
+Each stage explains what it is, why it fills, and prompts before
+any destructive step.
+
+flags:
+  -y, --yes            accept the recommended action at every prompt
+  --only <stage>       run a single stage: host | dmgs | runtime | registry
+  host|dmgs|runtime|registry
+                       positional shorthand for --only
+
+examples:
+  sandboxctl prune                  # interactive, all four stages
+  sandboxctl prune --yes            # accept every prompt (CI / scripted)
+  sandboxctl prune runtime          # just clean podman/docker
+  sandboxctl prune --only registry  # just GC the in-cluster registry
+EOF
+        return 0 ;;
+      *) die "unknown flag for prune: $1 (try 'sandboxctl prune --help')" ;;
+    esac
+  done
+
+  export SANDBOX_PRUNE_ASSUME_YES="$assume_yes"
+
+  log "sandboxctl prune — diagnosing the four storage surfaces"
+  _prune_explain "Each stage prints what it is and why it fills before asking. Nothing is deleted without your y/N."
+
+  case "$only" in
+    "")        _prune_stage_host_disk
+               _prune_stage_mounted_dmgs
+               _prune_stage_runtime_vm
+               _prune_stage_cluster_registry ;;
+    host)      _prune_stage_host_disk ;;
+    dmgs)      _prune_stage_mounted_dmgs ;;
+    runtime)   _prune_stage_runtime_vm ;;
+    registry)  _prune_stage_cluster_registry ;;
+    *)         die "unknown stage: $only (use host | dmgs | runtime | registry)" ;;
+  esac
+
+  printf '\n' >&2
+  ok "prune complete"
+}
+
+# ============================================================================
 # Optional add-on libs. Sourced after every helper above so the libs can
 # call into log/ok/die, the kc helper, launchagent_stop, etc. without
 # worrying about ordering. Each lib is responsible for its own idempotency.
@@ -3760,6 +4090,10 @@ usage:
                                      remove the Argo Application, route, and hosts entry (namespace preserved)
   sandbox.sh bootstrap [path] [--repo <dir>] [up flags] [deploy flags]
                                      run 'up' (if not already up) + 'deploy' in one shot — handy first-run wrapper
+  sandbox.sh prune [host|dmgs|runtime|registry] [--yes]
+                                     diagnose + clean the four disk surfaces that obstruct sandboxctl
+                                     (host disk, mounted DMGs, container runtime VM, in-cluster registry).
+                                     Always prompts before destructive actions — alias: 'cleanup'.
 
 env overrides:
   SANDBOX_RUNTIME             podman (default) or docker
@@ -3817,6 +4151,7 @@ main() {
     deploy)             shift; cmd_deploy "$@" ;;
     undeploy)           shift; cmd_undeploy "$@" ;;
     bootstrap)          shift; cmd_bootstrap "$@" ;;
+    prune|cleanup)      shift; cmd_prune "$@" ;;
     ""|-h|--help|help)  usage ;;
     *) die "unknown subcommand: $1 (try --help)" ;;
   esac

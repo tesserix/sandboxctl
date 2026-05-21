@@ -201,6 +201,31 @@ sandboxctl purge                          # down + remove ~/.sandboxctl (prompts
 sandboxctl tui                            # live status dashboard
 ```
 
+## Reclaiming disk
+
+Builds and pushes can fail with `no space left on device` even when the Mac
+has hundreds of GiB free, because containers use a separate VM disk and the
+in-cluster registry uses a PVC inside that VM. `sandboxctl prune` walks the
+four surfaces, explains each one, and prompts before doing anything:
+
+```sh
+sandboxctl prune                          # interactive — diagnoses all four
+sandboxctl prune runtime                  # only podman/docker VM
+sandboxctl prune registry                 # only the in-cluster registry
+sandboxctl prune --yes                    # accept every prompt (scripted use)
+```
+
+Stages, in order:
+
+1. **macOS host disk** — read-only diagnosis; never auto-cleaned.
+2. **Mounted DMGs under `/Volumes`** — offers `hdiutil detach`. DMGs always
+   show as 100% full in `df`; that's expected, not a leak.
+3. **Container runtime VM** (podman or docker) — runs `<runtime> system prune`
+   to free dangling images, stopped containers, and build cache. A second
+   prompt offers to also remove unused tagged images.
+4. **In-cluster registry** — runs registry GC (safe, blob-only) and, on a
+   separate prompt, a full prune of every tag.
+
 The first `up` prompts for `sudo` once — it edits `/etc/hosts` and trusts
 the local root CA in the System keychain. Subsequent runs are silent.
 

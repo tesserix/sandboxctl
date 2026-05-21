@@ -48,6 +48,7 @@ var commands = []command{
 	{"deploy", "discover charts in the product repo (--repo <dir> | [path] | cwd) + push to Gitea + create Argo Apps"},
 	{"undeploy", "remove the Argo Application + route created by 'deploy'"},
 	{"bootstrap", "'up' (if needed) + 'deploy' in one command (--repo <dir> | [path] | cwd)"},
+	{"prune", "diagnose + clean disk: host / mounted DMGs / runtime VM / cluster registry (prompts before each step; alias: cleanup)"},
 	{"tui", "live status dashboard (Bubble Tea)"},
 	{"version", "print sandboxctl version, commit, and build date"},
 }
@@ -69,6 +70,10 @@ func known(sub string) bool {
 	// Hidden subcommands consumed by sandbox.sh itself, not listed in usage.
 	switch sub {
 	case "secret", "_parse-build-manifest", "_autogen-manifest":
+		return true
+	}
+	// `cleanup` is a friendlier alias for `prune` — accepted, not advertised.
+	if sub == "cleanup" {
 		return true
 	}
 	return false
