@@ -1141,6 +1141,18 @@ gitea_push_chart() {
 
   local push_url="http://${GITEA_ADMIN_USER}:${admin_pass}@127.0.0.1:13000/${GITEA_ORG}/${repo_name}.git"
 
+  with_spinner "[${repo_name}] pushing chart to gitea" \
+    _gitea_git_push "$src_dir" "$tmp" "$push_url" \
+    || die "git push to gitea failed"
+
+  echo "http://gitea-http.${GITEA_NS}.svc.cluster.local:3000/${GITEA_ORG}/${repo_name}.git"
+}
+
+# Slow inner of gitea_push_chart, factored out so with_spinner can
+# wrap it. Subshelled to keep `cd` from leaking when with_spinner
+# is bypassed (SANDBOXCTL_NO_SPINNER=1 or stderr not a TTY).
+_gitea_git_push() {
+  local src_dir="$1" tmp="$2" push_url="$3"
   (
     set -e
     cp -R "${src_dir}/." "$tmp/"
@@ -1152,9 +1164,7 @@ gitea_push_chart() {
     git commit -q -m "sandboxctl: chart snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)" --allow-empty
     git remote add origin "$push_url"
     git push -q -f origin main
-  ) || die "git push to gitea failed"
-
-  echo "http://gitea-http.${GITEA_NS}.svc.cluster.local:3000/${GITEA_ORG}/${repo_name}.git"
+  )
 }
 
 helm_istio() {
@@ -3612,18 +3622,30 @@ EOF
 
 # Poll Argo CD for an Application to become Synced + Healthy. Times out
 # after 180s with a warning rather than failing — the user can inspect
-# the Argo UI for details and re-run deploy.
+# the Argo UI for details and re-run deploy. Wrapped in with_spinner so
+# the user sees a live elapsed counter instead of a silent 30–180s pause.
 _wait_argo_health() {
   local cname="$1"
-  log "[${cname}] waiting for Argo CD to sync (Healthy)"
+  if with_spinner "[${cname}] waiting for Argo CD to sync (Healthy, up to 180s)" \
+       _wait_argo_health_poll "$cname"; then
+    return 0
+  fi
+  local sync health
+  sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+  health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
+  warn "[${cname}] did not become Healthy in 180s (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
+}
+
+_wait_argo_health_poll() {
+  local cname="$1"
   local i sync health
   for ((i=1; i<=60; i++)); do
     sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
     health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
-    [[ "$sync" == "Synced" && "$health" == "Healthy" ]] && { ok "[${cname}] synced + healthy"; return 0; }
+    [[ "$sync" == "Synced" && "$health" == "Healthy" ]] && return 0
     sleep 3
   done
-  warn "[${cname}] did not become Healthy in 180s (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
+  return 1
 }
 
 # Roll the workloads Argo owns for this app so pods pick up rebuilt
@@ -3666,8 +3688,9 @@ _restart_app_workloads() {
     esac
     [[ -n "$ns" ]] || ns="$fallback_ns"
     lower_kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')"
-    kc -n "$ns" rollout status "${lower_kind}/${name}" --timeout=180s >/dev/null 2>&1 || \
-      warn "[${cname}] ${lower_kind}/${name} in ${ns} did not finish rolling within 180s"
+    with_spinner "[${cname}] waiting for ${lower_kind}/${name} rollout (up to 180s)" \
+      kc -n "$ns" rollout status "${lower_kind}/${name}" --timeout=180s \
+      || warn "[${cname}] ${lower_kind}/${name} in ${ns} did not finish rolling within 180s"
   done <<<"$resources"
   ok "[${cname}] workloads restarted"
 }
