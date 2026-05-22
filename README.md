@@ -1,8 +1,10 @@
-# sandboxctl
+<h1 align="center">sandboxctl</h1>
 
-[![ci](https://github.com/tesserix/sandboxctl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tesserix/sandboxctl/actions/workflows/ci.yml)
-[![release](https://github.com/tesserix/sandboxctl/actions/workflows/release.yml/badge.svg)](https://github.com/tesserix/sandboxctl/actions/workflows/release.yml)
-[![latest](https://img.shields.io/github/v/release/zendesk/sandboxctl?label=latest&logo=github)](https://github.com/tesserix/sandboxctl/releases/latest)
+<p align="center">
+  <a href="https://github.com/tesserix/sandboxctl/actions/workflows/ci.yml"><img src="https://github.com/tesserix/sandboxctl/actions/workflows/ci.yml/badge.svg?branch=main" alt="ci"></a>
+  <a href="https://github.com/tesserix/sandboxctl/actions/workflows/release.yml"><img src="https://github.com/tesserix/sandboxctl/actions/workflows/release.yml/badge.svg" alt="release"></a>
+  <a href="https://github.com/tesserix/sandboxctl/releases/latest"><img src="https://img.shields.io/github/v/release/tesserix/sandboxctl?label=latest&sort=semver&logo=github&color=blue" alt="latest release"></a>
+</p>
 
 A one-command local Kubernetes sandbox for macOS — kind + Argo CD + Kargo +
 Istio + an in-cluster Docker registry + an in-cluster Gitea, all wired up
