@@ -71,14 +71,14 @@ aregistry_present() {
 # ============================================================================
 
 install_cnpg_operator() {
-  if helm status "$CNPG_RELEASE" -n "$CNPG_NS" >/dev/null 2>&1; then
+  if helmk status "$CNPG_RELEASE" -n "$CNPG_NS" >/dev/null 2>&1; then
     ok "cloudnative-pg operator already installed (ns: $CNPG_NS)"
     return 0
   fi
   log "installing cloudnative-pg operator (ns: $CNPG_NS, chart $CNPG_CHART_VERSION)"
   helm repo add cnpg https://cloudnative-pg.github.io/charts >/dev/null 2>&1 || true
   helm repo update cnpg >/dev/null
-  with_spinner "cloudnative-pg helm install (typically 30-60s)" \
+  helm_install "cloudnative-pg helm install (typically 30-60s)" \
     helm upgrade --install "$CNPG_RELEASE" cnpg/cloudnative-pg \
       --namespace "$CNPG_NS" --create-namespace \
       --version "$CNPG_CHART_VERSION" \
@@ -189,11 +189,11 @@ install_aregistry() {
   # for revision-1 failures (i.e. the install never succeeded once) — a
   # later failed upgrade can be re-rolled forward without losing state.
   local helm_status
-  helm_status="$(helm -n "$AREGISTRY_NS" status "$AREGISTRY_RELEASE" -o json 2>/dev/null \
+  helm_status="$(helmk -n "$AREGISTRY_NS" status "$AREGISTRY_RELEASE" -o json 2>/dev/null \
     | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("info",{}).get("status",""), d.get("version",0))' 2>/dev/null || true)"
   if [[ "$helm_status" == "failed 1" ]]; then
     log "previous agentregistry install failed (rev 1) — uninstalling before retry"
-    helm -n "$AREGISTRY_NS" uninstall "$AREGISTRY_RELEASE" >/dev/null 2>&1 || true
+    helmk -n "$AREGISTRY_NS" uninstall "$AREGISTRY_RELEASE" >/dev/null 2>&1 || true
   fi
 
   log "installing agentregistry server (ns: $AREGISTRY_NS, chart $AREGISTRY_CHART_VERSION, image $AREGISTRY_IMAGE_TAG)"
@@ -202,7 +202,7 @@ install_aregistry() {
   # explicit rollout-status check below (5-min budget) instead, mirroring
   # install_kagent. Helm itself returns success once the resources are
   # applied, which is what we want to gate further steps on.
-  if ! with_spinner "agentregistry helm install" \
+  if ! helm_install "agentregistry helm install" \
         helm upgrade --install "$AREGISTRY_RELEASE" "$AREGISTRY_CHART" \
           --namespace "$AREGISTRY_NS" --create-namespace \
           --version "$AREGISTRY_CHART_VERSION" \

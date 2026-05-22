@@ -106,7 +106,7 @@ EOF
   # promise more disk than the PVC actually backs. Without this the
   # chart sets max_file_store to its 10Gi default and JetStream errors
   # out at PVC fill instead of refusing the write.
-  with_spinner "NATS helm install + JetStream PVC bind (typically 1–2 min)" \
+  helm_install "NATS helm install + JetStream PVC bind (typically 1–2 min)" \
     helm upgrade --install "$NATS_RELEASE" nats/nats \
       --namespace "$NATS_NS" \
       --version "$NATS_CHART_VERSION" \

@@ -232,13 +232,26 @@ _spinner_loop() {
 }
 with_spinner() {
   local label="$1"; shift
+  # A caller (helm_install) can pin the capture file via $SPINNER_LOGFILE
+  # so it can inspect helm's output afterwards; it then owns cleanup.
+  local caller_log="${SPINNER_LOGFILE:-}"
   if [[ "$SANDBOXCTL_NO_SPINNER" == "1" || ! -t 2 ]]; then
+    if [[ -n "$caller_log" ]]; then
+      "$@" >"$caller_log" 2>&1
+      local rc=$?
+      cat "$caller_log" >&2
+      return $rc
+    fi
     "$@"
     return $?
   fi
   mkdir -p "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs"
   local logfile
-  logfile="$(mktemp "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs/$(date +%s).XXXXXX.log")"
+  if [[ -n "$caller_log" ]]; then
+    logfile="$caller_log"
+  else
+    logfile="$(mktemp "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs/$(date +%s).XXXXXX.log")"
+  fi
   local start; start=$(date +%s)
   ( "$@" ) >"$logfile" 2>&1 &
   local pid=$!
@@ -254,13 +267,143 @@ with_spinner() {
   local elapsed=$(( $(date +%s) - start ))
   if (( rc == 0 )); then
     printf '\r\033[2K  \033[1;32m✓\033[0m %s \033[2m(%ds)\033[0m\n' "$label" "$elapsed" >&2
-    rm -f "$logfile"
+    [[ -n "$caller_log" ]] || rm -f "$logfile"
   else
     printf '\r\033[2K  \033[1;31m✗\033[0m %s \033[2m(%ds — log: %s)\033[0m\n' "$label" "$elapsed" "$logfile" >&2
-    # Surface the last 20 lines so the user sees the failure inline.
-    tail -20 "$logfile" >&2
+    # Surface the last 20 lines so the user sees the failure inline —
+    # unless the caller (helm_install) set SPINNER_QUIET_FAIL because it
+    # means to recover and retry, and will surface the log itself if the
+    # recovery ultimately fails.
+    [[ "${SPINNER_QUIET_FAIL:-}" == "1" ]] || tail -20 "$logfile" >&2
   fi
   return $rc
+}
+
+# helm_install <spinner-label> helm upgrade --install <release> <chart> [flags...]
+#
+# Drop-in for `with_spinner <label> helm upgrade --install ...` with two
+# behaviours layered on so every chart install survives a re-run and a
+# half-finished previous run:
+#
+#   1. Idempotent fast-path — if the release is already `deployed` at the
+#      requested --version, skip the install and continue. Re-running
+#      `up` on a healthy cluster then costs one `helm list`, not a full
+#      reconcile. A version mismatch (or any non-deployed state) falls
+#      through to `helm upgrade --install`, so version bumps still apply.
+#
+#   2. Ownership self-heal — an interrupted earlier run can leave a
+#      resource behind without Helm's ownership metadata, so the next
+#      install aborts with `<Kind> "<name>" ... exists and cannot be
+#      imported into the current release`. On that specific error this
+#      stamps the Helm ownership annotations/label onto the named orphan
+#      — a non-destructive adoption that never deletes data or PVCs — and
+#      retries. It loops a few times because Helm reports such conflicts
+#      one resource at a time. Any other failure is surfaced unchanged.
+helm_install() {
+  local label="$1"; shift
+  local -a cmd=("$@")
+
+  # Pull the release name (token after --install), namespace (--namespace
+  # / -n) and requested chart version (--version) out of the command so we
+  # can short-circuit and target adoptions.
+  local release="" ns="" want_ver="" i
+  for ((i=0; i<${#cmd[@]}; i++)); do
+    case "${cmd[i]}" in
+      --install)       release="${cmd[i+1]:-}" ;;
+      --namespace|-n)  ns="${cmd[i+1]:-}" ;;
+      --version)       want_ver="${cmd[i+1]:-}" ;;
+    esac
+  done
+
+  if [[ -n "$release" && -n "$ns" ]] && helm_release_satisfied "$release" "$ns" "$want_ver"; then
+    log "${release} already installed — skipping (helm release ${ns}/${release} is deployed${want_ver:+ at ${want_ver}})"
+    return 0
+  fi
+
+  # Pin the install to the kind cluster. Bare `helm` would follow the
+  # user's ambient context onto the wrong cluster (see helmk), so swap a
+  # leading `helm` for the pinned wrapper before running it.
+  local -a run=("${cmd[@]}")
+  [[ "${run[0]}" == "helm" ]] && run=(helmk "${run[@]:1}")
+
+  mkdir -p "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs" 2>/dev/null || true
+  local logfile
+  logfile="$(mktemp "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs/helm.$(date +%s).XXXXXX.log" 2>/dev/null || mktemp)"
+  local attempt rc=0
+  for attempt in 1 2 3 4 5 6; do
+    rc=0
+    SPINNER_LOGFILE="$logfile" SPINNER_QUIET_FAIL=1 with_spinner "$label" "${run[@]}" || rc=$?
+    if (( rc == 0 )); then
+      rm -f "$logfile"
+      return 0
+    fi
+    if [[ -n "$release" && -n "$ns" ]] \
+       && grep -q "cannot be imported into the current release" "$logfile" \
+       && helm_adopt_conflict "$release" "$ns" "$logfile"; then
+      continue
+    fi
+    break
+  done
+
+  # Unrecoverable: surface the tail with_spinner held back, then fail.
+  tail -20 "$logfile" >&2
+  rm -f "$logfile"
+  return "$rc"
+}
+
+# True when <release> in <ns> is already `deployed`, and — when a version
+# is given — at that chart version. Lets helm_install skip a redundant
+# reinstall while still upgrading on a version bump.
+helm_release_satisfied() {
+  local release="$1" ns="$2" want_ver="$3"
+  local list status chart have_ver
+  list="$(helmk list -n "$ns" --filter "^${release}\$" -o json 2>/dev/null || true)"
+  [[ -n "$list" && "$list" != "[]" ]] || return 1
+  status="$(printf '%s' "$list" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  [[ "$status" == "deployed" ]] || return 1
+  [[ -n "$want_ver" ]] || return 0          # deployed, and no pin to match
+  chart="$(printf '%s' "$list" | grep -o '"chart":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  have_ver="${chart##*-}"                    # "<name>-1.16.2" -> "1.16.2"
+  [[ "${have_ver#v}" == "${want_ver#v}" ]]   # ignore a leading v on either side
+}
+
+# helm_adopt_conflict <release> <release-namespace> <helm-logfile>
+# Read the resource Helm refused to import from its error output and stamp
+# Helm's ownership metadata onto it, so a retry adopts it instead of
+# colliding. Returns 0 if it adopted something, 1 if there was nothing to
+# adopt (so the caller stops retrying).
+helm_adopt_conflict() {
+  local release="$1" rel_ns="$2" logfile="$3"
+  local line
+  line="$(grep -m1 'cannot be imported into the current release' "$logfile" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 1
+
+  # Helm v3 phrasings:
+  #   ... : <Kind> "<name>" in namespace "<ns>" exists and cannot be ...   (namespaced)
+  #   ... : <Kind> "<name>" exists and cannot be imported ...              (cluster-scoped)
+  local prefix kind rest name res_ns
+  prefix="${line%%\"*}"                            # text up to the first quote
+  prefix="${prefix%"${prefix##*[![:space:]]}"}"    # right-trim the trailing space before the quote
+  kind="${prefix##* }"                             # its last word = the Kind
+  rest="${line#*\"}"                               # text after the first quote
+  name="${rest%%\"*}"                              # = the resource name
+  if [[ "$line" == *"in namespace \""* ]]; then
+    res_ns="${line#*in namespace \"}"
+    res_ns="${res_ns%%\"*}"
+  else
+    res_ns=""                                      # cluster-scoped
+  fi
+  [[ -n "$kind" && -n "$name" ]] || return 1
+
+  log "adopting orphaned ${kind} \"${name}\"${res_ns:+ (ns: ${res_ns})} into Helm release ${rel_ns}/${release}"
+  local -a nsflag=()
+  [[ -n "$res_ns" ]] && nsflag=(-n "$res_ns")
+  kc ${nsflag[@]+"${nsflag[@]}"} annotate "$kind" "$name" \
+    "meta.helm.sh/release-name=${release}" \
+    "meta.helm.sh/release-namespace=${rel_ns}" --overwrite >/dev/null 2>&1 || return 1
+  kc ${nsflag[@]+"${nsflag[@]}"} label "$kind" "$name" \
+    "app.kubernetes.io/managed-by=Helm" --overwrite >/dev/null 2>&1 || return 1
+  return 0
 }
 
 # User-facing kubeconfig. We force kind's kubeconfig writes here
@@ -275,6 +418,18 @@ kctx() { echo "kind-$CLUSTER_NAME"; }
 # we just wrote into, so sandbox.sh keeps working even if the caller
 # has a custom $KUBECONFIG that doesn't include ~/.kube/config.
 kc()   { KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl --context "$(kctx)" "$@"; }
+
+# Internal helm helper — the helm analogue of kc(). This is not a
+# convenience: bare `helm` reads the caller's ambient $KUBECONFIG and
+# whatever context is selected there, so without pinning it will happily
+# operate on a completely unrelated cluster the user has loaded (a real
+# GKE/EKS cluster, docker-desktop, etc.). Forcing BOTH the kubeconfig file
+# and --kube-context guarantees every release op lands on kind-$CLUSTER_NAME
+# regardless of the user's environment, overriding any context they have
+# set. All cluster-touching helm calls (upgrade/install/list/status/
+# uninstall) MUST go through this; only context-free calls (`helm repo
+# add/update`, which write ~/.config/helm) may use bare helm.
+helmk() { KUBECONFIG="$SANDBOX_USER_KUBECONFIG" helm --kube-context "$(kctx)" "$@"; }
 
 # kind_pinned runs `kind` with KUBECONFIG forced to the canonical
 # user kubeconfig, so create/delete operations always touch the same
@@ -333,9 +488,9 @@ sudo_prompt_banner() {
 
 helm_uninstall_if_present() {
   local release="$1" ns="$2"
-  if helm status "$release" -n "$ns" >/dev/null 2>&1; then
+  if helmk status "$release" -n "$ns" >/dev/null 2>&1; then
     log "uninstalling helm release ${ns}/${release}"
-    helm uninstall "$release" -n "$ns" >/dev/null 2>&1 || true
+    helmk uninstall "$release" -n "$ns" >/dev/null 2>&1 || true
   fi
 }
 
@@ -777,7 +932,10 @@ install_cert_manager() {
   log "installing cert-manager (ns: $CERT_MANAGER_NS, chart $CERT_MANAGER_CHART_VERSION)"
   helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
   helm repo update jetstack >/dev/null
-  with_spinner "cert-manager helm install (typically 1–2 min)" \
+  # helm_install skips when already deployed, and self-heals the ownership
+  # conflict an interrupted earlier run leaves on cert-manager's RBAC
+  # (the classic Role "cert-manager-tokenrequest" ... cannot be imported).
+  helm_install "cert-manager helm install (typically 1–2 min)" \
     helm upgrade --install cert-manager jetstack/cert-manager \
       --namespace "$CERT_MANAGER_NS" --create-namespace \
       --version "$CERT_MANAGER_CHART_VERSION" \
@@ -845,7 +1003,7 @@ install_argocd() {
   helm repo update argo >/dev/null
   # server.insecure=true makes argocd-server speak HTTP on :80 so the gateway
   # can terminate TLS without re-encrypting upstream.
-  with_spinner "Argo CD helm install (typically 2–5 min)" \
+  helm_install "Argo CD helm install (typically 2–5 min)" \
     helm upgrade --install argocd argo/argo-cd \
       --namespace "$ARGOCD_NS" --create-namespace \
       --version "$ARGOCD_CHART_VERSION" \
@@ -861,7 +1019,7 @@ install_reflector() {
   log "installing reflector (ns: $REFLECTOR_NS, chart $REFLECTOR_CHART_VERSION)"
   helm repo add emberstack https://emberstack.github.io/helm-charts >/dev/null 2>&1 || true
   helm repo update emberstack >/dev/null
-  with_spinner "reflector helm install (typically 30–60s)" \
+  helm_install "reflector helm install (typically 30–60s)" \
     helm upgrade --install reflector emberstack/reflector \
       --namespace "$REFLECTOR_NS" --create-namespace \
       --version "$REFLECTOR_CHART_VERSION" \
@@ -880,7 +1038,7 @@ install_reloader() {
   log "installing stakater/Reloader (ns: $RELOADER_NS, chart $RELOADER_CHART_VERSION)"
   helm repo add stakater https://stakater.github.io/stakater-charts >/dev/null 2>&1 || true
   helm repo update stakater >/dev/null
-  with_spinner "Reloader helm install (typically 30–60s)" \
+  helm_install "Reloader helm install (typically 30–60s)" \
     helm upgrade --install reloader stakater/reloader \
       --namespace "$RELOADER_NS" --create-namespace \
       --version "$RELOADER_CHART_VERSION" \
@@ -890,7 +1048,7 @@ install_reloader() {
 
 install_kargo() {
   log "installing Kargo (ns: $KARGO_NS, chart $KARGO_CHART_VERSION)"
-  with_spinner "Kargo helm install (typically 2–4 min)" \
+  helm_install "Kargo helm install (typically 2–4 min)" \
     helm upgrade --install kargo oci://ghcr.io/akuity/kargo-charts/kargo \
       --namespace "$KARGO_NS" --create-namespace \
       --version "$KARGO_CHART_VERSION" \
@@ -1035,13 +1193,13 @@ install_kagent() {
   log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — provider: Ollama at ${KAGENT_OLLAMA_HOST}"
 
   # CRDs ship as a separate chart, must land first.
-  with_spinner "kagent CRDs helm install (typically 30s)" \
+  helm_install "kagent CRDs helm install (typically 30s)" \
     helm upgrade --install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
       --namespace "$KAGENT_NS" --create-namespace \
       --version "$KAGENT_CHART_VERSION" \
       --wait --timeout 5m
 
-  with_spinner "kagent helm install (typically 3–5 min)" \
+  helm_install "kagent helm install (typically 3–5 min)" \
     helm upgrade --install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
       --namespace "$KAGENT_NS" \
       --version "$KAGENT_CHART_VERSION" \
@@ -1103,7 +1261,7 @@ install_gitea() {
   # by default in the gitea helm chart and are overkill for a one-user
   # sandbox).
   log "running helm upgrade --install gitea"
-  if ! with_spinner "Gitea helm install (typically 2–4 min)" \
+  if ! helm_install "Gitea helm install (typically 2–4 min)" \
         helm upgrade --install gitea gitea-charts/gitea \
           --namespace "$GITEA_NS" --create-namespace \
           --version "$GITEA_CHART_VERSION" \
@@ -1237,7 +1395,7 @@ _gitea_git_push() {
 helm_istio() {
   # $1 release, $2 chart, rest passed verbatim to helm.
   local release="$1" chart="$2"; shift 2
-  with_spinner "${release} helm install (typically 30–90s)" \
+  helm_install "${release} helm install (typically 30–90s)" \
     helm upgrade --install "$release" "istio/$chart" \
       --namespace "$ISTIO_SYSTEM_NS" --create-namespace \
       --version "$ISTIO_CHART_VERSION" \
@@ -1259,7 +1417,7 @@ install_istio_ambient() {
   # port-forward. Ports are 8080/8443 (not 80/443) so Envoy can bind without
   # the unprivileged-port-start sysctl tweak. Gateway selector in
   # manifests/ingress.yaml is `istio: ingress` (the Helm chart's pod label).
-  with_spinner "istio-ingress gateway helm install (typically 1–2 min)" \
+  helm_install "istio-ingress gateway helm install (typically 1–2 min)" \
     helm upgrade --install istio-ingress istio/gateway \
       --namespace "$ISTIO_INGRESS_NS" --create-namespace \
       --version "$ISTIO_CHART_VERSION" \
