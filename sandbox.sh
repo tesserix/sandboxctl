@@ -84,6 +84,21 @@ INSTALL_ARCTL="${INSTALL_ARCTL:-1}"
 #   INSTALL_AGENTREGISTRY=0   skip agentregistry + CNPG entirely
 INSTALL_AGENTREGISTRY="${INSTALL_AGENTREGISTRY:-1}"
 
+# AI Agentic Gateway — four independent LLM/API-gateway + observability
+# options, installed into the cluster by `up`/`bootstrap` so users can try
+# each one and pick what fits. All default-on. The individual gates live
+# in their libs (lib/{litellm,portkey,mlflow,tyk}.sh) and default to 1;
+# they're read at install time, so the flag parser below (or an env var)
+# can flip any of them off. The group flag --no-ai-gateway flips all four.
+#   INSTALL_LITELLM=0   skip LiteLLM proxy           (--no-litellm)
+#   INSTALL_PORTKEY=0   skip Portkey AI gateway      (--no-portkey)
+#   INSTALL_MLFLOW=0    skip MLflow tracking + UI     (--no-mlflow)
+#   INSTALL_TYK=0       skip Tyk OSS API gateway      (--no-tyk)
+INSTALL_LITELLM="${INSTALL_LITELLM:-1}"
+INSTALL_PORTKEY="${INSTALL_PORTKEY:-1}"
+INSTALL_MLFLOW="${INSTALL_MLFLOW:-1}"
+INSTALL_TYK="${INSTALL_TYK:-1}"
+
 # Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
 # pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
 # CD pulls from that URL — proper GitOps loop without needing external
@@ -1519,6 +1534,14 @@ EOF
   if declare -F install_aregistry_routes >/dev/null; then
     install_aregistry_routes
   fi
+
+  # AI Agentic Gateway routes — owned by each lib (service name + port live
+  # there). Same gating rationale as kagent/aregistry: each is a no-op when
+  # its namespace doesn't exist, so --no-* runs leave no dangling 503 route.
+  if declare -F install_litellm_routes >/dev/null; then install_litellm_routes; fi
+  if declare -F install_portkey_routes >/dev/null; then install_portkey_routes; fi
+  if declare -F install_mlflow_routes  >/dev/null; then install_mlflow_routes;  fi
+  if declare -F install_tyk_routes     >/dev/null; then install_tyk_routes;     fi
   ok "routes applied"
 }
 
@@ -1537,6 +1560,12 @@ _managed_hosts() {
   if declare -F aregistry_present >/dev/null && aregistry_present; then
     out+=("$AREGISTRY_HOST")
   fi
+  # AI Agentic Gateway hosts — only when their namespace is live, so a
+  # --no-* run doesn't leak the hostname into /etc/hosts.
+  if declare -F litellm_present >/dev/null && litellm_present; then out+=("$LITELLM_HOST"); fi
+  if declare -F portkey_present >/dev/null && portkey_present; then out+=("$PORTKEY_HOST"); fi
+  if declare -F mlflow_present  >/dev/null && mlflow_present;  then out+=("$MLFLOW_HOST");  fi
+  if declare -F tyk_present     >/dev/null && tyk_present;     then out+=("$TYK_HOST");     fi
   printf '%s\n' "${out[@]}"
 }
 
@@ -2089,6 +2118,18 @@ EOF
 # Validation
 # ============================================================================
 
+# True if $1 is a live AI Agentic Gateway host. Used by validate_urls to
+# accept a 4xx (route-works, upstream-answered) as a pass for the gateways
+# that serve 404 at "/".
+_is_ai_gateway_host() {
+  local h="$1"
+  [[ -n "${LITELLM_HOST:-}" && "$h" == "$LITELLM_HOST" ]] && return 0
+  [[ -n "${PORTKEY_HOST:-}" && "$h" == "$PORTKEY_HOST" ]] && return 0
+  [[ -n "${MLFLOW_HOST:-}"  && "$h" == "$MLFLOW_HOST"  ]] && return 0
+  [[ -n "${TYK_HOST:-}"     && "$h" == "$TYK_HOST"     ]] && return 0
+  return 1
+}
+
 validate_urls() {
   log "validating URLs reachable from the Mac"
   local failed=0 host url code
@@ -2106,6 +2147,10 @@ validate_urls() {
     if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]; then
       ok_code=1
     elif [[ -n "${NATS_HOST:-}" && "$host" == "$NATS_HOST" && "$code" == "400" ]]; then
+      ok_code=1
+    elif _is_ai_gateway_host "$host" && [[ "$code" =~ ^4[0-9][0-9]$ ]]; then
+      # Tyk/Portkey answer 404 at "/" with no API mounted — that 4xx still
+      # proves the route + upstream are alive (a dead route would be 503/000).
       ok_code=1
     fi
     if (( ok_code )); then
@@ -2210,6 +2255,11 @@ cmd_up() {
       --no-arctl)       INSTALL_ARCTL=0; shift ;;
       --no-nats-cli)    INSTALL_NATS_CLI=0; shift ;;
       --no-agentregistry) INSTALL_AGENTREGISTRY=0; shift ;;
+      --no-litellm)     INSTALL_LITELLM=0; shift ;;
+      --no-portkey)     INSTALL_PORTKEY=0; shift ;;
+      --no-mlflow)      INSTALL_MLFLOW=0; shift ;;
+      --no-tyk)         INSTALL_TYK=0; shift ;;
+      --no-ai-gateway)  INSTALL_LITELLM=0; INSTALL_PORTKEY=0; INSTALL_MLFLOW=0; INSTALL_TYK=0; shift ;;
       --workers)
         SANDBOX_WORKER_COUNT="${2:-}"
         validate_worker_count "$SANDBOX_WORKER_COUNT" "sandboxctl up"
@@ -2223,6 +2273,7 @@ cmd_up() {
         cat <<EOF
 sandboxctl up [--workers N] [--with-kagent] [--install all]
               [--no-arctl] [--no-nats-cli] [--no-agentregistry]
+              [--no-ai-gateway | --no-litellm | --no-portkey | --no-mlflow | --no-tyk]
 
 Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
 Kargo + Istio + in-cluster registry + Gitea + NATS (JetStream) + a demo
@@ -2245,6 +2296,17 @@ In the cluster (default-on):
                    https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
                    Skip with --no-agentregistry (or INSTALL_AGENTREGISTRY=0).
 
+AI Agentic Gateway (default-on — four options to test side by side):
+  litellm          OpenAI-compatible LLM proxy (UI at /ui), bundled Postgres.
+                   https://litellm.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-litellm)
+  portkey          Portkey OSS AI gateway + console UI (/public/).
+                   https://portkey.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-portkey)
+  mlflow           MLflow experiment tracking + model registry UI.
+                   https://mlflow.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}    (--no-mlflow)
+  tyk              Tyk OSS API gateway (+ bundled Redis).
+                   https://tyk.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}       (--no-tyk)
+  --no-ai-gateway  Skip all four (lighter, faster 'up').
+
 Also installs onto the Mac (not the cluster):
   arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
                    run MCP servers, agents, skills + prompts. Skip with
@@ -2266,6 +2328,8 @@ EOF
   # INSTALL_NATS_CLI is consumed by lib/nats.sh (shellcheck can't see
   # the cross-file reference, hence the explicit export).
   export INSTALL_NATS_CLI
+  # AI Agentic Gateway gates are consumed by lib/{litellm,portkey,mlflow,tyk}.sh.
+  export INSTALL_LITELLM INSTALL_PORTKEY INSTALL_MLFLOW INSTALL_TYK
 
   require_tools
   ensure_tooling
@@ -2304,6 +2368,13 @@ EOF
   if declare -F install_aregistry >/dev/null; then
     install_aregistry
   fi
+  # AI Agentic Gateway: each installer self-gates on its INSTALL_* flag and
+  # is non-fatal, so a slow/broken add-on never aborts `up`. Installed
+  # before install_routes so the present-gated VirtualServices are created.
+  if declare -F install_litellm >/dev/null; then install_litellm; fi
+  if declare -F install_portkey >/dev/null; then install_portkey; fi
+  if declare -F install_mlflow  >/dev/null; then install_mlflow;  fi
+  if declare -F install_tyk     >/dev/null; then install_tyk;     fi
   install_gitea
   install_istio_ambient
   install_routes
@@ -2334,6 +2405,10 @@ EOF
   if declare -F aregistry_present >/dev/null && aregistry_present; then
     printf '  open https://%s:%s\n' "$AREGISTRY_HOST" "$SANDBOX_HTTPS_PORT"
   fi
+  if declare -F litellm_present >/dev/null && litellm_present; then printf '  open https://%s:%s/ui      # LiteLLM admin UI\n' "$LITELLM_HOST" "$SANDBOX_HTTPS_PORT"; fi
+  if declare -F portkey_present >/dev/null && portkey_present; then printf '  open https://%s:%s/public/  # Portkey gateway console\n' "$PORTKEY_HOST" "$SANDBOX_HTTPS_PORT"; fi
+  if declare -F mlflow_present  >/dev/null && mlflow_present;  then printf '  open https://%s:%s          # MLflow UI\n' "$MLFLOW_HOST" "$SANDBOX_HTTPS_PORT"; fi
+  if declare -F tyk_present     >/dev/null && tyk_present;     then printf '  open https://%s:%s/hello    # Tyk gateway health\n' "$TYK_HOST" "$SANDBOX_HTTPS_PORT"; fi
   echo "  sandboxctl creds   # full login details"
   celebrate "sandbox is up"
 }
@@ -2360,7 +2435,8 @@ cmd_bootstrap() {
     case "$1" in
       --repo)
         repo_flag="${2:-}"; shift 2 ;;
-      --with-kagent|--no-arctl|--no-agentregistry|--install)
+      --with-kagent|--no-arctl|--no-agentregistry|--install|\
+      --no-ai-gateway|--no-litellm|--no-portkey|--no-mlflow|--no-tyk)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
           up_args+=("$1" "${2:-}"); shift 2
@@ -2395,6 +2471,7 @@ product repo is selected by:
   sandboxctl bootstrap --with-kagent         # forwarded to 'up'
   sandboxctl bootstrap --no-arctl            # forwarded to 'up'
   sandboxctl bootstrap --no-agentregistry    # forwarded to 'up'
+  sandboxctl bootstrap --no-ai-gateway       # forwarded to 'up' (skip litellm/portkey/mlflow/tyk)
   sandboxctl bootstrap --chart custom/chart  # forwarded to 'deploy'
   sandboxctl bootstrap --no-build            # forwarded to 'deploy'
 
@@ -2640,6 +2717,11 @@ EOF
   if declare -F install_aregistry >/dev/null; then
     install_aregistry
   fi
+  # AI Agentic Gateway — re-assert each (idempotent helm/kubectl; self-gated).
+  if declare -F install_litellm >/dev/null; then install_litellm; fi
+  if declare -F install_portkey >/dev/null; then install_portkey; fi
+  if declare -F install_mlflow  >/dev/null; then install_mlflow;  fi
+  if declare -F install_tyk     >/dev/null; then install_tyk;     fi
   install_gitea
   install_istio_ambient
   install_routes
@@ -2713,6 +2795,10 @@ cmd_status() {
   if declare -F aregistry_present >/dev/null && aregistry_present; then
     workload_summary "$AREGISTRY_NS"   "aregistry"
   fi
+  if declare -F litellm_present >/dev/null && litellm_present; then workload_summary "$LITELLM_NS" "litellm"; fi
+  if declare -F portkey_present >/dev/null && portkey_present; then workload_summary "$PORTKEY_NS" "portkey"; fi
+  if declare -F mlflow_present  >/dev/null && mlflow_present;  then workload_summary "$MLFLOW_NS"  "mlflow";  fi
+  if declare -F tyk_present     >/dev/null && tyk_present;     then workload_summary "$TYK_NS"     "tyk";     fi
   if declare -F nats_status >/dev/null; then
     echo
     nats_status | sed 's/^/  /'
@@ -2720,6 +2806,10 @@ cmd_status() {
   if declare -F aregistry_status >/dev/null; then
     aregistry_status | sed 's/^/  /'
   fi
+  if declare -F litellm_status >/dev/null; then litellm_status | sed 's/^/  /'; fi
+  if declare -F portkey_status >/dev/null; then portkey_status | sed 's/^/  /'; fi
+  if declare -F mlflow_status  >/dev/null; then mlflow_status  | sed 's/^/  /'; fi
+  if declare -F tyk_status     >/dev/null; then tyk_status     | sed 's/^/  /'; fi
   echo
   echo "apps & URLs:"
   printf '  %-12s https://%s:%s\n' "argocd"   "$ARGO_HOST"   "$SANDBOX_HTTPS_PORT"
@@ -2735,6 +2825,10 @@ cmd_status() {
   if declare -F aregistry_present >/dev/null && aregistry_present; then
     printf '  %-12s https://%s:%s\n' "aregistry" "$AREGISTRY_HOST" "$SANDBOX_HTTPS_PORT"
   fi
+  if declare -F litellm_present >/dev/null && litellm_present; then printf '  %-12s https://%s:%s\n' "litellm" "$LITELLM_HOST" "$SANDBOX_HTTPS_PORT"; fi
+  if declare -F portkey_present >/dev/null && portkey_present; then printf '  %-12s https://%s:%s/public/\n' "portkey" "$PORTKEY_HOST" "$SANDBOX_HTTPS_PORT"; fi
+  if declare -F mlflow_present  >/dev/null && mlflow_present;  then printf '  %-12s https://%s:%s\n' "mlflow" "$MLFLOW_HOST" "$SANDBOX_HTTPS_PORT"; fi
+  if declare -F tyk_present     >/dev/null && tyk_present;     then printf '  %-12s https://%s:%s\n' "tyk" "$TYK_HOST" "$SANDBOX_HTTPS_PORT"; fi
   printf '  %-12s localhost:%s    (push: docker push localhost:%s/<image>:<tag>)\n' "registry" "$SANDBOX_REGISTRY_PORT" "$SANDBOX_REGISTRY_PORT"
 }
 
@@ -2792,6 +2886,10 @@ EOF
     echo
     aregistry_print_creds
   fi
+  if declare -F litellm_print_creds >/dev/null && litellm_present; then echo; litellm_print_creds; fi
+  if declare -F portkey_print_creds >/dev/null && portkey_present; then echo; portkey_print_creds; fi
+  if declare -F mlflow_print_creds  >/dev/null && mlflow_present;  then echo; mlflow_print_creds;  fi
+  if declare -F tyk_print_creds     >/dev/null && tyk_present;     then echo; tyk_print_creds;     fi
   printf '\nkubectl context: %s\n' "$(kctx)"
 }
 
@@ -4417,6 +4515,19 @@ EOF
 # shellcheck source=lib/aregistry.sh
 [[ -f "${SANDBOX_LIB_DIR}/aregistry.sh" ]] && . "${SANDBOX_LIB_DIR}/aregistry.sh"
 
+# AI Agentic Gateway — four independent LLM/API-gateway + observability
+# options users can test side by side (all default-on; opt out per-tool or
+# with `up --no-ai-gateway`). Each lib is fully self-contained, matching
+# the nats.sh / aregistry.sh pattern above.
+# shellcheck source=lib/litellm.sh
+[[ -f "${SANDBOX_LIB_DIR}/litellm.sh" ]] && . "${SANDBOX_LIB_DIR}/litellm.sh"
+# shellcheck source=lib/portkey.sh
+[[ -f "${SANDBOX_LIB_DIR}/portkey.sh" ]] && . "${SANDBOX_LIB_DIR}/portkey.sh"
+# shellcheck source=lib/mlflow.sh
+[[ -f "${SANDBOX_LIB_DIR}/mlflow.sh" ]] && . "${SANDBOX_LIB_DIR}/mlflow.sh"
+# shellcheck source=lib/tyk.sh
+[[ -f "${SANDBOX_LIB_DIR}/tyk.sh" ]] && . "${SANDBOX_LIB_DIR}/tyk.sh"
+
 # ============================================================================
 # Usage + dispatcher
 # ============================================================================
@@ -4429,9 +4540,10 @@ usage:
   sandbox.sh setup-podman   install/configure rootful podman machine (one-time)
   sandbox.sh trust-ca       trust the sandbox root CA in macOS System keychain (sudo)
   sandbox.sh untrust-ca     remove the sandbox root CA from System keychain (sudo)
-  sandbox.sh up [--workers N] [--with-kagent | --install all] [--no-agentregistry]
+  sandbox.sh up [--workers N] [--with-kagent | --install all] [--no-agentregistry] [--no-ai-gateway]
                             create cluster + install argocd/kargo/demo/registry/gitea/nats/agentregistry+CNPG + ingress + PKI + hosts + portfwd
                             (NATS + agentregistry default-on; kagent is opt-in: --with-kagent or --install all)
+                            AI Agentic Gateway (litellm/portkey/mlflow/tyk) is default-on; skip with --no-ai-gateway or per-tool --no-litellm/--no-portkey/--no-mlflow/--no-tyk
                             --workers N picks the kind worker count (1–3, default 1)
   sandbox.sh down           remove cluster + LaunchAgent + /etc/hosts + keychain CA (keeps ~/.sandbox)
   sandbox.sh purge          down + remove ~/.sandbox (prompts for confirmation)
@@ -4498,6 +4610,14 @@ env overrides:
   AREGISTRY_PG_IMAGE          CNPG postgres image with pgvector (default: ghcr.io/cloudnative-pg/postgresql:17.9-standard-trixie)
   AREGISTRY_PG_STORAGE        PVC size for the CNPG cluster (default: 2Gi)
   CNPG_CHART_VERSION          pin cloudnative-pg operator chart version (default: 0.28.2)
+  INSTALL_LITELLM             set to 0 (or pass --no-litellm) to skip the LiteLLM proxy
+  INSTALL_PORTKEY             set to 0 (or pass --no-portkey) to skip the Portkey AI gateway
+  INSTALL_MLFLOW              set to 0 (or pass --no-mlflow) to skip MLflow
+  INSTALL_TYK                 set to 0 (or pass --no-tyk) to skip the Tyk OSS gateway
+  LITELLM_CHART_VERSION       pin litellm-helm OCI chart version (default: latest)
+  MLFLOW_CHART_VERSION        pin community-charts/mlflow chart version (default: latest)
+  TYK_CHART_VERSION           pin tyk-helm/tyk-oss chart version (default: latest)
+  PORTKEY_IMAGE               Portkey gateway image (default: portkeyai/gateway:latest)
 EOF
 }
 

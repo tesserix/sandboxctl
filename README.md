@@ -65,6 +65,10 @@ Open `https://<your-chart-name>.sandbox.app:8443` in your browser.
 | `https://kargo.sandbox.app:8443` | Kargo UI |
 | `https://kagent.sandbox.app:8443` | [kagent](https://github.com/kagent-dev/kagent) — agentic AI controller |
 | `https://demo-app.sandbox.app:8443` | a tiny demo deployment |
+| `https://litellm.sandbox.app:8443` | [LiteLLM](https://github.com/BerriAI/litellm) — OpenAI-compatible LLM proxy (admin UI at `/ui`) |
+| `https://portkey.sandbox.app:8443` | [Portkey AI Gateway](https://github.com/portkey-ai/gateway) — OSS LLM gateway + console (`/public/`) |
+| `https://mlflow.sandbox.app:8443` | [MLflow](https://github.com/mlflow/mlflow) — experiment tracking + model registry UI |
+| `https://tyk.sandbox.app:8443` | [Tyk OSS](https://tyk.io) — open-source API gateway (`/hello` health) |
 | `nats://nats.sandbox.app:4222` | NATS + JetStream (TCP+TLS); also `wss://nats.sandbox.app:8443` |
 | `localhost:5050` | in-cluster Docker registry (push target for `sandboxctl build`) |
 
@@ -79,6 +83,37 @@ your macOS System keychain — no browser warnings, no manual port-forwards.
 
 `sandboxctl creds` prints admin passwords on demand. Each install
 generates its own — nothing is hard-coded.
+
+### AI Agentic Gateway
+
+`sandboxctl up` / `bootstrap` also stand up four independent AI-gateway &
+observability options **in the cluster, default-on**, so you can test each
+behind its own trusted HTTPS URL and pick what fits — and present the same
+menu of choices to your own users/customers. Each is a self-contained lib
+(`lib/litellm.sh`, `lib/portkey.sh`, `lib/mlflow.sh`, `lib/tyk.sh`) wired
+into `up`, `restart`, `status`, and `creds` exactly like NATS/agentregistry.
+
+| Option | URL | What it gives you |
+|---|---|---|
+| **LiteLLM** | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, bundled Postgres |
+| **Portkey** | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs |
+| **MLflow** | `https://mlflow.sandbox.app:8443` | Experiment tracking, model registry, observability UI |
+| **Tyk OSS** | `https://tyk.sandbox.app:8443` (`/hello`) | Open-source API gateway — rate-limit/auth/quotas in front of any upstream |
+
+```sh
+sandboxctl up                 # all four, default-on
+sandboxctl up --no-ai-gateway # skip all four (lighter, faster up)
+sandboxctl up --no-tyk        # skip just one (also --no-litellm/--no-portkey/--no-mlflow)
+sandboxctl creds              # master keys, API secrets, and try-it curl commands for each
+```
+
+Each tool's master key / API secret is generated per-install and persisted
+under `~/.sandboxctl/` (printed by `sandboxctl creds`). Tyk's bundled Redis
+and LiteLLM's bundled Postgres are sandbox-grade (single replica, no PVC /
+ephemeral); pin chart versions or point at durable backends via the env
+overrides in `sandboxctl up --help`. Note the graphical **Tyk Dashboard**
+is a licensed component and is *not* part of Tyk OSS — the gateway here is
+driven by its control API + API-definition files.
 
 ## Deploying your own app
 
@@ -322,6 +357,10 @@ endpoint or model.
    │       ├── demo-app        (demo-app ns)       │
    │       ├── gitea           (gitea ns)          │
    │       ├── nats + JetStream (nats ns)          │
+   │       ├── litellm         (litellm ns)        │ ┐
+   │       ├── portkey-gateway (portkey ns)        │ │ AI Agentic
+   │       ├── mlflow          (mlflow ns)         │ │ Gateway
+   │       ├── tyk + redis     (tyk ns)            │ ┘ (default-on)
    │       ├── registry:30050  (sandboxctl-registry ns)
    │       └── your apps       (one ns each)       │
    │                                                │
@@ -345,6 +384,10 @@ The pieces:
   (TCP+TLS, served via an Istio TLS-passthrough listener and a second
   LaunchAgent port-forward) and `wss://nats.sandbox.app:8443` for browser/JS
   clients. Cert is signed by the same per-install CA as everything else.
+- **AI Agentic Gateway** — LiteLLM, Portkey, MLflow, and Tyk OSS, each in
+  its own namespace with an Istio route + trusted HTTPS URL (default-on;
+  see the section above). LiteLLM ships a bundled Postgres; Tyk ships a
+  bundled single-replica Redis.
 - **In-cluster registry** — `localhost:5050` push target, mirrored into
   the kind node's containerd via `hosts.toml`
 - **macOS LaunchAgent** — `kubectl port-forward` so the gateway is
@@ -382,6 +425,14 @@ Defaults work for most people. Override via env vars:
 | `INSTALL_ARCTL` | `1` | install `arctl` during `up`; set `0` to skip |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
 | `ARCTL_INSTALL_DIR` | `/usr/local/bin` | where the `arctl` binary is installed |
+| `INSTALL_LITELLM` | `1` | install LiteLLM proxy during `up` (`--no-litellm` to skip) |
+| `INSTALL_PORTKEY` | `1` | install Portkey gateway during `up` (`--no-portkey` to skip) |
+| `INSTALL_MLFLOW` | `1` | install MLflow during `up` (`--no-mlflow` to skip) |
+| `INSTALL_TYK` | `1` | install Tyk OSS gateway during `up` (`--no-tyk` to skip) |
+| `LITELLM_CHART_VERSION` | `latest` | pin the `litellm-helm` OCI chart version |
+| `MLFLOW_CHART_VERSION` | `latest` | pin the `community-charts/mlflow` chart version |
+| `TYK_CHART_VERSION` | `latest` | pin the `tyk-helm/tyk-oss` chart version |
+| `PORTKEY_IMAGE` | `portkeyai/gateway:latest` | Portkey gateway container image |
 
 ## Secrets
 
