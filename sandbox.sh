@@ -4615,6 +4615,7 @@ env overrides:
   INSTALL_MLFLOW              set to 0 (or pass --no-mlflow) to skip MLflow
   INSTALL_TYK                 set to 0 (or pass --no-tyk) to skip the Tyk OSS gateway
   LITELLM_CHART_VERSION       pin litellm-helm OCI chart version (default: latest)
+  LITELLM_DB_MODE             LiteLLM Postgres backend: auto|cnpg|standalone (default: auto — CNPG when available)
   MLFLOW_CHART_VERSION        pin community-charts/mlflow chart version (default: latest)
   TYK_CHART_VERSION           pin tyk-helm/tyk-oss chart version (default: latest)
   PORTKEY_IMAGE               Portkey gateway image (default: portkeyai/gateway:latest)

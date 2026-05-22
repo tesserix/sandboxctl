@@ -95,7 +95,7 @@ into `up`, `restart`, `status`, and `creds` exactly like NATS/agentregistry.
 
 | Option | URL | What it gives you |
 |---|---|---|
-| **LiteLLM** | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, bundled Postgres |
+| **LiteLLM** | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, CNPG-backed Postgres |
 | **Portkey** | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs |
 | **MLflow** | `https://mlflow.sandbox.app:8443` | Experiment tracking, model registry, observability UI |
 | **Tyk OSS** | `https://tyk.sandbox.app:8443` (`/hello`) | Open-source API gateway — rate-limit/auth/quotas in front of any upstream |
@@ -108,10 +108,14 @@ sandboxctl creds              # master keys, API secrets, and try-it curl comman
 ```
 
 Each tool's master key / API secret is generated per-install and persisted
-under `~/.sandboxctl/` (printed by `sandboxctl creds`). Tyk's bundled Redis
-and LiteLLM's bundled Postgres are sandbox-grade (single replica, no PVC /
-ephemeral); pin chart versions or point at durable backends via the env
-overrides in `sandboxctl up --help`. Note the graphical **Tyk Dashboard**
+under `~/.sandboxctl/` (printed by `sandboxctl creds`). LiteLLM's Postgres is
+provisioned by the **CloudNativePG operator** the platform already runs (one
+operator-managed Postgres flavour, not a second bare one) — set
+`LITELLM_DB_MODE=standalone` to use the chart's bundled Postgres instead, or
+it falls back automatically when CNPG isn't present (`--no-agentregistry`).
+Tyk's bundled Redis is sandbox-grade (single replica, no PVC); pin chart
+versions or point at durable backends via the env overrides in
+`sandboxctl up --help`. Note the graphical **Tyk Dashboard**
 is a licensed component and is *not* part of Tyk OSS — the gateway here is
 driven by its control API + API-definition files.
 
@@ -386,8 +390,9 @@ The pieces:
   clients. Cert is signed by the same per-install CA as everything else.
 - **AI Agentic Gateway** — LiteLLM, Portkey, MLflow, and Tyk OSS, each in
   its own namespace with an Istio route + trusted HTTPS URL (default-on;
-  see the section above). LiteLLM ships a bundled Postgres; Tyk ships a
-  bundled single-replica Redis.
+  see the section above). LiteLLM's Postgres is provisioned via the shared
+  CloudNativePG operator by default (bundled-standalone fallback); Tyk ships
+  a bundled single-replica Redis.
 - **In-cluster registry** — `localhost:5050` push target, mirrored into
   the kind node's containerd via `hosts.toml`
 - **macOS LaunchAgent** — `kubectl port-forward` so the gateway is
@@ -430,6 +435,7 @@ Defaults work for most people. Override via env vars:
 | `INSTALL_MLFLOW` | `1` | install MLflow during `up` (`--no-mlflow` to skip) |
 | `INSTALL_TYK` | `1` | install Tyk OSS gateway during `up` (`--no-tyk` to skip) |
 | `LITELLM_CHART_VERSION` | `latest` | pin the `litellm-helm` OCI chart version |
+| `LITELLM_DB_MODE` | `auto` | LiteLLM Postgres: `auto` (CNPG when available), `cnpg`, or `standalone` |
 | `MLFLOW_CHART_VERSION` | `latest` | pin the `community-charts/mlflow` chart version |
 | `TYK_CHART_VERSION` | `latest` | pin the `tyk-helm/tyk-oss` chart version |
 | `PORTKEY_IMAGE` | `portkeyai/gateway:latest` | Portkey gateway container image |
