@@ -12,6 +12,20 @@ behind a single wildcard cert and a stable `*.sandbox.app:8443` URL.
 app into it via a real GitOps loop — chart pushed to in-cluster Gitea, Argo
 CD syncs, Istio routes the URL.
 
+## Demo
+
+<video
+  src="https://github.com/tesserix/sandboxctl/releases/download/v2.3.0/sandboxctl-video.mp4"
+  poster="https://raw.githubusercontent.com/tesserix/sandboxctl/main/docs/demo-poster.jpg"
+  controls
+  width="100%">
+  Your browser can’t play the embedded video.
+</video>
+
+A full `sandboxctl up` run, end to end. If the player above doesn’t load,
+[▶ open the demo video](https://github.com/tesserix/sandboxctl/releases/download/v2.3.0/sandboxctl-video.mp4)
+(MP4, ~500 MB — hosted on the [v2.3.0 release](https://github.com/tesserix/sandboxctl/releases/tag/v2.3.0)).
+
 ## Install
 
 ```sh
