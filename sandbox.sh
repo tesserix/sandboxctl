@@ -85,18 +85,18 @@ INSTALL_ARCTL="${INSTALL_ARCTL:-1}"
 INSTALL_AGENTREGISTRY="${INSTALL_AGENTREGISTRY:-1}"
 
 # AI Agentic Gateway — four independent LLM/API-gateway + observability
-# options, installed into the cluster by `up`/`bootstrap` so users can try
-# each one and pick what fits. LiteLLM + Portkey are default-on (the light,
-# core LLM-gateway pair); MLflow + Tyk are opt-in (heavier, less universally
-# needed) — keeps the default `up` from over-subscribing a laptop-sized VM.
-# The gates live in their libs (lib/{litellm,portkey,mlflow,tyk}.sh) and are
-# read at install time, so the flag parser below (or an env var) can flip
-# any of them. --no-ai-gateway turns off the default-on pair.
-#   INSTALL_LITELLM=0   skip LiteLLM proxy            (default on;  --no-litellm)
+# options. Only Portkey (a single light, stateless pod) is default-on;
+# LiteLLM (700 MB image + Postgres + ~1-2 GB RAM), MLflow, and Tyk are
+# opt-in so the default `up` stays small on a laptop VM. Turn the opt-ins
+# on individually (--with-litellm / --with-mlflow / --with-tyk) or all the
+# gateways at once with --with-ai-gateway. The gates live in their libs
+# (lib/{litellm,portkey,mlflow,tyk}.sh) and are read at install time, so the
+# flag parser below (or an env var) can flip any of them.
 #   INSTALL_PORTKEY=0   skip Portkey AI gateway       (default on;  --no-portkey)
+#   INSTALL_LITELLM=1   install LiteLLM proxy         (default off; --with-litellm)
 #   INSTALL_MLFLOW=1    install MLflow tracking + UI  (default off; --with-mlflow)
 #   INSTALL_TYK=1       install Tyk OSS API gateway   (default off; --with-tyk)
-INSTALL_LITELLM="${INSTALL_LITELLM:-1}"
+INSTALL_LITELLM="${INSTALL_LITELLM:-0}"
 INSTALL_PORTKEY="${INSTALL_PORTKEY:-1}"
 INSTALL_MLFLOW="${INSTALL_MLFLOW:-0}"
 INSTALL_TYK="${INSTALL_TYK:-0}"
@@ -2291,13 +2291,15 @@ cmd_up() {
       --no-arctl)       INSTALL_ARCTL=0; shift ;;
       --no-nats-cli)    INSTALL_NATS_CLI=0; shift ;;
       --no-agentregistry) INSTALL_AGENTREGISTRY=0; shift ;;
-      --no-litellm)     INSTALL_LITELLM=0; shift ;;
-      --no-portkey)     INSTALL_PORTKEY=0; shift ;;
+      --with-litellm)   INSTALL_LITELLM=1; shift ;;
       --with-mlflow)    INSTALL_MLFLOW=1; shift ;;
       --with-tyk)       INSTALL_TYK=1; shift ;;
+      --with-ai-gateway) INSTALL_LITELLM=1; INSTALL_PORTKEY=1; INSTALL_MLFLOW=1; INSTALL_TYK=1; shift ;;
+      --no-litellm)     INSTALL_LITELLM=0; shift ;;
+      --no-portkey)     INSTALL_PORTKEY=0; shift ;;
       --no-mlflow)      INSTALL_MLFLOW=0; shift ;;
       --no-tyk)         INSTALL_TYK=0; shift ;;
-      --no-ai-gateway)  INSTALL_LITELLM=0; INSTALL_PORTKEY=0; shift ;;
+      --no-ai-gateway)  INSTALL_LITELLM=0; INSTALL_PORTKEY=0; INSTALL_MLFLOW=0; INSTALL_TYK=0; shift ;;
       --workers)
         SANDBOX_WORKER_COUNT="${2:-}"
         validate_worker_count "$SANDBOX_WORKER_COUNT" "sandboxctl up"
@@ -2311,7 +2313,7 @@ cmd_up() {
         cat <<EOF
 sandboxctl up [--workers N] [--with-kagent] [--install all]
               [--no-arctl] [--no-nats-cli] [--no-agentregistry]
-              [--no-litellm] [--no-portkey] [--with-mlflow] [--with-tyk] [--no-ai-gateway]
+              [--with-ai-gateway | --with-litellm | --with-mlflow | --with-tyk | --no-portkey | --no-ai-gateway]
 
 Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
 Kargo + Istio + in-cluster registry + Gitea + NATS (JetStream) + a demo
@@ -2335,18 +2337,19 @@ In the cluster (default-on):
                    Skip with --no-agentregistry (or INSTALL_AGENTREGISTRY=0).
 
 AI Agentic Gateway:
- Default-on (the light, core LLM-gateway pair):
-  litellm          OpenAI-compatible LLM proxy (UI at /ui). Reuses the shared
-                   CNPG Postgres (a 'litellm' db on agentregistry's cluster).
-                   https://litellm.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-litellm)
-  portkey          Portkey OSS AI gateway + console UI (/public/).
-                   https://portkey.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-portkey)
+ Default-on:
+  portkey          Portkey OSS AI gateway + console UI (/public/) — one light,
+                   stateless pod. https://portkey.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-portkey)
  Opt-in (heavier — enable when you want them):
+  --with-litellm   OpenAI-compatible LLM proxy (UI at /ui). ~700 MB image +
+                   ~1-2 GB RAM; reuses the shared CNPG Postgres (a 'litellm'
+                   db on agentregistry's cluster). https://litellm.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
   --with-mlflow    MLflow experiment tracking + model registry UI.
                    https://mlflow.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
   --with-tyk       Tyk OSS API gateway (+ bundled Redis).
                    https://tyk.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
-  --no-ai-gateway  Skip the default-on pair (litellm + portkey).
+  --with-ai-gateway  Install all of the above at once (litellm+portkey+mlflow+tyk).
+  --no-ai-gateway  Skip them all (including the default-on Portkey).
 
 Also installs onto the Mac (not the cluster):
   arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
@@ -2477,7 +2480,8 @@ cmd_bootstrap() {
       --repo)
         repo_flag="${2:-}"; shift 2 ;;
       --with-kagent|--no-arctl|--no-agentregistry|--install|\
-      --no-ai-gateway|--no-litellm|--no-portkey|--with-mlflow|--with-tyk|--no-mlflow|--no-tyk)
+      --with-ai-gateway|--with-litellm|--with-mlflow|--with-tyk|\
+      --no-ai-gateway|--no-litellm|--no-portkey|--no-mlflow|--no-tyk)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
           up_args+=("$1" "${2:-}"); shift 2
@@ -4584,8 +4588,9 @@ usage:
   sandbox.sh up [--workers N] [--with-kagent | --install all] [--no-agentregistry] [--no-ai-gateway] [--with-mlflow] [--with-tyk]
                             create cluster + install argocd/kargo/demo/registry/gitea/nats/agentregistry+CNPG + ingress + PKI + hosts + portfwd
                             (NATS + agentregistry default-on; kagent is opt-in: --with-kagent or --install all)
-                            AI Agentic Gateway: litellm + portkey default-on (skip with --no-litellm/--no-portkey or --no-ai-gateway);
-                            mlflow + tyk opt-in (--with-mlflow / --with-tyk)
+                            AI Agentic Gateway: portkey default-on (skip with --no-portkey);
+                            litellm/mlflow/tyk opt-in (--with-litellm / --with-mlflow / --with-tyk);
+                            --with-ai-gateway installs all of them at once; --no-ai-gateway skips them all
                             --workers N picks the kind worker count (1–3, default 1)
   sandbox.sh down           remove cluster + LaunchAgent + /etc/hosts + keychain CA (keeps ~/.sandbox)
   sandbox.sh purge          down + remove ~/.sandbox (prompts for confirmation)

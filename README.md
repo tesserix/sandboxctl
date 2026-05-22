@@ -89,24 +89,26 @@ generates its own — nothing is hard-coded.
 `sandboxctl up` / `bootstrap` also stand up independent AI-gateway &
 observability options **in the cluster**, each behind its own trusted HTTPS
 URL, so you can test them and present the same menu of choices to your own
-users/customers. **LiteLLM + Portkey are default-on** (the light, core
-LLM-gateway pair); **MLflow + Tyk are opt-in** (heavier — enable with
-`--with-mlflow` / `--with-tyk`). Each is a self-contained lib
-(`lib/litellm.sh`, `lib/portkey.sh`, `lib/mlflow.sh`, `lib/tyk.sh`) wired
-into `up`, `restart`, `status`, and `creds` exactly like NATS/agentregistry.
+users/customers. **Portkey is default-on** (a single light, stateless pod);
+**LiteLLM, MLflow, and Tyk are opt-in** (heavier). Turn them on individually
+with `--with-litellm` / `--with-mlflow` / `--with-tyk`, or all the gateways at
+once with `--with-ai-gateway`. Each is a self-contained lib (`lib/litellm.sh`,
+`lib/portkey.sh`, `lib/mlflow.sh`, `lib/tyk.sh`) wired into `up`, `restart`,
+`status`, and `creds` exactly like NATS/agentregistry.
 
 | Option | Default | URL | What it gives you |
 |---|---|---|---|
-| **LiteLLM** | on | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, shared-CNPG Postgres |
 | **Portkey** | on | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs |
+| **LiteLLM** | `--with-litellm` | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, shared-CNPG Postgres |
 | **MLflow** | `--with-mlflow` | `https://mlflow.sandbox.app:8443` | Experiment tracking, model registry, observability UI |
 | **Tyk OSS** | `--with-tyk` | `https://tyk.sandbox.app:8443` (`/hello`) | Open-source API gateway — rate-limit/auth/quotas in front of any upstream |
 
 ```sh
-sandboxctl up                          # litellm + portkey (default-on)
-sandboxctl up --with-mlflow --with-tyk # add the opt-in pair too
-sandboxctl up --no-ai-gateway          # skip the default-on pair (lighter, faster up)
-sandboxctl creds                       # master keys, API secrets, and try-it curl commands for each
+sandboxctl up                     # portkey (default-on)
+sandboxctl up --with-litellm      # add LiteLLM (~700 MB image, ~1-2 GB RAM)
+sandboxctl up --with-ai-gateway   # install ALL gateways at once (litellm+portkey+mlflow+tyk)
+sandboxctl up --no-ai-gateway     # skip them all (lightest up)
+sandboxctl creds                  # master keys, API secrets, and try-it curl commands for each
 ```
 
 Each tool's master key / API secret is generated per-install and persisted
@@ -130,13 +132,14 @@ pieces have matching `--no-…` flags to leave them out.
 
 | Want to… | Command |
 |---|---|
+| Add LiteLLM (OpenAI-compatible proxy + UI) | `sandboxctl up --with-litellm` |
 | Add MLflow (tracking + UI) | `sandboxctl up --with-mlflow` |
 | Add Tyk OSS API gateway | `sandboxctl up --with-tyk` |
 | Add kagent (agentic AI controller) | `sandboxctl up --with-kagent` |
-| Add several at once | `sandboxctl up --with-mlflow --with-tyk --with-kagent` |
-| Skip LiteLLM | `sandboxctl up --no-litellm` |
-| Skip Portkey | `sandboxctl up --no-portkey` |
-| Skip both default LLM gateways | `sandboxctl up --no-ai-gateway` |
+| **Install every AI gateway at once** | `sandboxctl up --with-ai-gateway` |
+| Add several specific ones | `sandboxctl up --with-litellm --with-mlflow --with-tyk` |
+| Skip Portkey (the default-on one) | `sandboxctl up --no-portkey` |
+| Skip all AI gateways | `sandboxctl up --no-ai-gateway` |
 | Skip agentregistry + CNPG | `sandboxctl up --no-agentregistry` |
 
 **Adding one to a cluster that's already up?** Just run the same command —
@@ -316,11 +319,12 @@ existing cluster — recreating the kind cluster is the only path).
 **Lean by default.** Every component sandboxctl installs is tuned for a
 laptop: Argo CD ships without its `dex`/`applicationset`/`notifications`
 subcomponents (3 fewer pods), everything runs a single replica with small
-CPU/memory requests, the shared Postgres has capped memory, and the AI
-gateways carry memory limits so nothing balloons and starves the control
-plane. The default `up` (litellm + portkey + platform) fits comfortably in
-the default **4 CPU / 6 GB** VM. Adding `--with-mlflow --with-tyk` is when
-it's worth bumping the podman VM:
+CPU/memory requests (no CPU limits — only memory limits, so nothing
+balloons or gets CPU-throttled), and the shared Postgres has capped memory.
+The default `up` (Portkey + platform) fits comfortably in the default
+**4 CPU / 6 GB** VM. Turning on the heavier opt-ins — especially
+`--with-litellm` (~700 MB image, ~1-2 GB RAM) or `--with-ai-gateway` (all of
+them) — is when it's worth bumping the podman VM:
 
 ```sh
 podman machine stop
@@ -402,10 +406,10 @@ endpoint or model.
    │       ├── demo-app        (demo-app ns)       │
    │       ├── gitea           (gitea ns)          │
    │       ├── nats + JetStream (nats ns)          │
-   │       ├── litellm         (litellm ns)        │ ┐ AI Agentic Gateway
-   │       ├── portkey-gateway (portkey ns)        │ ┘ (litellm+portkey on)
-   │       ├── mlflow          (mlflow ns)         │ ┐ opt-in:
-   │       ├── tyk + redis     (tyk ns)            │ ┘ --with-mlflow/--with-tyk
+   │       ├── portkey-gateway (portkey ns)        │   AI Agentic Gateway (portkey on)
+   │       ├── litellm         (litellm ns)        │ ┐ opt-in:  --with-litellm
+   │       ├── mlflow          (mlflow ns)         │ │ --with-mlflow / --with-tyk
+   │       ├── tyk + redis     (tyk ns)            │ ┘ (or --with-ai-gateway for all)
    │       ├── registry:30050  (sandboxctl-registry ns)
    │       └── your apps       (one ns each)       │
    │                                                │
@@ -429,7 +433,7 @@ The pieces:
   (TCP+TLS, served via an Istio TLS-passthrough listener and a second
   LaunchAgent port-forward) and `wss://nats.sandbox.app:8443` for browser/JS
   clients. Cert is signed by the same per-install CA as everything else.
-- **AI Agentic Gateway** — LiteLLM + Portkey default-on, MLflow + Tyk opt-in, each in
+- **AI Agentic Gateway** — Portkey default-on; LiteLLM, MLflow, Tyk opt-in, each in
   its own namespace with an Istio route + trusted HTTPS URL (default-on;
   see the section above). LiteLLM reuses the shared CloudNativePG cluster
   (a `litellm` db on agentregistry's Postgres — no second pod;
@@ -471,7 +475,7 @@ Defaults work for most people. Override via env vars:
 | `INSTALL_ARCTL` | `1` | install `arctl` during `up`; set `0` to skip |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
 | `ARCTL_INSTALL_DIR` | `/usr/local/bin` | where the `arctl` binary is installed |
-| `INSTALL_LITELLM` | `1` | LiteLLM proxy (default-on; `--no-litellm` to skip) |
+| `INSTALL_LITELLM` | `0` | LiteLLM proxy (opt-in; `--with-litellm` or `INSTALL_LITELLM=1`) |
 | `INSTALL_PORTKEY` | `1` | Portkey gateway (default-on; `--no-portkey` to skip) |
 | `INSTALL_MLFLOW` | `0` | MLflow (opt-in; `--with-mlflow` or `INSTALL_MLFLOW=1`) |
 | `INSTALL_TYK` | `0` | Tyk OSS gateway (opt-in; `--with-tyk` or `INSTALL_TYK=1`) |

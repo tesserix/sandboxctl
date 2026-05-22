@@ -73,9 +73,10 @@ LITELLM_DB_SECRET="${LITELLM_DB_SECRET:-litellm-db}"
 # Master key persisted across reruns. LiteLLM expects an `sk-...` shape.
 LITELLM_KEY_FILE="${LITELLM_KEY_FILE:-${SANDBOX_STATE_DIR}/litellm-master-key}"
 
-# Gate: default-on as part of the AI Agentic Gateway. INSTALL_LITELLM=0
-# (or `up --no-litellm` / `up --no-ai-gateway`) skips it.
-INSTALL_LITELLM="${INSTALL_LITELLM:-1}"
+# Gate: opt-in (it pulls a ~700 MB image and wants ~1-2 GB RAM, so it's not
+# in the default `up`). Enable with `up --with-litellm` / `--with-ai-gateway`,
+# or INSTALL_LITELLM=1.
+INSTALL_LITELLM="${INSTALL_LITELLM:-0}"
 
 # ============================================================================
 # Predicate
@@ -216,8 +217,8 @@ install_litellm() {
       --set "service.port=${LITELLM_PORT}"
       --set "replicaCount=1"
       --set "resources.requests.cpu=50m"
-      --set "resources.requests.memory=256Mi"
-      --set "resources.limits.memory=768Mi"
+      --set "resources.requests.memory=512Mi"
+      --set "resources.limits.memory=2Gi"
   )
   if (( use_shared )); then
     # Point LiteLLM at the litellm db on the shared CNPG cluster, with creds

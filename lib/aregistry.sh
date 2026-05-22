@@ -114,7 +114,7 @@ spec:
   # a real server). Shared between agentregistry + LiteLLM, so not too tiny.
   resources:
     requests: { cpu: 50m, memory: 256Mi }
-    limits:   { cpu: "1", memory: 640Mi }
+    limits:   { memory: 768Mi }
   postgresql:
     parameters:
       shared_buffers: "128MB"
