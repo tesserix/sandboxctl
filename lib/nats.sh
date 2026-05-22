@@ -121,6 +121,9 @@ EOF
       --set "config.websocket.tls.enabled=true" \
       --set "config.websocket.tls.secretName=${NATS_TLS_SECRET}" \
       --set "config.monitor.enabled=true" \
+      --set "container.merge.resources.requests.cpu=25m" \
+      --set "container.merge.resources.requests.memory=64Mi" \
+      --set "container.merge.resources.limits.memory=256Mi" \
       --wait --timeout 5m
 
   with_spinner "waiting for NATS pod to become Ready" \

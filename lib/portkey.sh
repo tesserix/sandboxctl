@@ -90,8 +90,8 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:
-            requests: { cpu: 50m, memory: 128Mi }
-            limits:   { cpu: "1",  memory: 512Mi }
+            requests: { cpu: 25m, memory: 96Mi }
+            limits:   { cpu: 300m, memory: 256Mi }
 ---
 apiVersion: v1
 kind: Service

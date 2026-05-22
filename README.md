@@ -86,38 +86,64 @@ generates its own — nothing is hard-coded.
 
 ### AI Agentic Gateway
 
-`sandboxctl up` / `bootstrap` also stand up four independent AI-gateway &
-observability options **in the cluster, default-on**, so you can test each
-behind its own trusted HTTPS URL and pick what fits — and present the same
-menu of choices to your own users/customers. Each is a self-contained lib
+`sandboxctl up` / `bootstrap` also stand up independent AI-gateway &
+observability options **in the cluster**, each behind its own trusted HTTPS
+URL, so you can test them and present the same menu of choices to your own
+users/customers. **LiteLLM + Portkey are default-on** (the light, core
+LLM-gateway pair); **MLflow + Tyk are opt-in** (heavier — enable with
+`--with-mlflow` / `--with-tyk`). Each is a self-contained lib
 (`lib/litellm.sh`, `lib/portkey.sh`, `lib/mlflow.sh`, `lib/tyk.sh`) wired
 into `up`, `restart`, `status`, and `creds` exactly like NATS/agentregistry.
 
-| Option | URL | What it gives you |
-|---|---|---|
-| **LiteLLM** | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, CNPG-backed Postgres |
-| **Portkey** | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs |
-| **MLflow** | `https://mlflow.sandbox.app:8443` | Experiment tracking, model registry, observability UI |
-| **Tyk OSS** | `https://tyk.sandbox.app:8443` (`/hello`) | Open-source API gateway — rate-limit/auth/quotas in front of any upstream |
+| Option | Default | URL | What it gives you |
+|---|---|---|---|
+| **LiteLLM** | on | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, shared-CNPG Postgres |
+| **Portkey** | on | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs |
+| **MLflow** | `--with-mlflow` | `https://mlflow.sandbox.app:8443` | Experiment tracking, model registry, observability UI |
+| **Tyk OSS** | `--with-tyk` | `https://tyk.sandbox.app:8443` (`/hello`) | Open-source API gateway — rate-limit/auth/quotas in front of any upstream |
 
 ```sh
-sandboxctl up                 # all four, default-on
-sandboxctl up --no-ai-gateway # skip all four (lighter, faster up)
-sandboxctl up --no-tyk        # skip just one (also --no-litellm/--no-portkey/--no-mlflow)
-sandboxctl creds              # master keys, API secrets, and try-it curl commands for each
+sandboxctl up                          # litellm + portkey (default-on)
+sandboxctl up --with-mlflow --with-tyk # add the opt-in pair too
+sandboxctl up --no-ai-gateway          # skip the default-on pair (lighter, faster up)
+sandboxctl creds                       # master keys, API secrets, and try-it curl commands for each
 ```
 
 Each tool's master key / API secret is generated per-install and persisted
-under `~/.sandboxctl/` (printed by `sandboxctl creds`). LiteLLM's Postgres is
-provisioned by the **CloudNativePG operator** the platform already runs (one
-operator-managed Postgres flavour, not a second bare one) — set
-`LITELLM_DB_MODE=standalone` to use the chart's bundled Postgres instead, or
-it falls back automatically when CNPG isn't present (`--no-agentregistry`).
+under `~/.sandboxctl/` (printed by `sandboxctl creds`). LiteLLM **reuses the
+CloudNativePG cluster the platform already runs for agentregistry** — it just
+adds a `litellm` database on that one cluster, so there's no second Postgres
+pod. Set `LITELLM_DB_MODE=standalone` to use the chart's bundled Postgres
+instead; it also falls back automatically when that cluster isn't present
+(`--no-agentregistry`).
 Tyk's bundled Redis is sandbox-grade (single replica, no PVC); pin chart
 versions or point at durable backends via the env overrides in
 `sandboxctl up --help`. Note the graphical **Tyk Dashboard**
 is a licensed component and is *not* part of Tyk OSS — the gateway here is
 driven by its control API + API-definition files.
+
+## Optional components
+
+Some pieces are **off by default** (heavier, not everyone needs them). To
+turn one on, pass its `--with-…` flag to `up` (or `bootstrap`). The default-on
+pieces have matching `--no-…` flags to leave them out.
+
+| Want to… | Command |
+|---|---|
+| Add MLflow (tracking + UI) | `sandboxctl up --with-mlflow` |
+| Add Tyk OSS API gateway | `sandboxctl up --with-tyk` |
+| Add kagent (agentic AI controller) | `sandboxctl up --with-kagent` |
+| Add several at once | `sandboxctl up --with-mlflow --with-tyk --with-kagent` |
+| Skip LiteLLM | `sandboxctl up --no-litellm` |
+| Skip Portkey | `sandboxctl up --no-portkey` |
+| Skip both default LLM gateways | `sandboxctl up --no-ai-gateway` |
+| Skip agentregistry + CNPG | `sandboxctl up --no-agentregistry` |
+
+**Adding one to a cluster that's already up?** Just run the same command —
+`up` is idempotent, so `sandboxctl up --with-mlflow` on a running cluster
+installs only the new piece and leaves everything else untouched. The flags
+also work through `bootstrap` (they're forwarded to `up`). `sandboxctl up
+--help` lists every toggle and its env-var equivalent (e.g. `INSTALL_MLFLOW=1`).
 
 ## Deploying your own app
 
@@ -287,6 +313,21 @@ The flag wins over the env var when both are set. `bootstrap` accepts
 cluster with the new count (kind doesn't support adding nodes to an
 existing cluster — recreating the kind cluster is the only path).
 
+**Lean by default.** Every component sandboxctl installs is tuned for a
+laptop: Argo CD ships without its `dex`/`applicationset`/`notifications`
+subcomponents (3 fewer pods), everything runs a single replica with small
+CPU/memory requests, the shared Postgres has capped memory, and the AI
+gateways carry memory limits so nothing balloons and starves the control
+plane. The default `up` (litellm + portkey + platform) fits comfortably in
+the default **4 CPU / 6 GB** VM. Adding `--with-mlflow --with-tyk` is when
+it's worth bumping the podman VM:
+
+```sh
+podman machine stop
+podman machine set --cpus 6 --memory 10240   # 10 GB; host should have >= 16 GB
+podman machine start
+```
+
 ## Reclaiming disk
 
 Builds and pushes can fail with `no space left on device` even when the Mac
@@ -361,10 +402,10 @@ endpoint or model.
    │       ├── demo-app        (demo-app ns)       │
    │       ├── gitea           (gitea ns)          │
    │       ├── nats + JetStream (nats ns)          │
-   │       ├── litellm         (litellm ns)        │ ┐
-   │       ├── portkey-gateway (portkey ns)        │ │ AI Agentic
-   │       ├── mlflow          (mlflow ns)         │ │ Gateway
-   │       ├── tyk + redis     (tyk ns)            │ ┘ (default-on)
+   │       ├── litellm         (litellm ns)        │ ┐ AI Agentic Gateway
+   │       ├── portkey-gateway (portkey ns)        │ ┘ (litellm+portkey on)
+   │       ├── mlflow          (mlflow ns)         │ ┐ opt-in:
+   │       ├── tyk + redis     (tyk ns)            │ ┘ --with-mlflow/--with-tyk
    │       ├── registry:30050  (sandboxctl-registry ns)
    │       └── your apps       (one ns each)       │
    │                                                │
@@ -388,11 +429,11 @@ The pieces:
   (TCP+TLS, served via an Istio TLS-passthrough listener and a second
   LaunchAgent port-forward) and `wss://nats.sandbox.app:8443` for browser/JS
   clients. Cert is signed by the same per-install CA as everything else.
-- **AI Agentic Gateway** — LiteLLM, Portkey, MLflow, and Tyk OSS, each in
+- **AI Agentic Gateway** — LiteLLM + Portkey default-on, MLflow + Tyk opt-in, each in
   its own namespace with an Istio route + trusted HTTPS URL (default-on;
-  see the section above). LiteLLM's Postgres is provisioned via the shared
-  CloudNativePG operator by default (bundled-standalone fallback); Tyk ships
-  a bundled single-replica Redis.
+  see the section above). LiteLLM reuses the shared CloudNativePG cluster
+  (a `litellm` db on agentregistry's Postgres — no second pod;
+  bundled-standalone fallback); Tyk ships a bundled single-replica Redis.
 - **In-cluster registry** — `localhost:5050` push target, mirrored into
   the kind node's containerd via `hosts.toml`
 - **macOS LaunchAgent** — `kubectl port-forward` so the gateway is
@@ -430,12 +471,13 @@ Defaults work for most people. Override via env vars:
 | `INSTALL_ARCTL` | `1` | install `arctl` during `up`; set `0` to skip |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
 | `ARCTL_INSTALL_DIR` | `/usr/local/bin` | where the `arctl` binary is installed |
-| `INSTALL_LITELLM` | `1` | install LiteLLM proxy during `up` (`--no-litellm` to skip) |
-| `INSTALL_PORTKEY` | `1` | install Portkey gateway during `up` (`--no-portkey` to skip) |
-| `INSTALL_MLFLOW` | `1` | install MLflow during `up` (`--no-mlflow` to skip) |
-| `INSTALL_TYK` | `1` | install Tyk OSS gateway during `up` (`--no-tyk` to skip) |
+| `INSTALL_LITELLM` | `1` | LiteLLM proxy (default-on; `--no-litellm` to skip) |
+| `INSTALL_PORTKEY` | `1` | Portkey gateway (default-on; `--no-portkey` to skip) |
+| `INSTALL_MLFLOW` | `0` | MLflow (opt-in; `--with-mlflow` or `INSTALL_MLFLOW=1`) |
+| `INSTALL_TYK` | `0` | Tyk OSS gateway (opt-in; `--with-tyk` or `INSTALL_TYK=1`) |
 | `LITELLM_CHART_VERSION` | `latest` | pin the `litellm-helm` OCI chart version |
-| `LITELLM_DB_MODE` | `auto` | LiteLLM Postgres: `auto` (CNPG when available), `cnpg`, or `standalone` |
+| `LITELLM_DB_MODE` | `auto` | LiteLLM Postgres: `auto`/`shared` (reuse the shared CNPG cluster) or `standalone` (chart's own) |
+| `LITELLM_IMAGE_TAG` | `main-latest` | LiteLLM image tag (the chart's version-derived default is often unpublished) |
 | `MLFLOW_CHART_VERSION` | `latest` | pin the `community-charts/mlflow` chart version |
 | `TYK_CHART_VERSION` | `latest` | pin the `tyk-helm/tyk-oss` chart version |
 | `PORTKEY_IMAGE` | `portkeyai/gateway:latest` | Portkey gateway container image |

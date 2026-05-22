@@ -108,6 +108,17 @@ spec:
   instances: ${AREGISTRY_PG_INSTANCES}
   imageName: ${AREGISTRY_PG_IMAGE}
   primaryUpdateStrategy: unsupervised
+  # Lean sandbox sizing: small request so the scheduler packs it, a modest
+  # limit so it can't balloon and starve the control plane, and tuned
+  # Postgres memory params (default shared_buffers/connections are sized for
+  # a real server). Shared between agentregistry + LiteLLM, so not too tiny.
+  resources:
+    requests: { cpu: 50m, memory: 256Mi }
+    limits:   { cpu: "1", memory: 640Mi }
+  postgresql:
+    parameters:
+      shared_buffers: "128MB"
+      max_connections: "100"
   bootstrap:
     initdb:
       database: ${AREGISTRY_DB_NAME}

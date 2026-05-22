@@ -86,18 +86,20 @@ INSTALL_AGENTREGISTRY="${INSTALL_AGENTREGISTRY:-1}"
 
 # AI Agentic Gateway — four independent LLM/API-gateway + observability
 # options, installed into the cluster by `up`/`bootstrap` so users can try
-# each one and pick what fits. All default-on. The individual gates live
-# in their libs (lib/{litellm,portkey,mlflow,tyk}.sh) and default to 1;
-# they're read at install time, so the flag parser below (or an env var)
-# can flip any of them off. The group flag --no-ai-gateway flips all four.
-#   INSTALL_LITELLM=0   skip LiteLLM proxy           (--no-litellm)
-#   INSTALL_PORTKEY=0   skip Portkey AI gateway      (--no-portkey)
-#   INSTALL_MLFLOW=0    skip MLflow tracking + UI     (--no-mlflow)
-#   INSTALL_TYK=0       skip Tyk OSS API gateway      (--no-tyk)
+# each one and pick what fits. LiteLLM + Portkey are default-on (the light,
+# core LLM-gateway pair); MLflow + Tyk are opt-in (heavier, less universally
+# needed) — keeps the default `up` from over-subscribing a laptop-sized VM.
+# The gates live in their libs (lib/{litellm,portkey,mlflow,tyk}.sh) and are
+# read at install time, so the flag parser below (or an env var) can flip
+# any of them. --no-ai-gateway turns off the default-on pair.
+#   INSTALL_LITELLM=0   skip LiteLLM proxy            (default on;  --no-litellm)
+#   INSTALL_PORTKEY=0   skip Portkey AI gateway       (default on;  --no-portkey)
+#   INSTALL_MLFLOW=1    install MLflow tracking + UI  (default off; --with-mlflow)
+#   INSTALL_TYK=1       install Tyk OSS API gateway   (default off; --with-tyk)
 INSTALL_LITELLM="${INSTALL_LITELLM:-1}"
 INSTALL_PORTKEY="${INSTALL_PORTKEY:-1}"
-INSTALL_MLFLOW="${INSTALL_MLFLOW:-1}"
-INSTALL_TYK="${INSTALL_TYK:-1}"
+INSTALL_MLFLOW="${INSTALL_MLFLOW:-0}"
+INSTALL_TYK="${INSTALL_TYK:-0}"
 
 # Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
 # pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
@@ -958,6 +960,9 @@ install_cert_manager() {
       --namespace "$CERT_MANAGER_NS" --create-namespace \
       --version "$CERT_MANAGER_CHART_VERSION" \
       --set crds.enabled=true \
+      --set 'resources.requests.cpu=10m'           --set 'resources.requests.memory=64Mi' \
+      --set 'webhook.resources.requests.cpu=10m'   --set 'webhook.resources.requests.memory=32Mi' \
+      --set 'cainjector.resources.requests.cpu=10m' --set 'cainjector.resources.requests.memory=64Mi' \
       --wait --timeout 5m
   ok "cert-manager ready"
 }
@@ -1021,13 +1026,27 @@ install_argocd() {
   helm repo update argo >/dev/null
   # server.insecure=true makes argocd-server speak HTTP on :80 so the gateway
   # can terminate TLS without re-encrypting upstream.
+  #
+  # Lean profile (single-user sandbox): drop the three default-on
+  # subcomponents nobody here uses — dex (SSO), applicationset, and
+  # notifications — removing three always-on pods. Pin every component to a
+  # single replica and give each a small request so the scheduler packs them
+  # tightly and the control plane keeps its memory.
   helm_install "Argo CD helm install (typically 2–5 min)" \
     helm upgrade --install argocd argo/argo-cd \
       --namespace "$ARGOCD_NS" --create-namespace \
       --version "$ARGOCD_CHART_VERSION" \
       --set 'configs.params.server\.insecure=true' \
+      --set 'dex.enabled=false' \
+      --set 'notifications.enabled=false' \
+      --set 'applicationset.enabled=false' \
+      --set 'controller.replicas=1' \
+      --set 'controller.resources.requests.cpu=50m'      --set 'controller.resources.requests.memory=256Mi' \
+      --set 'repoServer.resources.requests.cpu=25m'      --set 'repoServer.resources.requests.memory=128Mi' \
+      --set 'server.resources.requests.cpu=25m'          --set 'server.resources.requests.memory=128Mi' \
+      --set 'redis.resources.requests.cpu=25m'           --set 'redis.resources.requests.memory=64Mi' \
       --wait --timeout 10m
-  ok "Argo CD ready"
+  ok "Argo CD ready (lean: no dex/applicationset/notifications)"
 }
 
 install_reflector() {
@@ -1041,6 +1060,8 @@ install_reflector() {
     helm upgrade --install reflector emberstack/reflector \
       --namespace "$REFLECTOR_NS" --create-namespace \
       --version "$REFLECTOR_CHART_VERSION" \
+      --set 'resources.requests.cpu=10m' --set 'resources.requests.memory=32Mi' \
+      --set 'resources.limits.memory=128Mi' \
       --wait --timeout 5m
   ok "reflector ready"
 }
@@ -1060,6 +1081,9 @@ install_reloader() {
     helm upgrade --install reloader stakater/reloader \
       --namespace "$RELOADER_NS" --create-namespace \
       --version "$RELOADER_CHART_VERSION" \
+      --set 'reloader.deployment.resources.requests.cpu=10m' \
+      --set 'reloader.deployment.resources.requests.memory=32Mi' \
+      --set 'reloader.deployment.resources.limits.memory=128Mi' \
       --wait --timeout 5m
   ok "reloader ready (annotate workloads with reloader.stakater.com/auto: \"true\")"
 }
@@ -1072,6 +1096,8 @@ install_kargo() {
       --version "$KARGO_CHART_VERSION" \
       --set api.adminAccount.passwordHash="$KARGO_ADMIN_PASSWORD_HASH" \
       --set api.adminAccount.tokenSigningKey="$KARGO_TOKEN_SIGNING_KEY" \
+      --set 'api.resources.requests.cpu=25m'        --set 'api.resources.requests.memory=128Mi' \
+      --set 'controller.resources.requests.cpu=25m' --set 'controller.resources.requests.memory=128Mi' \
       --wait --timeout 10m
   ok "Kargo ready"
 }
@@ -1167,6 +1193,9 @@ spec:
           readinessProbe:
             httpGet: { path: /, port: http }
             periodSeconds: 5
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { memory: 256Mi }
           volumeMounts:
             - { name: data, mountPath: /var/lib/registry }
       volumes:
@@ -1301,6 +1330,8 @@ install_gitea() {
           --set 'persistence.size=1Gi' \
           --set 'replicaCount=1' \
           --set 'service.http.port=3000' \
+          --set 'resources.requests.cpu=25m' --set 'resources.requests.memory=128Mi' \
+          --set 'resources.limits.memory=512Mi' \
           --wait --timeout 8m; then
     die "gitea helm install failed — see 'helm -n ${GITEA_NS} status gitea' and 'kc -n ${GITEA_NS} get events --sort-by=.lastTimestamp'"
   fi
@@ -1428,8 +1459,12 @@ install_istio_ambient() {
 
   helm_istio istio-base base
   helm_istio istio-cni  cni    --set profile=ambient
-  helm_istio istiod     istiod --set profile=ambient
-  helm_istio ztunnel    ztunnel
+  # istiod's pilot is the chunkiest Istio component — give it a small request
+  # so it's scheduled lean (it self-sizes its cache to load, not the request).
+  helm_istio istiod     istiod --set profile=ambient \
+    --set 'pilot.resources.requests.cpu=50m' --set 'pilot.resources.requests.memory=128Mi'
+  helm_istio ztunnel    ztunnel \
+    --set 'resources.requests.cpu=25m' --set 'resources.requests.memory=64Mi'
 
   # Ingress gateway. ClusterIP only — Mac reaches it via the LaunchAgent
   # port-forward. Ports are 8080/8443 (not 80/443) so Envoy can bind without
@@ -1443,6 +1478,7 @@ install_istio_ambient() {
       --set 'service.ports[0].name=status-port'  --set 'service.ports[0].port=15021' --set 'service.ports[0].targetPort=15021' --set 'service.ports[0].protocol=TCP' \
       --set 'service.ports[1].name=http2'        --set 'service.ports[1].port=8080'  --set 'service.ports[1].targetPort=8080'  --set 'service.ports[1].protocol=TCP' \
       --set 'service.ports[2].name=https'        --set 'service.ports[2].port=8443'  --set 'service.ports[2].targetPort=8443'  --set 'service.ports[2].protocol=TCP' \
+      --set 'resources.requests.cpu=25m' --set 'resources.requests.memory=64Mi' \
       --wait --timeout 5m
 
   with_spinner "waiting for istio-ingress gateway pod to become Ready" \
@@ -2257,9 +2293,11 @@ cmd_up() {
       --no-agentregistry) INSTALL_AGENTREGISTRY=0; shift ;;
       --no-litellm)     INSTALL_LITELLM=0; shift ;;
       --no-portkey)     INSTALL_PORTKEY=0; shift ;;
+      --with-mlflow)    INSTALL_MLFLOW=1; shift ;;
+      --with-tyk)       INSTALL_TYK=1; shift ;;
       --no-mlflow)      INSTALL_MLFLOW=0; shift ;;
       --no-tyk)         INSTALL_TYK=0; shift ;;
-      --no-ai-gateway)  INSTALL_LITELLM=0; INSTALL_PORTKEY=0; INSTALL_MLFLOW=0; INSTALL_TYK=0; shift ;;
+      --no-ai-gateway)  INSTALL_LITELLM=0; INSTALL_PORTKEY=0; shift ;;
       --workers)
         SANDBOX_WORKER_COUNT="${2:-}"
         validate_worker_count "$SANDBOX_WORKER_COUNT" "sandboxctl up"
@@ -2273,7 +2311,7 @@ cmd_up() {
         cat <<EOF
 sandboxctl up [--workers N] [--with-kagent] [--install all]
               [--no-arctl] [--no-nats-cli] [--no-agentregistry]
-              [--no-ai-gateway | --no-litellm | --no-portkey | --no-mlflow | --no-tyk]
+              [--no-litellm] [--no-portkey] [--with-mlflow] [--with-tyk] [--no-ai-gateway]
 
 Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
 Kargo + Istio + in-cluster registry + Gitea + NATS (JetStream) + a demo
@@ -2296,16 +2334,19 @@ In the cluster (default-on):
                    https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
                    Skip with --no-agentregistry (or INSTALL_AGENTREGISTRY=0).
 
-AI Agentic Gateway (default-on — four options to test side by side):
-  litellm          OpenAI-compatible LLM proxy (UI at /ui), bundled Postgres.
+AI Agentic Gateway:
+ Default-on (the light, core LLM-gateway pair):
+  litellm          OpenAI-compatible LLM proxy (UI at /ui). Reuses the shared
+                   CNPG Postgres (a 'litellm' db on agentregistry's cluster).
                    https://litellm.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-litellm)
   portkey          Portkey OSS AI gateway + console UI (/public/).
                    https://portkey.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-portkey)
-  mlflow           MLflow experiment tracking + model registry UI.
-                   https://mlflow.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}    (--no-mlflow)
-  tyk              Tyk OSS API gateway (+ bundled Redis).
-                   https://tyk.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}       (--no-tyk)
-  --no-ai-gateway  Skip all four (lighter, faster 'up').
+ Opt-in (heavier — enable when you want them):
+  --with-mlflow    MLflow experiment tracking + model registry UI.
+                   https://mlflow.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  --with-tyk       Tyk OSS API gateway (+ bundled Redis).
+                   https://tyk.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  --no-ai-gateway  Skip the default-on pair (litellm + portkey).
 
 Also installs onto the Mac (not the cluster):
   arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
@@ -2436,7 +2477,7 @@ cmd_bootstrap() {
       --repo)
         repo_flag="${2:-}"; shift 2 ;;
       --with-kagent|--no-arctl|--no-agentregistry|--install|\
-      --no-ai-gateway|--no-litellm|--no-portkey|--no-mlflow|--no-tyk)
+      --no-ai-gateway|--no-litellm|--no-portkey|--with-mlflow|--with-tyk|--no-mlflow|--no-tyk)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
           up_args+=("$1" "${2:-}"); shift 2
@@ -4540,10 +4581,11 @@ usage:
   sandbox.sh setup-podman   install/configure rootful podman machine (one-time)
   sandbox.sh trust-ca       trust the sandbox root CA in macOS System keychain (sudo)
   sandbox.sh untrust-ca     remove the sandbox root CA from System keychain (sudo)
-  sandbox.sh up [--workers N] [--with-kagent | --install all] [--no-agentregistry] [--no-ai-gateway]
+  sandbox.sh up [--workers N] [--with-kagent | --install all] [--no-agentregistry] [--no-ai-gateway] [--with-mlflow] [--with-tyk]
                             create cluster + install argocd/kargo/demo/registry/gitea/nats/agentregistry+CNPG + ingress + PKI + hosts + portfwd
                             (NATS + agentregistry default-on; kagent is opt-in: --with-kagent or --install all)
-                            AI Agentic Gateway (litellm/portkey/mlflow/tyk) is default-on; skip with --no-ai-gateway or per-tool --no-litellm/--no-portkey/--no-mlflow/--no-tyk
+                            AI Agentic Gateway: litellm + portkey default-on (skip with --no-litellm/--no-portkey or --no-ai-gateway);
+                            mlflow + tyk opt-in (--with-mlflow / --with-tyk)
                             --workers N picks the kind worker count (1–3, default 1)
   sandbox.sh down           remove cluster + LaunchAgent + /etc/hosts + keychain CA (keeps ~/.sandbox)
   sandbox.sh purge          down + remove ~/.sandbox (prompts for confirmation)
@@ -4615,7 +4657,8 @@ env overrides:
   INSTALL_MLFLOW              set to 0 (or pass --no-mlflow) to skip MLflow
   INSTALL_TYK                 set to 0 (or pass --no-tyk) to skip the Tyk OSS gateway
   LITELLM_CHART_VERSION       pin litellm-helm OCI chart version (default: latest)
-  LITELLM_DB_MODE             LiteLLM Postgres backend: auto|cnpg|standalone (default: auto — CNPG when available)
+  LITELLM_IMAGE_TAG           LiteLLM image tag (default: main-latest — the chart's version-derived default is often unpublished)
+  LITELLM_DB_MODE             LiteLLM Postgres: auto|shared (reuse agentregistry's CNPG cluster) | standalone (default: auto)
   MLFLOW_CHART_VERSION        pin community-charts/mlflow chart version (default: latest)
   TYK_CHART_VERSION           pin tyk-helm/tyk-oss chart version (default: latest)
   PORTKEY_IMAGE               Portkey gateway image (default: portkeyai/gateway:latest)

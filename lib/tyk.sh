@@ -56,8 +56,9 @@ TYK_REDIS_IMAGE="${TYK_REDIS_IMAGE:-redis:7-alpine}"
 # APISecret (gateway control-API secret) persisted across reruns.
 TYK_SECRET_FILE="${TYK_SECRET_FILE:-${SANDBOX_STATE_DIR}/tyk-api-secret}"
 
-# Gate: default-on as part of the AI Agentic Gateway.
-INSTALL_TYK="${INSTALL_TYK:-1}"
+# Gate: opt-in (heavier add-on — gateway + bundled Redis). Enable with
+# `up --with-tyk` or INSTALL_TYK=1.
+INSTALL_TYK="${INSTALL_TYK:-0}"
 
 # ============================================================================
 # Predicate
@@ -161,6 +162,9 @@ install_tyk() {
       --set "global.secrets.APISecret=${secret}"
       --set "global.storageType=redis"
       --set "global.redis.addrs={${redis_addr}}"
+      --set "tyk-gateway.gateway.resources.requests.cpu=25m"
+      --set "tyk-gateway.gateway.resources.requests.memory=96Mi"
+      --set "tyk-gateway.gateway.resources.limits.memory=256Mi"
   )
   [[ -n "$TYK_CHART_VERSION" ]] && args+=(--version "$TYK_CHART_VERSION")
 

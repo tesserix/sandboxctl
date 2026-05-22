@@ -40,8 +40,8 @@ MLFLOW_HOST="${MLFLOW_HOST:-mlflow.${SANDBOX_DOMAIN}}"
 # chart Service listens on 80 and forwards to the container's 5000.
 MLFLOW_SVC_PORT="${MLFLOW_SVC_PORT:-80}"
 
-# Gate: default-on as part of the AI Agentic Gateway.
-INSTALL_MLFLOW="${INSTALL_MLFLOW:-1}"
+# Gate: opt-in (heavier add-on). Enable with `up --with-mlflow` or INSTALL_MLFLOW=1.
+INSTALL_MLFLOW="${INSTALL_MLFLOW:-0}"
 
 # ============================================================================
 # Predicate
@@ -72,6 +72,9 @@ install_mlflow() {
       --set "replicaCount=1"
       --set "service.type=ClusterIP"
       --set "service.port=${MLFLOW_SVC_PORT}"
+      --set "resources.requests.cpu=25m"
+      --set "resources.requests.memory=128Mi"
+      --set "resources.limits.memory=512Mi"
   )
   [[ -n "$MLFLOW_CHART_VERSION" ]] && args+=(--version "$MLFLOW_CHART_VERSION")
 
