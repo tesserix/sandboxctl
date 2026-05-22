@@ -14,13 +14,8 @@ CD syncs, Istio routes the URL.
 
 ## Demo
 
-<video
-  src="https://github.com/tesserix/sandboxctl/releases/download/v2.3.0/sandboxctl-video.mp4"
-  poster="https://raw.githubusercontent.com/tesserix/sandboxctl/main/docs/demo-poster.jpg"
-  controls
-  width="100%">
-  Your browser can’t play the embedded video.
-</video>
+https://github.com/user-attachments/assets/2de50f00-a427-4de0-a114-5b2f7eb05223
+
 
 A full `sandboxctl up` run, end to end. If the player above doesn’t load,
 [▶ open the demo video](https://github.com/tesserix/sandboxctl/releases/download/v2.3.0/sandboxctl-video.mp4)
