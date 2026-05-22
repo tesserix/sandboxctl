@@ -330,6 +330,7 @@ helm_install() {
   local logfile
   logfile="$(mktemp "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs/helm.$(date +%s).XXXXXX.log" 2>/dev/null || mktemp)"
   local attempt rc=0
+  # shellcheck disable=SC2034  # loop counter only bounds retries; value unused
   for attempt in 1 2 3 4 5 6; do
     rc=0
     SPINNER_LOGFILE="$logfile" SPINNER_QUIET_FAIL=1 with_spinner "$label" "${run[@]}" || rc=$?
@@ -522,23 +523,25 @@ _looks_like_product_repo() {
 # then cwd. Validates the result is a directory and looks repo-shaped.
 # Echoes the absolute path on stdout; dies on any problem.
 _resolve_product_repo() {
-  local flag_repo="$1" positional="$2" cmd="$3"
+  # Named cmd_name (not cmd) to avoid colliding with helm_install's array
+  # parameter of the same name — shellcheck conflates the two scopes (SC2178).
+  local flag_repo="$1" positional="$2" cmd_name="$3"
   if [[ -n "$flag_repo" && -n "$positional" ]]; then
-    die "${cmd}: pass either --repo <dir> or a positional path, not both"
+    die "${cmd_name}: pass either --repo <dir> or a positional path, not both"
   fi
   local target="${flag_repo:-${positional:-.}}"
   local explicit=0
   [[ -n "$flag_repo" || -n "$positional" ]] && explicit=1
 
-  [[ -d "$target" ]] || die "${cmd}: '${target}' is not a directory"
+  [[ -d "$target" ]] || die "${cmd_name}: '${target}' is not a directory"
   target="$(cd "$target" && pwd)"
 
   if ! _looks_like_product_repo "$target"; then
     if (( explicit )); then
-      die "${cmd}: '${target}' doesn't look like a product repo
+      die "${cmd_name}: '${target}' doesn't look like a product repo
        (no Dockerfile, Chart.yaml, or sandboxctl.yaml found)"
     else
-      die "${cmd}: current directory doesn't look like a product repo
+      die "${cmd_name}: current directory doesn't look like a product repo
        (no Dockerfile, Chart.yaml, or sandboxctl.yaml found).
        cd into your product repo, or pass --repo <dir>"
     fi
@@ -3582,7 +3585,12 @@ Pipeline (per chart):
   3. Push the chart to the in-cluster Gitea, create one Argo CD
      Application per chart syncing from Gitea, and route
      <chart>.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT} to the
-     chart's primary Service.
+     chart's primary Service. The chart's image is auto-pinned via
+     Argo helm parameters to the registry image just built
+     (localhost:${SANDBOX_REGISTRY_PORT}/<name>:<tag>) when a manifest
+     image maps to the chart by name (or is the repo's sole image), so
+     the deployed image always matches the build — no need to hardcode
+     the registry path in values.yaml.
 
 Chart resolution order (no --chart):
   1. <repo>/k8s/chart/Chart.yaml         the recommended layout
@@ -3718,6 +3726,18 @@ EOF
     fi
   fi
 
+  # Resolve the build manifest once (same precedence as cmd_build) so the
+  # per-chart loop can pin each chart's image to the registry coordinates
+  # cmd_build just pushed. chart_count gates the "sole image" fallback in
+  # _image_ref_for_chart — a single-image, single-chart repo maps even
+  # when image and chart names differ.
+  local deploy_manifest=""
+  for candidate in "${target}/sandboxctl.yaml" "${target}/sandboxctl.yml"; do
+    [[ -f "$candidate" ]] && { deploy_manifest="$candidate"; break; }
+  done
+  local chart_count
+  chart_count="$(printf '%s\n' "$entries" | grep -c . || true)"
+
   # Iterate every discovered chart. Each becomes one Argo Application
   # synced from a dedicated Gitea repo (apps/<chart>-chart.git).
   local kind cname src_dir values_file
@@ -3748,7 +3768,19 @@ EOF
     gitea_url="$(gitea_push_chart "$repo_name" "$src_dir")"
     log "[${cname}] pushed chart → ${gitea_url}"
 
-    _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace"
+    # Map this chart to the image cmd_build pushed and pin it via Argo
+    # helm parameters, so the deployed image matches the registry even
+    # if the chart's values.yaml hardcodes a stale/foreign reference.
+    local image_repo="" image_tag=""
+    if [[ "$kind" == "helm" ]]; then
+      local image_ref=""
+      image_ref="$(_image_ref_for_chart "$cname" "$deploy_manifest" "$chart_count")"
+      if [[ -n "$image_ref" ]]; then
+        IFS=$'\t' read -r image_repo image_tag <<<"$image_ref"
+      fi
+    fi
+
+    _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$image_repo" "$image_tag"
 
     _wait_argo_health "$cname"
 
@@ -3807,13 +3839,76 @@ _print_deploy_summary() {
   echo "  sandboxctl undeploy --name <app> --env ${env}    # tear one down"
 }
 
+# Echo "<repository>\t<tag>" for the registry image that backs chart
+# <cname>, or nothing when no built image maps to it. <cname> is the
+# (already-slugified) chart name; <manifest> is the repo's sandboxctl.yaml.
+#
+# Mapping rules, in order:
+#   1. exact match — a manifest image whose slugified name equals <cname>
+#      (the common case: chart `sandbox-demo` ↔ image `sandbox-demo`).
+#   2. sole image — when the manifest declares exactly one image AND the
+#      repo deploys exactly one chart (<chart_count> == 1), assume that
+#      image backs the chart even if the names differ.
+#
+# Anything else (multi-image repos with no name match) returns nothing,
+# so the chart's own values.yaml image is left untouched — we never guess
+# which of several images a chart wants.
+_image_ref_for_chart() {
+  local cname="$1" manifest="$2" chart_count="${3:-1}"
+  [[ -f "$manifest" ]] || return 0
+  local sandboxctl_bin
+  sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
+  [[ -n "$sandboxctl_bin" ]] || return 0
+  local entries
+  entries="$("$sandboxctl_bin" _parse-build-manifest "$manifest" 2>/dev/null)" || return 0
+  [[ -n "$entries" ]] || return 0
+
+  local count=0 only_name="" only_tag="" name ctx df tag aliases deps
+  while IFS=$'\t' read -r name ctx df tag aliases deps; do
+    [[ -n "$name" ]] || continue
+    count=$((count + 1))
+    only_name="$name"; only_tag="$tag"
+    if [[ "$(slugify "$name")" == "$cname" ]]; then
+      printf '%s\t%s\n' "localhost:${SANDBOX_REGISTRY_PORT}/${name}" "${tag:-latest}"
+      return 0
+    fi
+  done <<<"$entries"
+
+  if [[ "$count" -eq 1 && "$chart_count" -eq 1 ]]; then
+    printf '%s\t%s\n' "localhost:${SANDBOX_REGISTRY_PORT}/${only_name}" "${only_tag:-latest}"
+  fi
+}
+
 # Apply (or update) one Argo CD Application. Helper for cmd_deploy so
 # the per-chart loop body stays readable.
+#
+# <image_repo>/<image_tag> (optional) pin the chart's image to what
+# cmd_build just pushed to the in-cluster registry, injected as
+# spec.source.helm.parameters (image.repository / image.tag). Argo
+# applies parameters *after* valueFiles, so the deployed image always
+# matches the freshly-built one regardless of what the chart's
+# values.yaml hardcodes.
 _apply_argo_app() {
   local cname="$1" kind="$2" gitea_url="$3" values_file="$4" namespace="$5"
+  local image_repo="${6:-}" image_tag="${7:-}"
 
   log "[${cname}] creating Argo CD Application (source: ${gitea_url}@main)"
-  if [[ "$kind" == "helm" && -n "$values_file" ]]; then
+  if [[ "$kind" == "helm" ]]; then
+    # Assemble spec.source.helm from whatever we have. Emitted only when
+    # there's a value file and/or an image to pin — a bare helm source
+    # (neither) stays free of an empty `helm:` block.
+    local helm_block=""
+    if [[ -n "$values_file" || -n "$image_repo" ]]; then
+      helm_block="    helm:"$'\n'
+      [[ -n "$values_file" ]] && \
+        helm_block+="      valueFiles: [\"${values_file}\"]"$'\n'
+      if [[ -n "$image_repo" ]]; then
+        helm_block+="      parameters:"$'\n'
+        helm_block+="        - { name: image.repository, value: \"${image_repo}\" }"$'\n'
+        helm_block+="        - { name: image.tag, value: \"${image_tag:-latest}\" }"$'\n'
+        log "[${cname}] pinning image → ${image_repo}:${image_tag:-latest}"
+      fi
+    fi
     kc apply -f - <<EOF >/dev/null
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -3827,30 +3922,7 @@ spec:
     repoURL: ${gitea_url}
     targetRevision: main
     path: .
-    helm:
-      valueFiles: ["${values_file}"]
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: ${namespace}
-  syncPolicy:
-    automated: { prune: true, selfHeal: true }
-    syncOptions: [CreateNamespace=true, ServerSideApply=true]
-EOF
-  elif [[ "$kind" == "helm" ]]; then
-    kc apply -f - <<EOF >/dev/null
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: ${cname}
-  namespace: ${ARGOCD_NS}
-  finalizers: [resources-finalizer.argocd.argoproj.io]
-spec:
-  project: default
-  source:
-    repoURL: ${gitea_url}
-    targetRevision: main
-    path: .
-  destination:
+${helm_block}  destination:
     server: https://kubernetes.default.svc
     namespace: ${namespace}
   syncPolicy:
