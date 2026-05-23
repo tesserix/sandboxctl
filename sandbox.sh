@@ -3059,11 +3059,26 @@ cmd_kargo_ui() {
 
 # ----- Build + push (registry) -----
 
+# Prefer podman: matches the rest of the pipeline (detect_pusher requires
+# podman) and avoids the cross-runtime save|load handoff. Docker is only a
+# fallback for hosts where podman is unavailable.
 detect_builder() {
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then echo docker
-  elif command -v podman >/dev/null 2>&1; then echo podman
-  else die "neither docker nor podman is available — install one to build images"
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then echo podman
+  elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then echo docker
+  else die "neither podman nor docker is available — install podman ('sandboxctl setup-podman') to build images"
   fi
+}
+
+# Docker BuildKit needs the buildx CLI plugin. On hosts without Docker
+# Desktop, buildx is often missing and `docker build` aborts with
+# "BuildKit is enabled but the buildx component is missing". Falling back
+# to the legacy builder via DOCKER_BUILDKIT=0 keeps builds working without
+# pulling in Desktop. Caller-set DOCKER_BUILDKIT wins.
+docker_build_env() {
+  if [[ -n "${DOCKER_BUILDKIT-}" ]]; then return 0; fi
+  if docker buildx version >/dev/null 2>&1; then return 0; fi
+  warn "docker buildx not installed — falling back to legacy builder (DOCKER_BUILDKIT=0). Install buildx for faster builds: https://docs.docker.com/go/buildx/"
+  export DOCKER_BUILDKIT=0
 }
 
 # Always podman: docker push from Docker Desktop's VM can't reach the
@@ -3115,6 +3130,7 @@ build_and_push() {
   pusher="$(detect_pusher)"
 
   log "building ${image}  (context: ${context}, builder: ${builder})"
+  if [[ "$builder" == "docker" ]]; then docker_build_env; fi
   "$builder" build -t "$image" "$@" -f "$dockerfile" "$context" || \
     die "build failed for ${image}"
 
