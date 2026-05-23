@@ -52,13 +52,11 @@ SANDBOX_WORKER_COUNT="${SANDBOX_WORKER_COUNT:-1}"
 SANDBOX_WORKER_COUNT_MIN=1
 SANDBOX_WORKER_COUNT_MAX=3
 
-# kagent: chart defaults its LLM provider to Ollama at host.docker.internal.
-# sandboxctl does not install Ollama — the UI works either way; agents
-# need a reachable Ollama (or remote KAGENT_OLLAMA_HOST) to answer.
+# kagent: install the controller + UI only. We deliberately do not wire a
+# model provider here — no Ollama, no API-key providers, no model pulls.
+# Users configure providers/models out-of-band after the install.
 KAGENT_NS="${KAGENT_NS:-kagent}"
 KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
-KAGENT_OLLAMA_HOST="${KAGENT_OLLAMA_HOST:-host.docker.internal:11434}"
-KAGENT_OLLAMA_MODEL="${KAGENT_OLLAMA_MODEL:-llama3.2}"
 
 # arctl — the agentregistry CLI (https://aregistry.ai). Installed onto the
 # *Mac* (not the cluster) by `up`/`bootstrap` so the sandbox can build,
@@ -1238,9 +1236,10 @@ EOF
 }
 
 install_kagent() {
-  # The kagent UI works without an LLM. To actually answer queries, the
-  # && ollama pull llama3.2` or set KAGENT_OLLAMA_HOST to a remote endpoint.
-  log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — provider: Ollama at ${KAGENT_OLLAMA_HOST}"
+  # Install only the kagent controller + UI. No model provider is wired
+  # here (no Ollama, no API-key providers, no model pulls); users hook a
+  # provider up themselves after the install.
+  log "installing kagent (ns: $KAGENT_NS, chart $KAGENT_CHART_VERSION) — controller + UI only, no model provider"
 
   # CRDs ship as a separate chart, must land first.
   helm_install "kagent CRDs helm install (typically 30s)" \
@@ -1253,9 +1252,6 @@ install_kagent() {
     helm upgrade --install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
       --namespace "$KAGENT_NS" \
       --version "$KAGENT_CHART_VERSION" \
-      --set 'providers.default=ollama' \
-      --set "providers.ollama.model=${KAGENT_OLLAMA_MODEL}" \
-      --set "providers.ollama.config.host=${KAGENT_OLLAMA_HOST}" \
       --wait --timeout 10m
 
   with_spinner "waiting for kagent UI pod to become Ready" \
@@ -2939,13 +2935,8 @@ EOF
 
 kagent
   URL:       https://${KAGENT_HOST}:${SANDBOX_HTTPS_PORT}
-  LLM:       configured for Ollama at ${KAGENT_OLLAMA_HOST} (model: ${KAGENT_OLLAMA_MODEL})
-  Note:      kagent is installed but not wired to a live LLM by default.
-             To make agents answer queries, install Ollama yourself:
-               brew install ollama
-               ollama serve &
-               ollama pull ${KAGENT_OLLAMA_MODEL}
-             or set KAGENT_OLLAMA_HOST to a remote endpoint and re-run 'sandboxctl up'.
+  Note:      controller + UI only — no model provider is configured.
+             Wire a provider/model in the kagent UI (or via CRDs) before agents can answer.
 EOF
   fi
   if declare -F aregistry_print_creds >/dev/null && aregistry_present; then
@@ -4666,8 +4657,6 @@ env overrides:
   CERT_MANAGER_CHART_VERSION  pin cert-manager chart version
   ISTIO_CHART_VERSION         pin istio version
   KAGENT_CHART_VERSION        pin kagent helm chart version
-  KAGENT_OLLAMA_HOST          Ollama endpoint kagent connects to (default: host.docker.internal:11434)
-  KAGENT_OLLAMA_MODEL         model kagent will pull from Ollama (default: llama3.2)
   KARGO_TOKEN_SIGNING_KEY     pin Kargo JWT signing key (default: random per install)
   GITEA_CHART_VERSION         pin gitea helm chart version (default: 12.5.0)
   GITEA_ADMIN_USER            admin user created in Gitea (default: sandbox)

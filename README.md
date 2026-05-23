@@ -384,20 +384,12 @@ the local root CA in the System keychain. Subsequent runs are silent.
 `sandboxctl setup-podman` installs and configures podman for you (rootful,
 6 GiB memory) if it isn't ready yet.
 
-### Optional: Ollama for kagent
+### kagent model providers
 
-`kagent` defaults to Ollama as its LLM provider. The UI works without it,
-but to actually invoke an LLM you need Ollama reachable from the cluster:
-
-```sh
-brew install ollama
-ollama serve &
-ollama pull llama3.2
-```
-
-The kagent pod reaches your Mac's Ollama via `host.docker.internal:11434`.
-Override `KAGENT_OLLAMA_HOST` / `KAGENT_OLLAMA_MODEL` for a different
-endpoint or model.
+`sandboxctl --with-kagent` installs only the kagent controller + UI — no
+model provider is configured. Wire a provider/model yourself afterwards
+(via the kagent UI or a `ModelConfig` CRD); sandboxctl will not pull
+models or stand up Ollama for you.
 
 ## How it fits together
 
@@ -486,8 +478,6 @@ Defaults work for most people. Override via env vars:
 | `ISTIO_CHART_VERSION` | `1.29.2` | Istio chart version |
 | `KAGENT_CHART_VERSION` | `0.9.4` | kagent chart version |
 | `GITEA_CHART_VERSION` | `12.5.0` | Gitea chart version |
-| `KAGENT_OLLAMA_HOST` | `host.docker.internal:11434` | Ollama endpoint |
-| `KAGENT_OLLAMA_MODEL` | `llama3.2` | Ollama model |
 | `ARCTL_VERSION` | `latest` | `arctl` release to install (`latest` or a tag like `v0.3.3`) |
 | `INSTALL_ARCTL` | `1` | install `arctl` during `up`; set `0` to skip |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
