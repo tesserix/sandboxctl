@@ -183,7 +183,7 @@ _litellm_provision_shared_db() {
 # ============================================================================
 
 install_litellm() {
-  (( ${INSTALL_LITELLM:-1} )) || { log "skipping LiteLLM (INSTALL_LITELLM=0)"; return 0; }
+  (( ${INSTALL_LITELLM:-1} )) || { log "skipping LiteLLM (INSTALL_LITELLM=0; pass --with-litellm or set INSTALL_LITELLM=1 to enable)"; return 0; }
 
   local key; key="$(_litellm_master_key)"
 

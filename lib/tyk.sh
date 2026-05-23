@@ -130,7 +130,7 @@ EOF
 # ============================================================================
 
 install_tyk() {
-  (( ${INSTALL_TYK:-1} )) || { log "skipping Tyk OSS gateway (INSTALL_TYK=0)"; return 0; }
+  (( ${INSTALL_TYK:-1} )) || { log "skipping Tyk OSS gateway (INSTALL_TYK=0; pass --with-tyk or set INSTALL_TYK=1 to enable)"; return 0; }
 
   log "installing Tyk OSS gateway (ns: $TYK_NS, chart ${TYK_CHART}${TYK_CHART_VERSION:+ @ $TYK_CHART_VERSION})"
 

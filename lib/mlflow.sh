@@ -56,7 +56,7 @@ mlflow_present() {
 # ============================================================================
 
 install_mlflow() {
-  (( ${INSTALL_MLFLOW:-1} )) || { log "skipping MLflow (INSTALL_MLFLOW=0)"; return 0; }
+  (( ${INSTALL_MLFLOW:-1} )) || { log "skipping MLflow (INSTALL_MLFLOW=0; pass --with-mlflow or set INSTALL_MLFLOW=1 to enable)"; return 0; }
 
   log "installing MLflow tracking server + UI (ns: $MLFLOW_NS, chart ${MLFLOW_CHART}${MLFLOW_CHART_VERSION:+ @ $MLFLOW_CHART_VERSION})"
 

@@ -50,7 +50,7 @@ portkey_present() {
 # ============================================================================
 
 install_portkey() {
-  (( ${INSTALL_PORTKEY:-0} )) || { log "skipping Portkey gateway (INSTALL_PORTKEY=0)"; return 0; }
+  (( ${INSTALL_PORTKEY:-0} )) || { log "skipping Portkey gateway (INSTALL_PORTKEY=0; pass --with-portkey or set INSTALL_PORTKEY=1 to enable)"; return 0; }
 
   log "installing Portkey AI Gateway (ns: $PORTKEY_NS, image $PORTKEY_IMAGE)"
 
