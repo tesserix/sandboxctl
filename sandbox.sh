@@ -4216,20 +4216,33 @@ EOF
   fi
 }
 
-# Poll Argo CD for an Application to become Synced + Healthy. Times out
-# after 180s with a warning rather than failing — the user can inspect
-# the Argo UI for details and re-run deploy. Wrapped in with_spinner so
-# the user sees a live elapsed counter instead of a silent 30–180s pause.
+# Poll Argo CD for an Application to become Synced + Healthy. Each
+# attempt waits up to 180s; we retry up to ARGO_HEALTH_ATTEMPTS times
+# because some charts (image pulls over slow links, CRD-heavy installs,
+# pre-sync hooks) legitimately need more than one 3-minute window before
+# everything settles. Times out with a warning rather than failing —
+# the user can inspect the Argo UI for details and re-run deploy.
+# Wrapped in with_spinner so the user sees a live elapsed counter
+# instead of a silent pause.
+ARGO_HEALTH_ATTEMPTS="${ARGO_HEALTH_ATTEMPTS:-3}"
 _wait_argo_health() {
   local cname="$1"
-  if with_spinner "[${cname}] waiting for Argo CD to sync (Healthy, up to 180s)" \
-       _wait_argo_health_poll "$cname"; then
-    return 0
-  fi
-  local sync health
+  local attempt
+  for (( attempt=1; attempt<=ARGO_HEALTH_ATTEMPTS; attempt++ )); do
+    local label
+    if (( ARGO_HEALTH_ATTEMPTS == 1 )); then
+      label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s)"
+    else
+      label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s — attempt ${attempt}/${ARGO_HEALTH_ATTEMPTS})"
+    fi
+    if with_spinner "$label" _wait_argo_health_poll "$cname"; then
+      return 0
+    fi
+  done
+  local sync health total=$(( ARGO_HEALTH_ATTEMPTS * 180 ))
   sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
   health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
-  warn "[${cname}] did not become Healthy in 180s (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
+  warn "[${cname}] did not become Healthy in ${total}s across ${ARGO_HEALTH_ATTEMPTS} attempts (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
 }
 
 _wait_argo_health_poll() {
