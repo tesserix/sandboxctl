@@ -66,11 +66,24 @@ aregistry_present() {
   kc get ns "$AREGISTRY_NS" >/dev/null 2>&1
 }
 
+cnpg_present() {
+  kc get ns "$CNPG_NS" >/dev/null 2>&1
+}
+
+# Top-level wrapper so cmd_up / cmd_restart can install the operator
+# stand-alone (without agentregistry's Cluster CR). Calling it
+# explicitly is idempotent — install_aregistry calls install_cnpg_operator
+# unconditionally, but it's a no-op if the helm release already exists.
+install_cnpg() {
+  install_cnpg_operator
+}
+
 # ============================================================================
 # CNPG operator install (idempotent)
 # ============================================================================
 
 install_cnpg_operator() {
+  (( ${INSTALL_CNPG:-0} )) || { log "skipping cloudnative-pg operator (pass --with-cnpg, --with-agentregistry, or --install all to enable)"; return 0; }
   if helmk status "$CNPG_RELEASE" -n "$CNPG_NS" >/dev/null 2>&1; then
     ok "cloudnative-pg operator already installed (ns: $CNPG_NS)"
     return 0

@@ -108,6 +108,14 @@ INSTALL_TYK="${INSTALL_TYK:-0}"
 #   INSTALL_NATS=1   install NATS + JetStream + nats-portfwd (--with-nats)
 INSTALL_NATS="${INSTALL_NATS:-0}"
 
+# CloudNativePG operator — opt-in. The operator runs in cnpg-system and
+# manages Postgres clusters declaratively (used by agentregistry's
+# pgvector-enabled cluster, and reused by LiteLLM when both are enabled).
+# --with-agentregistry implies this; turn it on stand-alone with
+# --with-cnpg if you want a shared Postgres without agentregistry.
+#   INSTALL_CNPG=1   install the cloudnative-pg operator (--with-cnpg)
+INSTALL_CNPG="${INSTALL_CNPG:-0}"
+
 # Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
 # pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
 # CD pulls from that URL — proper GitOps loop without needing external
@@ -2299,7 +2307,8 @@ cmd_up() {
     case "$1" in
       --with-kagent)        INSTALL_KAGENT=1; shift ;;
       --with-arctl)         INSTALL_ARCTL=1; shift ;;
-      --with-agentregistry) INSTALL_AGENTREGISTRY=1; shift ;;
+      --with-cnpg)          INSTALL_CNPG=1; shift ;;
+      --with-agentregistry) INSTALL_AGENTREGISTRY=1; INSTALL_CNPG=1; shift ;;
       --with-nats)          INSTALL_NATS=1; shift ;;
       --with-agentgateway)  INSTALL_AGENTGATEWAY=1; shift ;;
       --with-portkey)       INSTALL_PORTKEY=1; shift ;;
@@ -2312,7 +2321,7 @@ cmd_up() {
       # default, so passing --no-X is a no-op kept only so older docs and
       # scripts keep working. They will be removed once nothing in the
       # team's muscle memory relies on them.
-      --no-arctl|--no-agentregistry|--no-agentgateway|--no-litellm|--no-portkey|--no-mlflow|--no-tyk|--no-ai-gateway|--no-nats)
+      --no-arctl|--no-agentregistry|--no-agentgateway|--no-litellm|--no-portkey|--no-mlflow|--no-tyk|--no-ai-gateway|--no-nats|--no-cnpg)
         shift ;;
       --workers)
         SANDBOX_WORKER_COUNT="${2:-}"
@@ -2323,6 +2332,7 @@ cmd_up() {
           all)
             INSTALL_KAGENT=1
             INSTALL_ARCTL=1
+            INSTALL_CNPG=1
             INSTALL_AGENTREGISTRY=1
             INSTALL_NATS=1
             INSTALL_AGENTGATEWAY=1
@@ -2336,7 +2346,7 @@ cmd_up() {
       -h|--help)
         cat <<EOF
 sandboxctl up [--workers N]
-              [--with-arctl] [--with-agentregistry] [--with-nats] [--with-kagent]
+              [--with-arctl] [--with-cnpg] [--with-agentregistry] [--with-nats] [--with-kagent]
               [--with-agentgateway | --with-ai-gateway | --with-portkey | --with-litellm | --with-mlflow | --with-tyk]
               [--install all]
 
@@ -2368,9 +2378,12 @@ Opt-in add-ons (flag required to enable):
   --with-arctl         agentregistry CLI on the Mac (build/publish/run
                        MCP servers, agents, skills + prompts). Pin with
                        ARCTL_VERSION; SANDBOX_KEEP_ARCTL=1 keeps it on down/purge.
+  --with-cnpg          CloudNativePG operator (Postgres-as-a-CRD).
+                       Implied by --with-agentregistry.
   --with-agentregistry agentregistry server in the cluster, backed by
-                       CloudNativePG Postgres with pgvector. Reached at
+                       a CNPG Postgres with pgvector. Reached at
                        https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+                       Implies --with-cnpg.
   --with-nats          NATS + JetStream + LaunchAgent port-forward (:4222).
                        Reached at nats://${NATS_HOST:-nats.${SANDBOX_DOMAIN}}:${SANDBOX_NATS_PORT:-4222}.
   --with-kagent        kagent (agentic AI controller + UI).
@@ -2408,7 +2421,7 @@ EOF
   # the cross-file reference, hence the explicit export).
   export INSTALL_NATS_CLI
   # Add-on gates consumed by lib/* installers, or by their wrappers below.
-  export INSTALL_ARCTL INSTALL_AGENTREGISTRY INSTALL_NATS
+  export INSTALL_ARCTL INSTALL_AGENTREGISTRY INSTALL_NATS INSTALL_CNPG
   export INSTALL_AGENTGATEWAY INSTALL_LITELLM INSTALL_PORTKEY INSTALL_MLFLOW INSTALL_TYK
 
   require_tools
@@ -2448,6 +2461,9 @@ EOF
     install_kagent
   else
     log "skipping kagent (pass --with-kagent or --install all to enable)"
+  fi
+  if (( INSTALL_CNPG )) && declare -F install_cnpg >/dev/null; then
+    install_cnpg
   fi
   if (( INSTALL_AGENTREGISTRY )) && declare -F install_aregistry >/dev/null; then
     install_aregistry
@@ -2532,9 +2548,11 @@ cmd_bootstrap() {
     case "$1" in
       --repo)
         repo_flag="${2:-}"; shift 2 ;;
-      --with-kagent|--no-arctl|--no-agentregistry|--install|\
-      --with-ai-gateway|--with-litellm|--with-mlflow|--with-tyk|\
-      --no-ai-gateway|--no-litellm|--no-portkey|--no-mlflow|--no-tyk)
+      --with-kagent|--with-arctl|--with-cnpg|--with-agentregistry|--with-nats|\
+      --with-agentgateway|--with-ai-gateway|--with-portkey|--with-litellm|--with-mlflow|--with-tyk|\
+      --no-arctl|--no-cnpg|--no-agentregistry|--no-nats|--no-agentgateway|--no-ai-gateway|\
+      --no-litellm|--no-portkey|--no-mlflow|--no-tyk|\
+      --install)
         # `--install` takes a value (today: "all"). Forward both forms.
         if [[ "$1" == "--install" ]]; then
           up_args+=("$1" "${2:-}"); shift 2
@@ -2566,12 +2584,14 @@ product repo is selected by:
   sandboxctl bootstrap path/to/repo
   sandboxctl bootstrap --repo path/to/repo
   sandboxctl bootstrap --workers 2           # forwarded to 'up' (1–${SANDBOX_WORKER_COUNT_MAX})
-  sandboxctl bootstrap --with-kagent         # forwarded to 'up'
-  sandboxctl bootstrap --no-arctl            # forwarded to 'up'
-  sandboxctl bootstrap --no-agentregistry    # forwarded to 'up'
-  sandboxctl bootstrap --no-ai-gateway       # forwarded to 'up' (skip litellm/portkey/mlflow/tyk)
-  sandboxctl bootstrap --chart custom/chart  # forwarded to 'deploy'
-  sandboxctl bootstrap --no-build            # forwarded to 'deploy'
+  sandboxctl bootstrap --with-kagent          # forwarded to 'up'
+  sandboxctl bootstrap --with-arctl           # forwarded to 'up'
+  sandboxctl bootstrap --with-agentregistry   # forwarded to 'up' (implies --with-cnpg)
+  sandboxctl bootstrap --with-nats            # forwarded to 'up'
+  sandboxctl bootstrap --with-ai-gateway      # forwarded to 'up' (agentgateway+litellm+portkey+mlflow+tyk)
+  sandboxctl bootstrap --install all          # forwarded to 'up' (every add-on)
+  sandboxctl bootstrap --chart custom/chart   # forwarded to 'deploy'
+  sandboxctl bootstrap --no-build             # forwarded to 'deploy'
 
 If the cluster is already up the platform install is skipped — only
 the deploy half runs, so this is also fine to use as your every-day
@@ -2815,8 +2835,11 @@ EOF
   # On restart, re-assert any add-on that's already in the cluster even
   # if its flag wasn't passed — restart should never silently undo what
   # `up --with-X` previously installed. Each lib function is idempotent.
+  if (( ${INSTALL_CNPG:-0} )) || (declare -F cnpg_present >/dev/null && cnpg_present); then
+    if declare -F install_cnpg >/dev/null; then INSTALL_CNPG=1 install_cnpg; fi
+  fi
   if (( ${INSTALL_AGENTREGISTRY:-0} )) || (declare -F aregistry_present >/dev/null && aregistry_present); then
-    if declare -F install_aregistry >/dev/null; then install_aregistry; fi
+    if declare -F install_aregistry >/dev/null; then INSTALL_AGENTREGISTRY=1 INSTALL_CNPG=1 install_aregistry; fi
   fi
   if (( ${INSTALL_AGENTGATEWAY:-0} )) || (declare -F agentgateway_present >/dev/null && agentgateway_present); then
     if declare -F install_agentgateway >/dev/null; then INSTALL_AGENTGATEWAY=1 install_agentgateway; fi
@@ -4655,12 +4678,14 @@ usage:
   sandbox.sh setup-podman   install/configure rootful podman machine (one-time)
   sandbox.sh trust-ca       trust the sandbox root CA in macOS System keychain (sudo)
   sandbox.sh untrust-ca     remove the sandbox root CA from System keychain (sudo)
-  sandbox.sh up [--workers N] [--with-kagent | --install all] [--no-agentregistry] [--no-agentgateway] [--no-ai-gateway] [--with-portkey] [--with-litellm] [--with-mlflow] [--with-tyk]
-                            create cluster + install argocd/kargo/demo/registry/gitea/nats/agentregistry+CNPG + ingress + PKI + hosts + portfwd
-                            (NATS + agentregistry default-on; kagent is opt-in: --with-kagent or --install all)
-                            AI Agentic Gateway: agentgateway default-on (skip with --no-agentgateway);
-                            portkey/litellm/mlflow/tyk opt-in (--with-portkey / --with-litellm / --with-mlflow / --with-tyk);
-                            --with-ai-gateway installs all gateways at once; --no-ai-gateway skips them all
+  sandbox.sh up [--workers N] [--with-arctl] [--with-cnpg] [--with-agentregistry] [--with-nats] [--with-kagent]
+                [--with-agentgateway | --with-ai-gateway | --with-portkey | --with-litellm | --with-mlflow | --with-tyk] [--install all]
+                            create cluster + install core (argocd/kargo/demo/gitea/registry/PKI/Istio/dnsmasq).
+                            Add-ons are opt-in:
+                              --with-arctl / --with-cnpg / --with-agentregistry / --with-nats / --with-kagent
+                              --with-agentgateway (or --with-ai-gateway for all five AI gateways)
+                              --with-portkey / --with-litellm / --with-mlflow / --with-tyk
+                              --install all  (every add-on)
                             --workers N picks the kind worker count (1–3, default 1)
   sandbox.sh down           remove cluster + LaunchAgent + /etc/hosts + keychain CA (keeps ~/.sandbox)
   sandbox.sh purge          down + remove ~/.sandbox (prompts for confirmation)
@@ -4719,13 +4744,17 @@ env overrides:
   NATS_HOST                   user-facing NATS hostname (default: nats.\${SANDBOX_DOMAIN})
   NATS_JETSTREAM_SIZE         PVC size for JetStream file store (default: 2Gi)
   SANDBOX_NATS_PORT           Mac-side TCP port for nats:// (default: 4222)
-  INSTALL_AGENTREGISTRY       set to 0 (or pass --no-agentregistry) to skip agentregistry + CNPG
+  INSTALL_ARCTL               set to 1 (or pass --with-arctl) to install the arctl CLI on the Mac
+  INSTALL_CNPG                set to 1 (or pass --with-cnpg) to install the CloudNativePG operator
+  INSTALL_AGENTREGISTRY       set to 1 (or pass --with-agentregistry) to install agentregistry + CNPG
   AREGISTRY_CHART_VERSION     pin agentregistry helm chart version (default: 0.3.3)
   AREGISTRY_IMAGE_TAG         pin agentregistry server image tag (default: v0.3.3)
   AREGISTRY_PG_IMAGE          CNPG postgres image with pgvector (default: ghcr.io/cloudnative-pg/postgresql:17.9-standard-trixie)
   AREGISTRY_PG_STORAGE        PVC size for the CNPG cluster (default: 2Gi)
   CNPG_CHART_VERSION          pin cloudnative-pg operator chart version (default: 0.28.2)
-  INSTALL_AGENTGATEWAY        set to 0 (or pass --no-agentgateway) to skip the default agentgateway proxy
+  INSTALL_NATS                set to 1 (or pass --with-nats) to install NATS + JetStream
+  INSTALL_KAGENT              set to 1 (or pass --with-kagent) to install kagent
+  INSTALL_AGENTGATEWAY        set to 1 (or pass --with-agentgateway) to install the agentgateway proxy
   INSTALL_LITELLM             set to 1 (or pass --with-litellm) to install the LiteLLM proxy
   INSTALL_PORTKEY             set to 1 (or pass --with-portkey) to install the Portkey AI gateway
   INSTALL_MLFLOW              set to 1 (or pass --with-mlflow) to install MLflow

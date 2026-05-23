@@ -59,106 +59,75 @@ Open `https://<your-chart-name>.sandbox.app:8443` in your browser.
 
 ## What's running after `sandboxctl up`
 
-| URL | What |
-|---|---|
-| `https://argo.sandbox.app:8443` | Argo CD UI |
-| `https://kargo.sandbox.app:8443` | Kargo UI |
-| `https://kagent.sandbox.app:8443` | [kagent](https://github.com/kagent-dev/kagent) — agentic AI controller |
-| `https://demo-app.sandbox.app:8443` | a tiny demo deployment |
-| `https://agentgateway.sandbox.app:8443` | [agentgateway](https://agentgateway.dev) — default AI Agentic Gateway (Gateway-API-native; MCP / A2A / agent-to-LLM) |
-| `nats://nats.sandbox.app:4222` | NATS + JetStream (TCP+TLS); also `wss://nats.sandbox.app:8443` |
-| `localhost:5050` | in-cluster Docker registry (push target for `sandboxctl build`) |
+A plain `sandboxctl up` (no flags) is intentionally small — it only stands
+up the pieces you'd reach for on day one. Everything else is opt-in
+behind a `--with-*` flag. Pass `--install all` for the kitchen-sink demo.
 
-`sandboxctl up` also installs the [`arctl`](https://aregistry.ai)
-(agentregistry) CLI onto your Mac — for building, publishing, and running
-MCP servers, agents, skills, and prompts. Skip it with `sandboxctl up
---no-arctl` (or `INSTALL_ARCTL=0`); pin a version with `ARCTL_VERSION=v0.3.3`.
-`sandboxctl down` / `purge` remove it again (keep it with `SANDBOX_KEEP_ARCTL=1`).
+### Default-on (always installed)
 
-All TLS is signed by a per-install root CA that `sandboxctl up` trusts in
-your macOS System keychain — no browser warnings, no manual port-forwards.
+| Component | URL / port | What it gives you |
+|---|---|---|
+| **Argo CD** | `https://argo.sandbox.app:8443` | GitOps controller (the cluster's source of truth) |
+| **Kargo** | `https://kargo.sandbox.app:8443` | Promotion pipelines on top of Argo |
+| **Demo app** | `https://demo-app.sandbox.app:8443` | A tiny deployment so the cluster ships with something live |
+| **Gitea** | `https://gitea.sandbox.app:8443` | In-cluster git server backing `sandboxctl deploy` |
+| **In-cluster registry** | `localhost:5050` (NodePort `30050`) | Push target for `sandboxctl build` / `docker push` |
+| **dnsmasq + DNS** | `/etc/resolver/sandbox.app` → `127.0.0.1` | Wildcard `*.sandbox.app` resolution on the host |
+| Plumbing | — | cert-manager + per-install root CA (trusted in System keychain), reflector, reloader, Istio ambient + ingress, kubectl port-forward LaunchAgent |
 
-`sandboxctl creds` prints admin passwords on demand. Each install
-generates its own — nothing is hard-coded.
+All TLS is signed by a per-install root CA — no browser warnings, no
+manual port-forwards. `sandboxctl creds` prints admin passwords on
+demand; each install generates its own and nothing is hard-coded.
 
-### AI Agentic Gateway
+### Opt-in add-ons
 
-`sandboxctl up` / `bootstrap` ship **agentgateway** as the default AI
-Agentic Gateway: a Linux-Foundation-hosted, [Gateway-API-native](https://gateway-api.sigs.k8s.io/)
-proxy purpose-built for AI traffic — agent-to-LLM, agent-to-tool (MCP),
-agent-to-agent (A2A). It comes up in its own namespace behind a trusted
-HTTPS URL, with the upstream Kubernetes Gateway API CRDs preinstalled, and
-accepts `HTTPRoute`s from any namespace — drop one in for your LLM
-provider, MCP backend, or per-product agent route without touching
-sandboxctl.
+Pass the flag to `sandboxctl up` (or `bootstrap`); flags are forwarded
+through, and `up` is idempotent so re-running with a new flag adds the
+piece without disturbing the rest.
 
-Four legacy alternatives — Portkey, LiteLLM, MLflow, Tyk — are **opt-in**
-and stand up side-by-side so you can compare them. Each is a
-self-contained lib (`lib/agentgateway.sh`, `lib/litellm.sh`,
-`lib/portkey.sh`, `lib/mlflow.sh`, `lib/tyk.sh`) wired into `up`,
-`restart`, `status`, and `creds` exactly like NATS/agentregistry.
-
-| Option | Default | URL | What it gives you |
+| Component | Flag | URL / port | What it gives you |
 |---|---|---|---|
-| **agentgateway** | on | `https://agentgateway.sandbox.app:8443` | Gateway-API-native proxy for AI traffic (MCP / A2A / LLM); attach `HTTPRoute`s from any ns |
-| **Portkey** | `--with-portkey` | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs |
-| **LiteLLM** | `--with-litellm` | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers, one API + master key, shared-CNPG Postgres |
-| **MLflow** | `--with-mlflow` | `https://mlflow.sandbox.app:8443` | Experiment tracking, model registry, observability UI |
-| **Tyk OSS** | `--with-tyk` | `https://tyk.sandbox.app:8443` (`/hello`) | Open-source API gateway — rate-limit/auth/quotas in front of any upstream |
+| **arctl** (CLI on the Mac) | `--with-arctl` | binary in `/usr/local/bin/arctl` | [agentregistry](https://aregistry.ai) CLI — build/publish/run MCP servers, agents, skills, prompts. Pin with `ARCTL_VERSION`. `SANDBOX_KEEP_ARCTL=1` keeps it on `down`/`purge`. |
+| **CloudNativePG operator** | `--with-cnpg` | (operator only) | Postgres-as-a-CRD; foundation for shared Postgres clusters. Implied by `--with-agentregistry`. |
+| **agentregistry server** | `--with-agentregistry` | `https://aregistry.sandbox.app:8443` | In-cluster registry for MCP/agents/skills, backed by a CNPG Postgres with `pgvector` (semantic search). Implies `--with-cnpg`. |
+| **NATS + JetStream** | `--with-nats` | `nats://nats.sandbox.app:4222` (also `wss://nats.sandbox.app:8443`) | Pub/sub + persistent streams. Adds a LaunchAgent that port-forwards `:4222` to the host. |
+| **kagent** | `--with-kagent` | `https://kagent.sandbox.app:8443` | [kagent](https://github.com/kagent-dev/kagent) — agentic AI controller + UI (controller-only install; configure model providers out-of-band). |
+| **agentgateway** | `--with-agentgateway` | `https://agentgateway.sandbox.app:8443` | [agentgateway](https://agentgateway.dev) — Linux-Foundation-hosted, [Gateway-API-native](https://gateway-api.sigs.k8s.io/) proxy for AI traffic (MCP / A2A / agent-to-LLM). Drop in `HTTPRoute`s from any namespace. |
+| **Portkey** | `--with-portkey` | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS AI gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs. |
+| **LiteLLM** | `--with-litellm` | `https://litellm.sandbox.app:8443` (UI `/ui`) | OpenAI-compatible proxy for 100+ providers. Reuses the shared CNPG cluster when `--with-agentregistry` (or `--with-cnpg`) is also on; otherwise falls back to the chart's bundled standalone Postgres. |
+| **MLflow** | `--with-mlflow` | `https://mlflow.sandbox.app:8443` | Experiment tracking + model registry UI. |
+| **Tyk OSS** | `--with-tyk` | `https://tyk.sandbox.app:8443` (`/hello`) | Open-source API gateway — rate-limit/auth/quotas in front of any upstream. (Bundled Redis is sandbox-grade: single replica, no PVC.) |
+| **All AI gateways at once** | `--with-ai-gateway` | — | Umbrella: enables agentgateway + Portkey + LiteLLM + MLflow + Tyk. |
+| **Kitchen sink** | `--install all` | — | Every opt-in above (full demo install). |
 
 ```sh
-sandboxctl up                     # agentgateway only (default)
-sandboxctl up --with-litellm      # add LiteLLM (~700 MB image, ~1-2 GB RAM)
-sandboxctl up --with-portkey      # add Portkey (light, stateless)
-sandboxctl up --with-ai-gateway   # install ALL gateways at once (agentgateway+portkey+litellm+mlflow+tyk)
-sandboxctl up --no-agentgateway   # skip the default agentgateway only
-sandboxctl up --no-ai-gateway     # skip every gateway (lightest up)
-sandboxctl creds                  # URLs, master keys, API secrets, and try-it curl commands for each
+sandboxctl up                                    # core only
+sandboxctl up --with-agentgateway                # add agentgateway
+sandboxctl up --with-agentregistry --with-arctl  # agentregistry + CLI (pulls in CNPG)
+sandboxctl up --with-litellm                     # LiteLLM with the chart's standalone Postgres
+sandboxctl up --with-cnpg --with-litellm         # LiteLLM on a shared CNPG cluster (no agentregistry)
+sandboxctl up --with-ai-gateway                  # all five AI gateways
+sandboxctl up --install all                      # everything
+sandboxctl creds                                 # URLs, admin creds, master keys, copy-paste curl examples
 ```
 
 agentgateway is configured with `allowedRoutes.namespaces.from=All`, so
 any chart in any namespace can attach an `HTTPRoute` whose `parentRefs`
-points at `agentgateway-system/agentgateway-proxy` — that's the integration
-hook for wiring your local-dev workloads in later. `sandboxctl creds`
-prints a copy-paste `HTTPRoute` template under the agentgateway block.
+points at `agentgateway-system/agentgateway-proxy` — that's the
+integration hook for wiring your local-dev workloads in later.
+`sandboxctl creds` prints a copy-paste `HTTPRoute` template under the
+agentgateway block.
 
 Each opt-in tool's master key / API secret is generated per-install and
-persisted under `~/.sandboxctl/` (printed by `sandboxctl creds`). LiteLLM
-**reuses the CloudNativePG cluster the platform already runs for
-agentregistry** — it just adds a `litellm` database on that one cluster,
-so there's no second Postgres pod. Set `LITELLM_DB_MODE=standalone` to use
-the chart's bundled Postgres instead; it also falls back automatically
-when that cluster isn't present (`--no-agentregistry`).
-Tyk's bundled Redis is sandbox-grade (single replica, no PVC); pin chart
-versions or point at durable backends via the env overrides in
-`sandboxctl up --help`. Note the graphical **Tyk Dashboard**
-is a licensed component and is *not* part of Tyk OSS — the gateway here is
-driven by its control API + API-definition files.
+persisted under `~/.sandboxctl/` (printed by `sandboxctl creds`). The
+graphical **Tyk Dashboard** is a licensed component and is *not* part of
+Tyk OSS — the gateway here is driven by its control API + API-definition
+files.
 
-## Optional components
-
-Some pieces are **off by default** (heavier, not everyone needs them). To
-turn one on, pass its `--with-…` flag to `up` (or `bootstrap`). The default-on
-pieces have matching `--no-…` flags to leave them out.
-
-| Want to… | Command |
-|---|---|
-| Add Portkey (OSS gateway + console) | `sandboxctl up --with-portkey` |
-| Add LiteLLM (OpenAI-compatible proxy + UI) | `sandboxctl up --with-litellm` |
-| Add MLflow (tracking + UI) | `sandboxctl up --with-mlflow` |
-| Add Tyk OSS API gateway | `sandboxctl up --with-tyk` |
-| Add kagent (agentic AI controller) | `sandboxctl up --with-kagent` |
-| **Install every AI gateway at once** | `sandboxctl up --with-ai-gateway` |
-| Add several specific ones | `sandboxctl up --with-portkey --with-litellm --with-mlflow` |
-| Skip agentgateway (the default-on one) | `sandboxctl up --no-agentgateway` |
-| Skip all AI gateways | `sandboxctl up --no-ai-gateway` |
-| Skip agentregistry + CNPG | `sandboxctl up --no-agentregistry` |
-
-**Adding one to a cluster that's already up?** Just run the same command —
-`up` is idempotent, so `sandboxctl up --with-mlflow` on a running cluster
-installs only the new piece and leaves everything else untouched. The flags
-also work through `bootstrap` (they're forwarded to `up`). `sandboxctl up
---help` lists every toggle and its env-var equivalent (e.g. `INSTALL_MLFLOW=1`).
+`sandboxctl restart` re-asserts whatever you previously opted into (it
+detects components by namespace presence), so it never silently
+uninstalls something. Removing an add-on means `sandboxctl down` (which
+wipes the cluster) — there is no per-component uninstaller today.
 
 ## Deploying your own app
 
@@ -479,14 +448,18 @@ Defaults work for most people. Override via env vars:
 | `KAGENT_CHART_VERSION` | `0.9.4` | kagent chart version |
 | `GITEA_CHART_VERSION` | `12.5.0` | Gitea chart version |
 | `ARCTL_VERSION` | `latest` | `arctl` release to install (`latest` or a tag like `v0.3.3`) |
-| `INSTALL_ARCTL` | `1` | install `arctl` during `up`; set `0` to skip |
+| `INSTALL_ARCTL` | `0` | install `arctl` during `up` (opt-in; `--with-arctl` or `INSTALL_ARCTL=1`) |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
 | `ARCTL_INSTALL_DIR` | `/usr/local/bin` | where the `arctl` binary is installed |
-| `INSTALL_AGENTGATEWAY` | `1` | agentgateway proxy (default-on; `--no-agentgateway` to skip) |
-| `INSTALL_PORTKEY` | `0` | Portkey gateway (opt-in; `--with-portkey` or `INSTALL_PORTKEY=1`) |
-| `INSTALL_LITELLM` | `0` | LiteLLM proxy (opt-in; `--with-litellm` or `INSTALL_LITELLM=1`) |
-| `INSTALL_MLFLOW` | `0` | MLflow (opt-in; `--with-mlflow` or `INSTALL_MLFLOW=1`) |
-| `INSTALL_TYK` | `0` | Tyk OSS gateway (opt-in; `--with-tyk` or `INSTALL_TYK=1`) |
+| `INSTALL_CNPG` | `0` | CloudNativePG operator (opt-in; `--with-cnpg`; implied by `--with-agentregistry`) |
+| `INSTALL_AGENTREGISTRY` | `0` | agentregistry server + CNPG cluster (opt-in; `--with-agentregistry`) |
+| `INSTALL_NATS` | `0` | NATS + JetStream (opt-in; `--with-nats`) |
+| `INSTALL_KAGENT` | `0` | kagent controller + UI (opt-in; `--with-kagent`) |
+| `INSTALL_AGENTGATEWAY` | `0` | agentgateway proxy (opt-in; `--with-agentgateway`) |
+| `INSTALL_PORTKEY` | `0` | Portkey gateway (opt-in; `--with-portkey`) |
+| `INSTALL_LITELLM` | `0` | LiteLLM proxy (opt-in; `--with-litellm`) |
+| `INSTALL_MLFLOW` | `0` | MLflow (opt-in; `--with-mlflow`) |
+| `INSTALL_TYK` | `0` | Tyk OSS gateway (opt-in; `--with-tyk`) |
 | `AGENTGATEWAY_CHART_VERSION` | `v1.2.0` | pin the agentgateway OCI chart version |
 | `GATEWAY_API_VERSION` | `v1.5.0` | pin the upstream Kubernetes Gateway API CRDs version agentgateway installs |
 | `LITELLM_CHART_VERSION` | `latest` | pin the `litellm-helm` OCI chart version |
