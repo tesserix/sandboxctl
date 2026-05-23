@@ -88,11 +88,12 @@ AGENTGATEWAY_ADMIN_PORT="${AGENTGATEWAY_ADMIN_PORT:-15000}"
 
 AGENTGATEWAY_HOST="${AGENTGATEWAY_HOST:-agentgateway.${SANDBOX_DOMAIN}}"
 
-# Gate: default-on. The control plane is small (~150 MB total across the
-# controller and one data-plane proxy pod) so it fits in the default 4 CPU
-# / 6 GB podman VM. Disable with `up --no-agentgateway` or
-# INSTALL_AGENTGATEWAY=0.
-INSTALL_AGENTGATEWAY="${INSTALL_AGENTGATEWAY:-1}"
+# Gate: opt-in. The control plane is small (~150 MB total across the
+# controller and one data-plane proxy pod) and fits comfortably in the
+# default 4 CPU / 6 GB podman VM, but it's still cluster surface area
+# nobody pays for unless they ask for it. Enable with
+# `up --with-agentgateway` (or --with-ai-gateway), or INSTALL_AGENTGATEWAY=1.
+INSTALL_AGENTGATEWAY="${INSTALL_AGENTGATEWAY:-0}"
 
 # ============================================================================
 # Predicate
@@ -108,7 +109,7 @@ agentgateway_present() {
 # ============================================================================
 
 install_agentgateway() {
-  (( ${INSTALL_AGENTGATEWAY:-1} )) || { log "skipping agentgateway (INSTALL_AGENTGATEWAY=0; default-on — re-enable with --with-agentgateway or INSTALL_AGENTGATEWAY=1)"; return 0; }
+  (( ${INSTALL_AGENTGATEWAY:-0} )) || { log "skipping agentgateway (pass --with-agentgateway, --with-ai-gateway, or --install all to enable)"; return 0; }
 
   log "installing agentgateway (ns: $AGENTGATEWAY_NS, chart $AGENTGATEWAY_CHART @ $AGENTGATEWAY_CHART_VERSION)"
 

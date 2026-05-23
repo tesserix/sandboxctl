@@ -59,48 +59,54 @@ KAGENT_NS="${KAGENT_NS:-kagent}"
 KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
 
 # arctl — the agentregistry CLI (https://aregistry.ai). Installed onto the
-# *Mac* (not the cluster) by `up`/`bootstrap` so the sandbox can build,
-# publish, and run MCP servers, agents, skills + prompts; removed again by
-# `down`/`purge`. We fetch the release binary directly and verify its
-# sha256 rather than piping the upstream installer to a shell.
+# *Mac* (not the cluster) by `up`/`bootstrap` when --with-arctl is passed,
+# so the sandbox can build, publish, and run MCP servers, agents, skills
+# + prompts; removed again by `down`/`purge`. We fetch the release binary
+# directly and verify its sha256 rather than piping the upstream
+# installer to a shell.
 #   ARCTL_VERSION   tag to install (default 'latest' tracks the newest
 #                   GitHub release; pin e.g. v0.3.3 for reproducibility)
-#   INSTALL_ARCTL=0      skip the install during up/bootstrap
+#   INSTALL_ARCTL=1      install arctl during up/bootstrap (--with-arctl)
 #   SANDBOX_KEEP_ARCTL=1 keep the binary on down/purge
 ARCTL_REPO="${ARCTL_REPO:-agentregistry-dev/agentregistry}"
 ARCTL_VERSION="${ARCTL_VERSION:-latest}"
 ARCTL_INSTALL_DIR="${ARCTL_INSTALL_DIR:-/usr/local/bin}"
-INSTALL_ARCTL="${INSTALL_ARCTL:-1}"
+INSTALL_ARCTL="${INSTALL_ARCTL:-0}"
 
-# agentregistry server — deployed *into* the cluster and exposed at
-# https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}. Backed by a
-# CloudNativePG-managed Postgres with the pgvector extension preloaded
-# (so embeddings + semantic search work, unlike the chart's bundled
-# postgres:18 which has no pgvector). All knobs live in lib/aregistry.sh;
-# only the gate flag belongs here so cmd_up can read it before the lib
-# is sourced.
-#   INSTALL_AGENTREGISTRY=0   skip agentregistry + CNPG entirely
-INSTALL_AGENTREGISTRY="${INSTALL_AGENTREGISTRY:-1}"
+# agentregistry server — deployed *into* the cluster (when opted in) and
+# exposed at https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+# Backed by a CloudNativePG-managed Postgres with the pgvector extension
+# preloaded (so embeddings + semantic search work, unlike the chart's
+# bundled postgres:18 which has no pgvector). All knobs live in
+# lib/aregistry.sh; only the gate flag belongs here so cmd_up can read it
+# before the lib is sourced.
+#   INSTALL_AGENTREGISTRY=1   install agentregistry + CNPG (--with-agentregistry)
+INSTALL_AGENTREGISTRY="${INSTALL_AGENTREGISTRY:-0}"
 
-# AI Agentic Gateway — agentgateway (https://agentgateway.dev) is the
-# default-on, Gateway-API-native proxy for AI traffic (MCP, A2A,
-# agent-to-LLM, agent-to-tool). The four legacy alternatives — Portkey,
-# LiteLLM, MLflow, Tyk — are all opt-in so the default `up` stays small on
-# a laptop VM. Turn them on individually (--with-portkey / --with-litellm /
-# --with-mlflow / --with-tyk) or all of them at once with --with-ai-gateway
-# (which also leaves agentgateway on). The gates live in their libs
-# (lib/{agentgateway,litellm,portkey,mlflow,tyk}.sh) and are read at install
-# time, so the flag parser below (or an env var) can flip any of them.
-#   INSTALL_AGENTGATEWAY=0  skip agentgateway              (default on;  --no-agentgateway)
-#   INSTALL_PORTKEY=1       install Portkey AI gateway    (default off; --with-portkey)
-#   INSTALL_LITELLM=1       install LiteLLM proxy         (default off; --with-litellm)
-#   INSTALL_MLFLOW=1        install MLflow tracking + UI  (default off; --with-mlflow)
-#   INSTALL_TYK=1           install Tyk OSS API gateway   (default off; --with-tyk)
-INSTALL_AGENTGATEWAY="${INSTALL_AGENTGATEWAY:-1}"
+# AI Agentic Gateway — every gateway is opt-in so a plain `sandboxctl up`
+# stays small on a laptop VM. Turn them on individually
+# (--with-agentgateway / --with-portkey / --with-litellm / --with-mlflow /
+# --with-tyk) or all at once with --with-ai-gateway. The gates live in
+# their libs (lib/{agentgateway,litellm,portkey,mlflow,tyk}.sh) and are
+# read at install time, so the flag parser below (or an env var) can
+# flip any of them.
+#   INSTALL_AGENTGATEWAY=1  install agentgateway          (--with-agentgateway)
+#   INSTALL_PORTKEY=1       install Portkey AI gateway    (--with-portkey)
+#   INSTALL_LITELLM=1       install LiteLLM proxy         (--with-litellm)
+#   INSTALL_MLFLOW=1        install MLflow tracking + UI  (--with-mlflow)
+#   INSTALL_TYK=1           install Tyk OSS API gateway   (--with-tyk)
+INSTALL_AGENTGATEWAY="${INSTALL_AGENTGATEWAY:-0}"
 INSTALL_LITELLM="${INSTALL_LITELLM:-0}"
 INSTALL_PORTKEY="${INSTALL_PORTKEY:-0}"
 INSTALL_MLFLOW="${INSTALL_MLFLOW:-0}"
 INSTALL_TYK="${INSTALL_TYK:-0}"
+
+# NATS + JetStream — opt-in. When enabled, installs the chart, issues a
+# server cert, wires the TLS-passthrough route through the Istio gateway,
+# and (on macOS) installs a LaunchAgent that port-forwards :4222 to the
+# host. Skipped by default to keep `up` quick.
+#   INSTALL_NATS=1   install NATS + JetStream + nats-portfwd (--with-nats)
+INSTALL_NATS="${INSTALL_NATS:-0}"
 
 # Gitea: in-cluster git server that backs `sandboxctl deploy`. The CLI
 # pushes the local chart subtree to gitea-http.gitea.svc:3000 and Argo
@@ -2282,47 +2288,63 @@ start_sudo_keepalive() {
 # ============================================================================
 
 cmd_up() {
-  # Optional add-ons. Off by default — they're useful for some users
-  # but slow down `up` and pull a noticeable amount of disk. Toggle on
-  # individually (--with-kagent) or all at once (--install all).
+  # All add-ons are opt-in. A plain `sandboxctl up` brings up only the
+  # core: kind + cert-manager + PKI + Argo CD + Kargo + reflector +
+  # reloader + in-cluster registry (NodePort 30050) + Gitea + Istio
+  # ambient + routes + /etc/hosts + dnsmasq + LaunchAgent port-forward +
+  # demo app. Toggle add-ons individually (--with-X) or all at once
+  # (--install all).
   INSTALL_KAGENT=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --with-kagent)    INSTALL_KAGENT=1; shift ;;
-      --no-arctl)       INSTALL_ARCTL=0; shift ;;
-      --no-nats-cli)    INSTALL_NATS_CLI=0; shift ;;
-      --no-agentregistry) INSTALL_AGENTREGISTRY=0; shift ;;
-      --with-agentgateway) INSTALL_AGENTGATEWAY=1; shift ;;
-      --no-agentgateway)   INSTALL_AGENTGATEWAY=0; shift ;;
-      --with-portkey)   INSTALL_PORTKEY=1; shift ;;
-      --with-litellm)   INSTALL_LITELLM=1; shift ;;
-      --with-mlflow)    INSTALL_MLFLOW=1; shift ;;
-      --with-tyk)       INSTALL_TYK=1; shift ;;
-      --with-ai-gateway) INSTALL_AGENTGATEWAY=1; INSTALL_LITELLM=1; INSTALL_PORTKEY=1; INSTALL_MLFLOW=1; INSTALL_TYK=1; shift ;;
-      --no-litellm)     INSTALL_LITELLM=0; shift ;;
-      --no-portkey)     INSTALL_PORTKEY=0; shift ;;
-      --no-mlflow)      INSTALL_MLFLOW=0; shift ;;
-      --no-tyk)         INSTALL_TYK=0; shift ;;
-      --no-ai-gateway)  INSTALL_AGENTGATEWAY=0; INSTALL_LITELLM=0; INSTALL_PORTKEY=0; INSTALL_MLFLOW=0; INSTALL_TYK=0; shift ;;
+      --with-kagent)        INSTALL_KAGENT=1; shift ;;
+      --with-arctl)         INSTALL_ARCTL=1; shift ;;
+      --with-agentregistry) INSTALL_AGENTREGISTRY=1; shift ;;
+      --with-nats)          INSTALL_NATS=1; shift ;;
+      --with-agentgateway)  INSTALL_AGENTGATEWAY=1; shift ;;
+      --with-portkey)       INSTALL_PORTKEY=1; shift ;;
+      --with-litellm)       INSTALL_LITELLM=1; shift ;;
+      --with-mlflow)        INSTALL_MLFLOW=1; shift ;;
+      --with-tyk)           INSTALL_TYK=1; shift ;;
+      --with-ai-gateway)    INSTALL_AGENTGATEWAY=1; INSTALL_LITELLM=1; INSTALL_PORTKEY=1; INSTALL_MLFLOW=1; INSTALL_TYK=1; shift ;;
+      --no-nats-cli)        INSTALL_NATS_CLI=0; shift ;;
+      # Deprecated --no-* flags. The named components are now opt-in by
+      # default, so passing --no-X is a no-op kept only so older docs and
+      # scripts keep working. They will be removed once nothing in the
+      # team's muscle memory relies on them.
+      --no-arctl|--no-agentregistry|--no-agentgateway|--no-litellm|--no-portkey|--no-mlflow|--no-tyk|--no-ai-gateway|--no-nats)
+        shift ;;
       --workers)
         SANDBOX_WORKER_COUNT="${2:-}"
         validate_worker_count "$SANDBOX_WORKER_COUNT" "sandboxctl up"
         shift 2 ;;
       --install)
         case "${2:-}" in
-          all)          INSTALL_KAGENT=1; shift 2 ;;
+          all)
+            INSTALL_KAGENT=1
+            INSTALL_ARCTL=1
+            INSTALL_AGENTREGISTRY=1
+            INSTALL_NATS=1
+            INSTALL_AGENTGATEWAY=1
+            INSTALL_LITELLM=1
+            INSTALL_PORTKEY=1
+            INSTALL_MLFLOW=1
+            INSTALL_TYK=1
+            shift 2 ;;
           *) die "--install: expected 'all' (got '${2:-}')" ;;
         esac ;;
       -h|--help)
         cat <<EOF
-sandboxctl up [--workers N] [--with-kagent] [--install all]
-              [--no-arctl] [--no-nats-cli] [--no-agentregistry]
-              [--no-agentgateway | --with-ai-gateway | --with-portkey | --with-litellm | --with-mlflow | --with-tyk | --no-ai-gateway]
+sandboxctl up [--workers N]
+              [--with-arctl] [--with-agentregistry] [--with-nats] [--with-kagent]
+              [--with-agentgateway | --with-ai-gateway | --with-portkey | --with-litellm | --with-mlflow | --with-tyk]
+              [--install all]
 
-Bring the local sandbox cluster up: kind + cert-manager + Argo CD +
-Kargo + Istio + in-cluster registry + Gitea + NATS (JetStream) + a demo
-app + agentregistry, all wired behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
-NATS is also reachable at nats://${NATS_HOST:-nats.${SANDBOX_DOMAIN}}:${SANDBOX_NATS_PORT:-4222}.
+Bring the local sandbox cluster up. Default install (no flags) is the
+small core: kind + cert-manager + PKI + Argo CD + Kargo + reflector +
+reloader + Istio ambient + in-cluster registry (NodePort 30050) + Gitea
++ a demo app, all wired behind https://*.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+via dnsmasq (/etc/resolver/${SANDBOX_DOMAIN}). Add-ons are opt-in.
 
 Cluster topology:
   --workers N      Number of kind worker nodes (default 1, max ${SANDBOX_WORKER_COUNT_MAX}).
@@ -2333,40 +2355,45 @@ Cluster topology:
                    Mac runs out of host memory before the cluster does.
                    Env override: SANDBOX_WORKER_COUNT=N sandboxctl up.
 
-In the cluster (default-on):
-  agentregistry    https://aregistry.ai server backed by a CloudNativePG
-                   Postgres with pgvector preloaded (so embeddings +
-                   semantic search work). Reached at
-                   https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
-                   Skip with --no-agentregistry (or INSTALL_AGENTREGISTRY=0).
+Default-on (always installed):
+  Argo CD          https://argo.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  Kargo            https://kargo.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  Demo app         Argo Application syncing manifests/demo-app
+  Gitea            in-cluster git server backing 'sandboxctl deploy'
+                   https://gitea.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  Registry         in-cluster registry (NodePort 30050, host-side :5050)
+  dnsmasq + DNS    /etc/resolver/${SANDBOX_DOMAIN} → 127.0.0.1 (wildcard)
 
-AI Agentic Gateway:
- Default-on:
-  agentgateway     Linux-Foundation Gateway-API-native proxy for AI traffic
-                   (MCP / A2A / agent-to-LLM). Drop in HTTPRoutes from any
-                   namespace to add LLM providers, MCP backends, or agent
-                   routes. https://agentgateway.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}   (--no-agentgateway)
- Opt-in alternatives (each in its own namespace; enable when you want them):
-  --with-portkey   Portkey OSS gateway + console UI (/public/) — one light,
-                   stateless pod. https://portkey.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
-  --with-litellm   OpenAI-compatible LLM proxy (UI at /ui). ~700 MB image +
-                   ~1-2 GB RAM; reuses the shared CNPG Postgres (a 'litellm'
-                   db on agentregistry's cluster). https://litellm.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
-  --with-mlflow    MLflow experiment tracking + model registry UI.
-                   https://mlflow.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
-  --with-tyk       Tyk OSS API gateway (+ bundled Redis).
-                   https://tyk.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
-  --with-ai-gateway  Install all gateways at once (agentgateway+portkey+litellm+mlflow+tyk).
-  --no-ai-gateway  Skip them all (including the default-on agentgateway).
+Opt-in add-ons (flag required to enable):
+  --with-arctl         agentregistry CLI on the Mac (build/publish/run
+                       MCP servers, agents, skills + prompts). Pin with
+                       ARCTL_VERSION; SANDBOX_KEEP_ARCTL=1 keeps it on down/purge.
+  --with-agentregistry agentregistry server in the cluster, backed by
+                       CloudNativePG Postgres with pgvector. Reached at
+                       https://aregistry.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}.
+  --with-nats          NATS + JetStream + LaunchAgent port-forward (:4222).
+                       Reached at nats://${NATS_HOST:-nats.${SANDBOX_DOMAIN}}:${SANDBOX_NATS_PORT:-4222}.
+  --with-kagent        kagent (agentic AI controller + UI).
+                       https://kagent.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
 
-Also installs onto the Mac (not the cluster):
-  arctl            agentregistry CLI (https://aregistry.ai) — build/publish/
-                   run MCP servers, agents, skills + prompts. Skip with
-                   --no-arctl (or INSTALL_ARCTL=0); pin with ARCTL_VERSION.
+AI Agentic Gateway add-ons (each in its own namespace):
+  --with-agentgateway  Linux-Foundation Gateway-API-native proxy for AI
+                       traffic (MCP / A2A / agent-to-LLM). Drop in
+                       HTTPRoutes from any namespace.
+                       https://agentgateway.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  --with-portkey       Portkey OSS gateway + console UI (/public/).
+                       https://portkey.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  --with-litellm       OpenAI-compatible LLM proxy (UI at /ui). Reuses
+                       a shared CNPG Postgres (requires --with-agentregistry).
+                       https://litellm.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  --with-mlflow        MLflow experiment tracking + model registry UI.
+                       https://mlflow.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  --with-tyk           Tyk OSS API gateway (+ bundled Redis).
+                       https://tyk.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+  --with-ai-gateway    All five gateways at once.
 
-Add-ons (off by default — they take longer and use more memory):
-  --with-kagent    Install kagent (agentic AI controller + UI).
-  --install all    Install every add-on. Today: kagent.
+Convenience:
+  --install all        Enable every add-on (full demo install).
 EOF
         return 0 ;;
       *) die "unknown flag: $1 (try 'sandboxctl up --help')" ;;
@@ -2380,8 +2407,8 @@ EOF
   # INSTALL_NATS_CLI is consumed by lib/nats.sh (shellcheck can't see
   # the cross-file reference, hence the explicit export).
   export INSTALL_NATS_CLI
-  # AI Agentic Gateway gates are consumed by
-  # lib/{agentgateway,litellm,portkey,mlflow,tyk}.sh.
+  # Add-on gates consumed by lib/* installers, or by their wrappers below.
+  export INSTALL_ARCTL INSTALL_AGENTREGISTRY INSTALL_NATS
   export INSTALL_AGENTGATEWAY INSTALL_LITELLM INSTALL_PORTKEY INSTALL_MLFLOW INSTALL_TYK
 
   require_tools
@@ -2394,7 +2421,11 @@ EOF
     start_sudo_keepalive
   fi
 
-  install_arctl
+  if (( INSTALL_ARCTL )); then
+    install_arctl
+  else
+    log "skipping arctl (pass --with-arctl or --install all to enable)"
+  fi
 
   bring_up_cluster
   # Set current-context in the canonical user kubeconfig so plain
@@ -2418,14 +2449,17 @@ EOF
   else
     log "skipping kagent (pass --with-kagent or --install all to enable)"
   fi
-  if declare -F install_aregistry >/dev/null; then
+  if (( INSTALL_AGENTREGISTRY )) && declare -F install_aregistry >/dev/null; then
     install_aregistry
+  else
+    log "skipping agentregistry (pass --with-agentregistry or --install all to enable)"
   fi
-  # AI Agentic Gateway: each installer self-gates on its INSTALL_* flag and
-  # is non-fatal, so a slow/broken add-on never aborts `up`. Installed
-  # before install_routes so the present-gated VirtualServices are created.
-  # agentgateway runs first because it brings up the upstream Gateway API
-  # CRDs, which any future opt-in lib (or product chart) can reuse.
+  # AI Agentic Gateway: each installer self-gates on its INSTALL_* flag
+  # and is non-fatal, so a slow/broken add-on never aborts `up`.
+  # Installed before install_routes so the present-gated VirtualServices
+  # are created. agentgateway runs first because it brings up the
+  # upstream Gateway API CRDs, which any future opt-in lib (or product
+  # chart) can reuse.
   if declare -F install_agentgateway >/dev/null; then install_agentgateway; fi
   if declare -F install_litellm      >/dev/null; then install_litellm;      fi
   if declare -F install_portkey      >/dev/null; then install_portkey;      fi
@@ -2434,13 +2468,19 @@ EOF
   install_gitea
   install_istio_ambient
   install_routes
-  install_nats
+  if (( INSTALL_NATS )); then
+    install_nats
+  else
+    log "skipping NATS (pass --with-nats or --install all to enable)"
+  fi
   install_hosts
   install_dnsmasq
   install_portfwd
-  install_nats_portfwd
+  if (( INSTALL_NATS )) && declare -F install_nats_portfwd >/dev/null; then
+    install_nats_portfwd
+  fi
   trust_root_ca
-  if declare -F trust_nats_ca >/dev/null; then
+  if (( INSTALL_NATS )) && declare -F trust_nats_ca >/dev/null; then
     trust_nats_ca
   fi
   write_state_file
@@ -2455,13 +2495,13 @@ EOF
   if (( INSTALL_KAGENT )); then
     printf '  open https://%s:%s\n' "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
   fi
-  if [[ -n "${NATS_HOST:-}" ]]; then
+  if (( ${INSTALL_NATS:-0} )) && [[ -n "${NATS_HOST:-}" ]]; then
     printf '  nats:  nats://%s:%s   (or wss://%s)\n' "$NATS_HOST" "$SANDBOX_NATS_PORT" "$NATS_HOST"
   fi
   if declare -F aregistry_present >/dev/null && aregistry_present; then
     printf '  open https://%s:%s\n' "$AREGISTRY_HOST" "$SANDBOX_HTTPS_PORT"
   fi
-  if declare -F agentgateway_present >/dev/null && agentgateway_present; then printf '  open https://%s:%s          # agentgateway (default AI Agentic Gateway)\n' "$AGENTGATEWAY_HOST" "$SANDBOX_HTTPS_PORT"; fi
+  if declare -F agentgateway_present >/dev/null && agentgateway_present; then printf '  open https://%s:%s          # agentgateway (AI Agentic Gateway)\n' "$AGENTGATEWAY_HOST" "$SANDBOX_HTTPS_PORT"; fi
   if declare -F litellm_present      >/dev/null && litellm_present;      then printf '  open https://%s:%s/ui      # LiteLLM admin UI\n' "$LITELLM_HOST" "$SANDBOX_HTTPS_PORT"; fi
   if declare -F portkey_present      >/dev/null && portkey_present;      then printf '  open https://%s:%s/public/  # Portkey gateway console\n' "$PORTKEY_HOST" "$SANDBOX_HTTPS_PORT"; fi
   if declare -F mlflow_present       >/dev/null && mlflow_present;       then printf '  open https://%s:%s          # MLflow UI\n' "$MLFLOW_HOST" "$SANDBOX_HTTPS_PORT"; fi
@@ -2772,30 +2812,44 @@ EOF
   if (( ${INSTALL_KAGENT:-0} )) || _kagent_present; then
     install_kagent
   fi
-  if declare -F install_aregistry >/dev/null; then
-    install_aregistry
+  # On restart, re-assert any add-on that's already in the cluster even
+  # if its flag wasn't passed — restart should never silently undo what
+  # `up --with-X` previously installed. Each lib function is idempotent.
+  if (( ${INSTALL_AGENTREGISTRY:-0} )) || (declare -F aregistry_present >/dev/null && aregistry_present); then
+    if declare -F install_aregistry >/dev/null; then install_aregistry; fi
   fi
-  # AI Agentic Gateway — re-assert each (idempotent helm/kubectl; self-gated).
-  if declare -F install_agentgateway >/dev/null; then install_agentgateway; fi
-  if declare -F install_litellm      >/dev/null; then install_litellm;      fi
-  if declare -F install_portkey      >/dev/null; then install_portkey;      fi
-  if declare -F install_mlflow       >/dev/null; then install_mlflow;       fi
-  if declare -F install_tyk          >/dev/null; then install_tyk;          fi
+  if (( ${INSTALL_AGENTGATEWAY:-0} )) || (declare -F agentgateway_present >/dev/null && agentgateway_present); then
+    if declare -F install_agentgateway >/dev/null; then INSTALL_AGENTGATEWAY=1 install_agentgateway; fi
+  fi
+  if (( ${INSTALL_LITELLM:-0} )) || (declare -F litellm_present >/dev/null && litellm_present); then
+    if declare -F install_litellm >/dev/null; then INSTALL_LITELLM=1 install_litellm; fi
+  fi
+  if (( ${INSTALL_PORTKEY:-0} )) || (declare -F portkey_present >/dev/null && portkey_present); then
+    if declare -F install_portkey >/dev/null; then INSTALL_PORTKEY=1 install_portkey; fi
+  fi
+  if (( ${INSTALL_MLFLOW:-0} )) || (declare -F mlflow_present >/dev/null && mlflow_present); then
+    if declare -F install_mlflow >/dev/null; then INSTALL_MLFLOW=1 install_mlflow; fi
+  fi
+  if (( ${INSTALL_TYK:-0} )) || (declare -F tyk_present >/dev/null && tyk_present); then
+    if declare -F install_tyk >/dev/null; then INSTALL_TYK=1 install_tyk; fi
+  fi
   install_gitea
   install_istio_ambient
   install_routes
-  if declare -F install_nats >/dev/null; then
-    install_nats
+  local nats_present=0
+  if kc get namespace "${NATS_NS:-nats}" >/dev/null 2>&1; then nats_present=1; fi
+  if (( ${INSTALL_NATS:-0} )) || (( nats_present )); then
+    if declare -F install_nats >/dev/null; then install_nats; fi
   fi
   install_hosts
   install_dnsmasq
   install_portfwd
-  if declare -F install_nats_portfwd >/dev/null; then
-    install_nats_portfwd
+  if (( ${INSTALL_NATS:-0} )) || (( nats_present )); then
+    if declare -F install_nats_portfwd >/dev/null; then install_nats_portfwd; fi
   fi
   trust_root_ca
-  if declare -F trust_nats_ca >/dev/null; then
-    trust_nats_ca
+  if (( ${INSTALL_NATS:-0} )) || (( nats_present )); then
+    if declare -F trust_nats_ca >/dev/null; then trust_nats_ca; fi
   fi
   write_state_file
   validate_urls
