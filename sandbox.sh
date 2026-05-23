@@ -890,6 +890,16 @@ bring_up_cluster() {
       warn "kind cluster '$CLUSTER_NAME' is registered but stopped — starting it"
       start_stopped_cluster
     fi
+    # If the user asked for a worker count that doesn't match the live
+    # cluster, tell them — kind can't add/remove nodes to an existing
+    # cluster, so silently honouring the old count would be misleading.
+    local live_workers
+    live_workers="$("$SANDBOX_RUNTIME" ps --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME" --format '{{.Names}}' 2>/dev/null \
+      | grep -c -- '-worker' || true)"
+    if [[ -n "$live_workers" ]] && (( live_workers != SANDBOX_WORKER_COUNT )); then
+      warn "cluster has ${live_workers} worker$([[ "$live_workers" = "1" ]] || echo s), but --workers ${SANDBOX_WORKER_COUNT} was requested — keeping ${live_workers}"
+      warn "to resize: 'sandboxctl restart --workers ${SANDBOX_WORKER_COUNT} --rebuild' (recreates the cluster)"
+    fi
     write_pinned_kubeconfig
     return
   fi
@@ -1600,18 +1610,15 @@ EOF
 # ============================================================================
 
 _managed_hosts() {
-  # Hostnames sandboxctl manages on the marker line. Kagent appears
-  # only when its namespace is live, so a default-off `up` doesn't
-  # leak `kagent.sandbox.app` into /etc/hosts. NATS is default-on so
-  # always appears once the lib is sourced.
+  # Hostnames sandboxctl manages on the marker line. Each opt-in
+  # component is gated on its presence helper so an `up` that didn't
+  # enable it never leaks the hostname into /etc/hosts (and never
+  # triggers a noisy URL validation failure for something the user
+  # never asked to install).
   local out=("$ARGO_HOST" "$KARGO_HOST" "$DEMO_HOST")
   if _kagent_present; then out+=("$KAGENT_HOST"); fi
-  if [[ -n "${NATS_HOST:-}" ]]; then out+=("$NATS_HOST"); fi
-  if declare -F aregistry_present >/dev/null && aregistry_present; then
-    out+=("$AREGISTRY_HOST")
-  fi
-  # AI Agentic Gateway hosts — only when their namespace is live, so a
-  # --no-* run doesn't leak the hostname into /etc/hosts.
+  if declare -F nats_present         >/dev/null && nats_present;         then out+=("$NATS_HOST");         fi
+  if declare -F aregistry_present    >/dev/null && aregistry_present;    then out+=("$AREGISTRY_HOST");    fi
   if declare -F agentgateway_present >/dev/null && agentgateway_present; then out+=("$AGENTGATEWAY_HOST"); fi
   if declare -F litellm_present      >/dev/null && litellm_present;      then out+=("$LITELLM_HOST");      fi
   if declare -F portkey_present      >/dev/null && portkey_present;      then out+=("$PORTKEY_HOST");      fi
@@ -2197,7 +2204,8 @@ validate_urls() {
     local ok_code=0
     if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]; then
       ok_code=1
-    elif [[ -n "${NATS_HOST:-}" && "$host" == "$NATS_HOST" && "$code" == "400" ]]; then
+    elif declare -F nats_present >/dev/null && nats_present \
+         && [[ "$host" == "$NATS_HOST" && "$code" == "400" ]]; then
       ok_code=1
     elif _is_ai_gateway_host "$host" && [[ "$code" =~ ^4[0-9][0-9]$ ]]; then
       # Tyk/Portkey answer 404 at "/" with no API mounted — that 4xx still
@@ -2212,7 +2220,11 @@ validate_urls() {
     fi
   done < <(_managed_hosts)
   # NATS TCP is on a separate port so it doesn't share the loop above.
-  if [[ -n "${NATS_HOST:-}" && -n "${SANDBOX_NATS_PORT:-}" ]]; then
+  # Only check it when NATS was actually opted into — otherwise a
+  # core-only `up` (no --with-nats) would always FAIL on a port that
+  # was never meant to be bound.
+  if declare -F nats_present >/dev/null && nats_present \
+     && [[ -n "${NATS_HOST:-}" && -n "${SANDBOX_NATS_PORT:-}" ]]; then
     local ntag="nats://${NATS_HOST}:${SANDBOX_NATS_PORT}"
     if nc -z 127.0.0.1 "$SANDBOX_NATS_PORT" 2>/dev/null; then
       printf '  %-50s OK (tcp)\n' "$ntag"
@@ -2936,7 +2948,8 @@ cmd_status() {
   if declare -F portkey_present      >/dev/null && portkey_present;      then workload_summary "$PORTKEY_NS"      "portkey"; fi
   if declare -F mlflow_present       >/dev/null && mlflow_present;       then workload_summary "$MLFLOW_NS"       "mlflow";  fi
   if declare -F tyk_present          >/dev/null && tyk_present;          then workload_summary "$TYK_NS"          "tyk";     fi
-  if declare -F nats_status >/dev/null; then
+  if declare -F nats_present >/dev/null && nats_present \
+     && declare -F nats_status >/dev/null; then
     echo
     nats_status | sed 's/^/  /'
   fi
@@ -2956,7 +2969,7 @@ cmd_status() {
   if _kagent_present; then
     printf '  %-12s https://%s:%s\n' "kagent" "$KAGENT_HOST" "$SANDBOX_HTTPS_PORT"
   fi
-  if [[ -n "${NATS_HOST:-}" ]]; then
+  if declare -F nats_present >/dev/null && nats_present; then
     printf '  %-12s nats://%s:%s   (also wss: https://%s)\n' \
       "nats" "$NATS_HOST" "$SANDBOX_NATS_PORT" "$NATS_HOST"
   fi

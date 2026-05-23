@@ -297,6 +297,21 @@ The flag wins over the env var when both are set. `bootstrap` accepts
 cluster with the new count (kind doesn't support adding nodes to an
 existing cluster — recreating the kind cluster is the only path).
 
+**Resizing an existing cluster:** `--workers N` is read only at cluster
+*creation* time. Running `sandboxctl up --workers 2` against a cluster
+that already exists is a no-op for the worker count: `up` is idempotent
+and skips `kind create cluster` entirely, so the existing 1-worker
+topology stays. To resize:
+
+```sh
+sandboxctl restart --workers 2 --rebuild   # destroys + recreates the cluster with the new count
+# or
+sandboxctl down && sandboxctl up --workers 2
+```
+
+`kc get nodes` is the way to confirm the live count (one
+`*-control-plane` line plus N `*-worker*` lines).
+
 **Lean by default.** Every component sandboxctl installs is tuned for a
 laptop: Argo CD ships without its `dex`/`applicationset`/`notifications`
 subcomponents (3 fewer pods), everything runs a single replica with small

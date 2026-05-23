@@ -54,6 +54,19 @@ NATS_PF_LOG="${SANDBOX_STATE_DIR}/nats-portfwd.log"
 NATS_TLS_SECRET="${NATS_TLS_SECRET:-nats-server-tls}"
 
 # ============================================================================
+# Predicate
+# ============================================================================
+#
+# Used by sandbox.sh (validate_urls, _managed_hosts, status output) and by
+# the AI Gateway libs to decide whether to print/check NATS-specific
+# entries. Namespace presence is the same convention every other opt-in
+# lib (agentgateway, aregistry, litellm, portkey, mlflow, tyk) uses.
+
+nats_present() {
+  kc get ns "$NATS_NS" >/dev/null 2>&1
+}
+
+# ============================================================================
 # install_nats — chart + cert + routes
 # ============================================================================
 
