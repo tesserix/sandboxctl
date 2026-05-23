@@ -32,8 +32,10 @@ PORTKEY_IMAGE="${PORTKEY_IMAGE:-portkeyai/gateway:latest}"
 PORTKEY_HOST="${PORTKEY_HOST:-portkey.${SANDBOX_DOMAIN}}"
 PORTKEY_PORT="${PORTKEY_PORT:-8787}"
 
-# Gate: default-on as part of the AI Agentic Gateway.
-INSTALL_PORTKEY="${INSTALL_PORTKEY:-1}"
+# Gate: opt-in. Default-on slot in the AI Agentic Gateway is now agentgateway
+# (lib/agentgateway.sh); enable Portkey with `up --with-portkey` /
+# `--with-ai-gateway`, or INSTALL_PORTKEY=1.
+INSTALL_PORTKEY="${INSTALL_PORTKEY:-0}"
 
 # ============================================================================
 # Predicate
@@ -48,7 +50,7 @@ portkey_present() {
 # ============================================================================
 
 install_portkey() {
-  (( ${INSTALL_PORTKEY:-1} )) || { log "skipping Portkey gateway (INSTALL_PORTKEY=0)"; return 0; }
+  (( ${INSTALL_PORTKEY:-0} )) || { log "skipping Portkey gateway (INSTALL_PORTKEY=0)"; return 0; }
 
   log "installing Portkey AI Gateway (ns: $PORTKEY_NS, image $PORTKEY_IMAGE)"
 
