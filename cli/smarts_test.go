@@ -257,6 +257,132 @@ func TestScoreServices_OutputContainsReasons(t *testing.T) {
 }
 
 // Sort stability sanity — equal scores break alphabetically.
+// ----------------------------------------------------------------------------
+// Tier 1C: mimic chart values
+// ----------------------------------------------------------------------------
+
+func TestMutateChartValues_FlipsIngressAndPinsImages(t *testing.T) {
+	body := `
+ingress:
+  enabled: true
+ui:
+  ingress:
+    enabled: true
+  image:
+    repository: ghcr.io/acme/ui
+    tag: 1.0.0
+backend:
+  image:
+    repository: ghcr.io/acme/backend
+    tag: 1.0.0
+deep:
+  inner:
+    ingress:
+      create: true
+`
+	root := parseYAML(t, body)
+	pins := map[string]imagePin{
+		"ui":      {Repo: "localhost:30500/ui", Tag: "abc"},
+		"backend": {Repo: "localhost:30500/backend", Tag: "abc"},
+	}
+	mutateChartValues(root, pins)
+
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(out)
+	wantContains := []string{
+		"localhost:30500/ui",
+		"localhost:30500/backend",
+		"create: false",
+	}
+	for _, s := range wantContains {
+		if !strings.Contains(got, s) {
+			t.Fatalf("output missing %q\n%s", s, got)
+		}
+	}
+	// All three ingress toggles flipped, no `enabled: true` left under
+	// any segment named "ingress".
+	if strings.Contains(got, "enabled: true") {
+		t.Fatalf("ingress toggles not all flipped:\n%s", got)
+	}
+}
+
+func TestMutateChartValues_NoPinsLeavesImagesAlone(t *testing.T) {
+	body := `
+image:
+  repository: nginx
+  tag: 1.25
+`
+	root := parseYAML(t, body)
+	mutateChartValues(root, nil)
+	out, _ := yaml.Marshal(root)
+	if !strings.Contains(string(out), "repository: nginx") {
+		t.Fatalf("expected nginx repo preserved, got:\n%s", string(out))
+	}
+}
+
+func TestLookupPin_PathSegment(t *testing.T) {
+	pins := map[string]imagePin{"backend": {Repo: "r", Tag: "t"}}
+	if _, ok := lookupPin(pins, []string{"backend", "image"}, "ghcr.io/acme/backend"); !ok {
+		t.Fatalf("expected match by path segment")
+	}
+}
+
+func TestLookupPin_RepoBasename(t *testing.T) {
+	pins := map[string]imagePin{"api-gateway": {Repo: "r", Tag: "t"}}
+	if _, ok := lookupPin(pins, []string{"images", "primary"}, "ghcr.io/acme/api-gateway"); !ok {
+		t.Fatalf("expected match by repo basename")
+	}
+}
+
+func TestLookupPin_LoneFallback(t *testing.T) {
+	pins := map[string]imagePin{"any-name": {Repo: "r", Tag: "t"}}
+	if _, ok := lookupPin(pins, []string{"image"}, "nginx"); !ok {
+		t.Fatalf("expected lone-pin fallback for top-level image group")
+	}
+}
+
+func TestLookupPin_NoMatch(t *testing.T) {
+	pins := map[string]imagePin{"frontend": {Repo: "r", Tag: "t"}}
+	if _, ok := lookupPin(pins, []string{"backend", "image"}, "ghcr.io/acme/backend"); ok {
+		t.Fatalf("did not expect a match")
+	}
+}
+
+func TestParseImagePins_Basic(t *testing.T) {
+	got, err := parseImagePins([]string{"ui=localhost:30500/ui:abc"})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if got["ui"].Repo != "localhost:30500/ui" || got["ui"].Tag != "abc" {
+		t.Fatalf("bad parse: %+v", got)
+	}
+}
+
+func TestParseImagePins_DefaultsTagToLatest(t *testing.T) {
+	got, _ := parseImagePins([]string{"ui=ghcr.io/acme/ui"})
+	if got["ui"].Tag != "latest" {
+		t.Fatalf("expected default tag latest, got %q", got["ui"].Tag)
+	}
+}
+
+func TestParseImagePins_RejectsMissingEquals(t *testing.T) {
+	if _, err := parseImagePins([]string{"oops"}); err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func parseYAML(t *testing.T, body string) *yaml.Node {
+	t.Helper()
+	var n yaml.Node
+	if err := yaml.Unmarshal([]byte(body), &n); err != nil {
+		t.Fatalf("yaml: %v", err)
+	}
+	return &n
+}
+
 func TestScoreServices_TieBreakAlphabetical(t *testing.T) {
 	svcs := mustSvcList(t, `{"items":[
         {"metadata":{"name":"zeta-thing"},"spec":{"type":"ClusterIP","ports":[]}},

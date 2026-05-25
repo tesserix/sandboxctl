@@ -3687,15 +3687,32 @@ _emit_chart_entry() {
   name="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "$chart_yml" | head -n1)"
   [[ -n "$name" ]] || return 1
 
-  # Prefer values-sandbox.yaml (sandboxctl-specific overrides). Fall
-  # back to values-local.yaml for charts that haven't been
-  # sandbox-ified yet. Charts with neither still deploy with the
-  # chart's baseline values.yaml.
-  if   [[ -f "${chart_dir}/values-sandbox.yaml" ]]; then values="values-sandbox.yaml"
-  elif [[ -f "${chart_dir}/values-local.yaml"   ]]; then values="values-local.yaml"
-  fi
+  values="$(_pick_sandbox_values_file "$chart_dir")"
 
   printf 'helm\t%s\t%s\t%s\n' "$name" "$chart_dir" "$values"
+}
+
+# Pick the first sandbox-flavour values file that already exists in a
+# chart directory. Returns the filename (no path) on stdout, empty when
+# none is present. The four names are checked in priority order so the
+# CLI can adapt to whatever convention the chart author already uses
+# without forcing them to rename anything:
+#
+#   1. sandbox-values.yaml   — favoured by Bitnami-style "sandbox first"
+#   2. values-sandbox.yaml   — sandboxctl's historical default
+#   3. sandbox.yaml          — short form some charts ship
+#   4. values-local.yaml     — pre-sandboxctl convention; kept for back-compat
+#
+# Order is "most-specific first" so a chart that ships every variant
+# gets the one most clearly authored for sandboxctl. If you want to
+# add a fifth name, append it to this list — the deploy path picks up
+# the change automatically.
+_pick_sandbox_values_file() {
+  local chart_dir="$1" name
+  for name in sandbox-values.yaml values-sandbox.yaml sandbox.yaml values-local.yaml; do
+    [[ -f "${chart_dir}/${name}" ]] && { printf '%s' "$name"; return 0; }
+  done
+  printf ''
 }
 
 # Emit a discover_app_charts-style entry for a single chart that the
@@ -3729,8 +3746,8 @@ _emit_explicit_chart_entry() {
   if [[ -n "$values_in" ]]; then
     [[ -f "${chart_dir}/${values_in}" ]] || die "values file not found in chart: ${values_in}"
     vfile="$values_in"
-  elif [[ -f "${chart_dir}/values-sandbox.yaml" ]]; then vfile="values-sandbox.yaml"
-  elif [[ -f "${chart_dir}/values-local.yaml"   ]]; then vfile="values-local.yaml"
+  else
+    vfile="$(_pick_sandbox_values_file "$chart_dir")"
   fi
 
   printf 'helm\t%s\t%s\t%s\n' "$cname" "$chart_dir" "$vfile"
@@ -4151,6 +4168,10 @@ EOF
 
     kc create namespace "$namespace" --dry-run=client -o yaml | kc apply -f - >/dev/null
 
+    if [[ "$kind" == "helm" && -z "$values_file" ]]; then
+      values_file="$(_ensure_sandbox_values_file "$cname" "$src_dir" "$deploy_manifest")"
+    fi
+
     [[ "$kind" == "helm" && -n "$values_file" ]] && \
       log "[${cname}] using values file: ${values_file}"
 
@@ -4260,6 +4281,64 @@ _image_ref_for_chart() {
   if [[ "$count" -eq 1 && "$chart_count" -eq 1 ]]; then
     printf '%s\t%s\n' "localhost:${SANDBOX_REGISTRY_PORT}/${only_name}" "${only_tag:-latest}"
   fi
+}
+
+# When the chart ships a values.yaml but no sandbox-flavour values file,
+# generate one (values-sandbox.yaml, next to Chart.yaml) by mimicking the
+# default values.yaml with two non-destructive edits:
+#
+#   • every `*.ingress.enabled` / `*.ingress.create` toggle flipped to false
+#     (sandboxctl owns external routing via the per-app Istio VirtualService);
+#   • every `{ repository, tag }` image group rewritten to the in-cluster
+#     registry whenever the build manifest names a matching image.
+#
+# Idempotent: re-running deploy regenerates the file with the latest pins,
+# but never touches a chart that already has a sandbox-flavour file the
+# user has hand-tuned. Designed so an arbitrary third-party chart can be
+# deployed without the user authoring sandboxctl-specific YAML.
+#
+# Echoes the relative filename on success ("values-sandbox.yaml"), empty
+# string on no-op (chart has no values.yaml or generation failed). The
+# caller treats empty as "no sandbox values file" — Argo will fall back
+# to the chart's vendored values.yaml plus the helm.parameters pins.
+_ensure_sandbox_values_file() {
+  local cname="$1" src_dir="$2" deploy_manifest="${3:-}"
+  local sandboxctl_bin
+  sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
+  [[ -n "$sandboxctl_bin" ]] || { printf ''; return 0; }
+  [[ -d "$src_dir" ]] || { printf ''; return 0; }
+  [[ -f "${src_dir}/values.yaml" ]] || { printf ''; return 0; }
+
+  # Build "<image>=<repo>:<tag>" pins from the build manifest. The
+  # mimic helper matches each pin against the dot-path of every image
+  # group in values.yaml (segment-equal) or the basename of its existing
+  # repository, so charts written with conventions like `backend.image`
+  # vs. `images.api` both light up without per-chart configuration.
+  local pins=() pin_count=0
+  if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
+    local iname _ictx _idf itag _ial _idep entries
+    entries="$("$sandboxctl_bin" _parse-build-manifest "$deploy_manifest" 2>/dev/null || true)"
+    if [[ -n "$entries" ]]; then
+      while IFS=$'\t' read -r iname _ictx _idf itag _ial _idep; do
+        [[ -n "$iname" ]] || continue
+        pins+=("${iname}=localhost:${SANDBOX_REGISTRY_PORT}/${iname}:${itag:-latest}")
+        pin_count=$((pin_count + 1))
+      done <<<"$entries"
+    fi
+  fi
+
+  local out_path="${src_dir}/values-sandbox.yaml"
+  if "$sandboxctl_bin" _chart-mimic-values "$src_dir" "$out_path" \
+       ${pins[@]+"${pins[@]}"} >/dev/null 2>&1; then
+    if [[ -f "$out_path" ]]; then
+      log "[${cname}] mimicked values.yaml → values-sandbox.yaml (Ingress disabled, ${pin_count} image pin(s))" >&2
+      printf 'values-sandbox.yaml'
+      return 0
+    fi
+  else
+    warn "[${cname}] could not mimic values.yaml — Argo will fall back to chart defaults + helm.parameters pins"
+  fi
+  printf ''
 }
 
 # Compute the full set of Argo helm parameters the chart should be deployed
