@@ -4300,7 +4300,7 @@ _chart_helm_overrides() {
   while IFS= read -r toggle; do
     [[ -n "$toggle" ]] || continue
     printf '%s=false\n' "$toggle"
-    log "[${cname}] auto-disabling chart toggle ${toggle}=false (sandboxctl owns external routing)"
+    log "[${cname}] auto-disabling chart toggle ${toggle}=false (sandboxctl owns external routing)" >&2
   done < <("$sandboxctl_bin" _chart-ingress-overrides "$src_dir" 2>/dev/null)
 
   # Read explicit overrides from the build manifest (primary_service is
@@ -4358,7 +4358,7 @@ _chart_helm_overrides() {
       [[ -n "$group_path" ]] || continue
       printf '%s.repository=localhost:%s/%s\n' "$group_path" "$SANDBOX_REGISTRY_PORT" "$iname"
       printf '%s.tag=%s\n' "$group_path" "${itag:-latest}"
-      log "[${cname}] pinning ${group_path} → localhost:${SANDBOX_REGISTRY_PORT}/${iname}:${itag:-latest}"
+      log "[${cname}] pinning ${group_path} → localhost:${SANDBOX_REGISTRY_PORT}/${iname}:${itag:-latest}" >&2
       pinned_any=1
     done <<<"$entries"
   fi
@@ -4375,7 +4375,7 @@ _chart_helm_overrides() {
       IFS=$'\t' read -r lrepo ltag <<<"$legacy_ref"
       printf 'image.repository=%s\n' "$lrepo"
       printf 'image.tag=%s\n' "${ltag:-latest}"
-      log "[${cname}] pinning image → ${lrepo}:${ltag:-latest} (single-image fallback)"
+      log "[${cname}] pinning image → ${lrepo}:${ltag:-latest} (single-image fallback)" >&2
     fi
   fi
 }
@@ -4400,7 +4400,13 @@ _apply_argo_app() {
     local -a helm_params=()
     local _line
     while IFS= read -r _line; do
-      [[ -n "$_line" ]] && helm_params+=("$_line")
+      # Only accept well-formed `name=value` lines. Defends the rendered
+      # Argo Application against any stray stdout pollution (ANSI-coloured
+      # log lines, helm command output, …) from `_chart_helm_overrides` —
+      # kubectl rejects YAML with control characters, and a single bad
+      # line would otherwise break the entire deploy.
+      [[ "$_line" =~ ^[A-Za-z_][A-Za-z0-9_.-]*= ]] || continue
+      helm_params+=("$_line")
     done < <(_chart_helm_overrides "$cname" "$src_dir" "$deploy_manifest" "$chart_count")
 
     local helm_block=""
