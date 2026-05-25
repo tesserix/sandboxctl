@@ -217,6 +217,65 @@ your-app/
 
 With this layout, `sandboxctl deploy` from the repo root needs no flags.
 
+### Chart adaptation
+
+`sandboxctl deploy` reads the chart's `values.yaml` and adapts to whatever
+shape it finds, so you rarely need sandboxctl-specific values. Four passes
+run automatically — each is opt-in, opt-out-able, and logged so you can
+see *why* a decision was made.
+
+**1. Chart-shipped `Ingress` is auto-disabled.** sandboxctl already creates
+an Istio VirtualService for `<chart>.sandbox.app`, so a chart-defined
+`Ingress` would either fight that route or stall waiting for an
+`IngressClass` this cluster doesn't ship. Any `*.ingress.enabled: true`
+or `*.ingress.create: true` key in `values.yaml` is flipped to `false`
+via Argo helm parameters at deploy time. Your chart stays portable — the
+toggle is only forced off inside sandboxctl, never edited.
+
+**2. Multi-image pinning.** For each image in your build manifest,
+sandboxctl walks the chart's `values.yaml` for nodes shaped like
+`{ repository: …, tag: … }` and pins the matching one to the freshly
+built image. Matching is by name: image `ui` ↔ group `ui.image`,
+image `backend` ↔ group `backend.image`. Single-image charts still get
+the legacy `image.repository` / `image.tag` pin. Charts with neither
+shape get nothing — sandboxctl never guesses.
+
+**3. Smarter primary-Service selection.** The VirtualService points at
+your chart's most-likely-user-facing Service. The picker scores each
+Service in the namespace by name match, web ports (80/8080/3000/8081),
+name keywords (`ui`/`web`/`frontend` win; `backend`/`api`/`worker` get
+a penalty), and falls back to first alphabetical when scores tie.
+
+**4. Explicit overrides.** When the heuristic guesses wrong, take
+control:
+
+- **Annotation** — add `sandboxctl.io/primary: "true"` to the Service
+  you want routed. Wins against everything else.
+
+- **`sandboxctl.yaml`** — declare the entrypoint inline:
+
+  ```yaml
+  images:
+    - name: backend
+      context: app/backend
+    - name: ui
+      context: app/ui
+
+  # Pick the Service routed to <chart>.sandbox.app:
+  primary_service: hello-sandbox-ui
+
+  # Map build-manifest images to values.yaml groups when the names
+  # don't already match by convention:
+  chart_image_map:
+    ui: ui.image
+    backend: backend.image
+  ```
+
+The deploy transcript logs each decision (`auto-disabling chart toggle
+ingress.enabled=false`, `pinning ui.image → localhost:5050/ui:latest`,
+`primary Service: svc/hello-sandbox-ui:80 (scored 90 …)`) so you can
+debug without re-reading the script.
+
 ## Multi-image builds
 
 If your repo has multiple Dockerfiles with build-order dependencies, drop

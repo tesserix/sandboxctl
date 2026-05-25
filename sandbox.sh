@@ -4159,25 +4159,17 @@ EOF
     gitea_url="$(gitea_push_chart "$repo_name" "$src_dir")"
     log "[${cname}] pushed chart → ${gitea_url}"
 
-    # Map this chart to the image cmd_build pushed and pin it via Argo
-    # helm parameters, so the deployed image matches the registry even
-    # if the chart's values.yaml hardcodes a stale/foreign reference.
-    local image_repo="" image_tag=""
-    if [[ "$kind" == "helm" ]]; then
-      local image_ref=""
-      image_ref="$(_image_ref_for_chart "$cname" "$deploy_manifest" "$chart_count")"
-      if [[ -n "$image_ref" ]]; then
-        IFS=$'\t' read -r image_repo image_tag <<<"$image_ref"
-      fi
-    fi
-
-    _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$image_repo" "$image_tag"
+    # All chart adaptation (image pins, chart-shipped Ingress override, …)
+    # happens inside _apply_argo_app via _chart_helm_overrides — it reads
+    # the chart's values.yaml + the repo's sandboxctl.yaml directly, so
+    # there's nothing to precompute here.
+    _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$src_dir" "$deploy_manifest" "$chart_count"
 
     _wait_argo_health "$cname"
 
     _restart_app_workloads "$cname" "$namespace"
 
-    _route_app_service "$cname" "$namespace" "$hostname"
+    _route_app_service "$cname" "$namespace" "$hostname" "$deploy_manifest"
   done <<<"$entries"
 
   _print_deploy_summary "$entries" "$env"
@@ -4270,34 +4262,155 @@ _image_ref_for_chart() {
   fi
 }
 
+# Compute the full set of Argo helm parameters the chart should be deployed
+# with. Output is one `name=value` line per parameter (sorted, deterministic).
+# Combines three independent passes — each is opt-in and skips silently when
+# its inputs are missing, so legacy single-image charts behave exactly as
+# before:
+#
+#   1. Ingress auto-disable.  Any `*.ingress.enabled = true` (or `.create = true`)
+#      key found in the chart's values.yaml is flipped to `false`. sandboxctl
+#      owns external routing via the per-app Istio VirtualService, so a
+#      chart-shipped Ingress would either fight that VirtualService or stall
+#      forever waiting for an IngressClass that this cluster doesn't ship.
+#
+#   2. Multi-image pinning.  Walks the chart's values.yaml for image groups
+#      shaped `{ repository: ..., tag: ... }`, matches each build-manifest
+#      image to a group (explicit `chart_image_map` first; otherwise the
+#      group whose dot-path contains the image name as a segment), and emits
+#      `<group>.repository=localhost:<reg-port>/<image>` + `<group>.tag=<tag>`.
+#      Falls back to the legacy `image.repository`/`image.tag` pair when the
+#      chart exposes a single top-level image (kept compatible with charts
+#      written before sandboxctl learned about nested image groups).
+#
+#   3. Explicit overrides.  Any extra `--set` lines a chart author wants
+#      sandboxctl to pass through — read straight from sandboxctl.yaml
+#      under future-proofed keys via `_manifest-extras`.
+#
+# Diagnostics: each decision is logged with its reason so the deploy
+# transcript shows *why* a particular parameter was injected.
+_chart_helm_overrides() {
+  local cname="$1" src_dir="$2" deploy_manifest="${3:-}" chart_count="${4:-1}"
+  local sandboxctl_bin
+  sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
+  [[ -n "$sandboxctl_bin" ]] || return 0
+  [[ -d "$src_dir" ]] || return 0
+
+  # Stage 1 — chart-shipped Ingress auto-disable.
+  while IFS= read -r toggle; do
+    [[ -n "$toggle" ]] || continue
+    printf '%s=false\n' "$toggle"
+    log "[${cname}] auto-disabling chart toggle ${toggle}=false (sandboxctl owns external routing)"
+  done < <("$sandboxctl_bin" _chart-ingress-overrides "$src_dir" 2>/dev/null)
+
+  # Read explicit overrides from the build manifest (primary_service is
+  # consumed by _route_app_service; we only need chart_image_map here).
+  declare -A chart_image_map=()
+  if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
+    while IFS='=' read -r key val; do
+      case "$key" in
+        chart_image_map.*) chart_image_map["${key#chart_image_map.}"]="$val" ;;
+      esac
+    done < <("$sandboxctl_bin" _manifest-extras "$deploy_manifest" 2>/dev/null)
+  fi
+
+  # Stage 2 — multi-image pinning. Build a name→group lookup from the
+  # chart's values.yaml, then walk the build manifest to pin each image
+  # we know how to place. Charts with no `repository:` anywhere in their
+  # values.yaml emit nothing here, falling back to legacy single-image.
+  local image_groups=""
+  image_groups="$("$sandboxctl_bin" _chart-image-keys "$src_dir" 2>/dev/null || true)"
+
+  local entries=""
+  if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
+    entries="$("$sandboxctl_bin" _parse-build-manifest "$deploy_manifest" 2>/dev/null || true)"
+  fi
+
+  local pinned_any=0
+  if [[ -n "$entries" && -n "$image_groups" ]]; then
+    local iname _ictx _idf itag _ial _idep
+    while IFS=$'\t' read -r iname _ictx _idf itag _ial _idep; do
+      [[ -n "$iname" ]] || continue
+      local group_path="${chart_image_map[$iname]:-}"
+      if [[ -z "$group_path" ]]; then
+        # Heuristic: pick the values group whose dot-path contains the
+        # image name as a segment (e.g. image "ui" → group "ui.image").
+        # Falls back to the lone group when there's exactly one — keeps
+        # single-image charts working without naming gymnastics.
+        local group_count
+        group_count="$(printf '%s\n' "$image_groups" | grep -c . || true)"
+        local gp _grepo _gtag
+        while IFS=$'\t' read -r gp _grepo _gtag; do
+          [[ -n "$gp" ]] || continue
+          case ".$gp." in
+            *.$iname.*) group_path="$gp"; break ;;
+          esac
+        done <<<"$image_groups"
+        if [[ -z "$group_path" && "$group_count" == "1" ]]; then
+          group_path="$(printf '%s\n' "$image_groups" | head -n1 | cut -f1)"
+        fi
+      fi
+      [[ -n "$group_path" ]] || continue
+      printf '%s.repository=localhost:%s/%s\n' "$group_path" "$SANDBOX_REGISTRY_PORT" "$iname"
+      printf '%s.tag=%s\n' "$group_path" "${itag:-latest}"
+      log "[${cname}] pinning ${group_path} → localhost:${SANDBOX_REGISTRY_PORT}/${iname}:${itag:-latest}"
+      pinned_any=1
+    done <<<"$entries"
+  fi
+
+  # Stage 2 fallback — legacy single-image behaviour. Only fires when the
+  # multi-image walk didn't pin anything (chart has no image groups OR
+  # build manifest empty), to preserve the existing `_image_ref_for_chart`
+  # contract for older charts.
+  if [[ "$pinned_any" == "0" && -n "$deploy_manifest" ]]; then
+    local legacy_ref
+    legacy_ref="$(_image_ref_for_chart "$cname" "$deploy_manifest" "$chart_count")"
+    if [[ -n "$legacy_ref" ]]; then
+      local lrepo ltag
+      IFS=$'\t' read -r lrepo ltag <<<"$legacy_ref"
+      printf 'image.repository=%s\n' "$lrepo"
+      printf 'image.tag=%s\n' "${ltag:-latest}"
+      log "[${cname}] pinning image → ${lrepo}:${ltag:-latest} (single-image fallback)"
+    fi
+  fi
+}
+
 # Apply (or update) one Argo CD Application. Helper for cmd_deploy so
 # the per-chart loop body stays readable.
 #
-# <image_repo>/<image_tag> (optional) pin the chart's image to what
-# cmd_build just pushed to the in-cluster registry, injected as
-# spec.source.helm.parameters (image.repository / image.tag). Argo
-# applies parameters *after* valueFiles, so the deployed image always
-# matches the freshly-built one regardless of what the chart's
-# values.yaml hardcodes.
+# Helm parameters (image pins, ingress overrides) come from
+# `_chart_helm_overrides`, which inspects the chart's values.yaml and the
+# repo's sandboxctl.yaml. Argo applies parameters *after* valueFiles, so
+# the deployed image always matches the freshly-built one regardless of
+# what the chart's values.yaml hardcodes — and chart-shipped Ingress
+# resources stay dormant when sandboxctl owns external routing.
 _apply_argo_app() {
   local cname="$1" kind="$2" gitea_url="$3" values_file="$4" namespace="$5"
-  local image_repo="${6:-}" image_tag="${7:-}"
+  local src_dir="${6:-}" deploy_manifest="${7:-}" chart_count="${8:-1}"
 
   log "[${cname}] creating Argo CD Application (source: ${gitea_url}@main)"
   if [[ "$kind" == "helm" ]]; then
-    # Assemble spec.source.helm from whatever we have. Emitted only when
-    # there's a value file and/or an image to pin — a bare helm source
-    # (neither) stays free of an empty `helm:` block.
+    # Collect helm parameters (image pins + ingress overrides + …) into an
+    # array; render the helm block from whatever survived the walks.
+    local -a helm_params=()
+    local _line
+    while IFS= read -r _line; do
+      [[ -n "$_line" ]] && helm_params+=("$_line")
+    done < <(_chart_helm_overrides "$cname" "$src_dir" "$deploy_manifest" "$chart_count")
+
     local helm_block=""
-    if [[ -n "$values_file" || -n "$image_repo" ]]; then
+    if [[ -n "$values_file" || "${#helm_params[@]}" -gt 0 ]]; then
       helm_block="    helm:"$'\n'
       [[ -n "$values_file" ]] && \
         helm_block+="      valueFiles: [\"${values_file}\"]"$'\n'
-      if [[ -n "$image_repo" ]]; then
+      if [[ "${#helm_params[@]}" -gt 0 ]]; then
         helm_block+="      parameters:"$'\n'
-        helm_block+="        - { name: image.repository, value: \"${image_repo}\" }"$'\n'
-        helm_block+="        - { name: image.tag, value: \"${image_tag:-latest}\" }"$'\n'
-        log "[${cname}] pinning image → ${image_repo}:${image_tag:-latest}"
+        local kv pname pval
+        for kv in "${helm_params[@]}"; do
+          pname="${kv%%=*}"
+          pval="${kv#*=}"
+          helm_block+="        - { name: ${pname}, value: \"${pval}\" }"$'\n'
+        done
       fi
     fi
     kc apply -f - <<EOF >/dev/null
@@ -4520,17 +4633,82 @@ _restart_app_workloads() {
 }
 
 # Wire one Istio VirtualService + /etc/hosts entry for the app's primary
-# Service. Heuristic: prefer a Service whose name matches the chart, fall
-# back to the first Service in the namespace.
+# Service. Selection order, first match wins:
+#
+#   1. Explicit override — `primary_service: <name>` in sandboxctl.yaml.
+#      Authoritative; sandboxctl never second-guesses an explicit pick.
+#   2. Annotation override — any Service in the namespace carrying
+#      `sandboxctl.io/primary: "true"`. Lets per-chart authors mark the
+#      entrypoint without touching sandboxctl.yaml.
+#   3. Scored heuristic — `_score-services` ranks every Service by:
+#        • exact name match with chart (+100)
+#        • web port (80/8080/3000/8081/5000/8000 or named http/web; +30/+25)
+#        • user-facing name keyword (ui/web/frontend/app/client; +20)
+#        • penalty for backend/api/worker-style names (-30)
+#      Ties break alphabetically. The reasons are logged so chart authors
+#      can debug why a particular Service got picked.
+#   4. Fallback — first Service in the namespace, preserving the old
+#      behaviour when scoring yields nothing useful.
+#
+# Sandboxctl is *deliberately* opinionated here: the chart already
+# encodes intent (which Service exposes port 80, which one is named
+# "ui", which one is annotated), so the heuristic just reads that
+# intent rather than asking the user to learn a new convention.
 _route_app_service() {
-  local cname="$1" namespace="$2" hostname="$3"
-  local svc svc_port
-  svc="$(kc -n "$namespace" get svc -o jsonpath="{.items[?(@.metadata.name=='${cname}')].metadata.name}" 2>/dev/null || true)"
+  local cname="$1" namespace="$2" hostname="$3" deploy_manifest="${4:-}"
+  local sandboxctl_bin svc svc_port pick_reason=""
+
+  sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
+
+  # 1. Explicit override from sandboxctl.yaml
+  local manifest_primary=""
+  if [[ -n "$sandboxctl_bin" && -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
+    while IFS='=' read -r key val; do
+      [[ "$key" == "primary_service" ]] && manifest_primary="$val"
+    done < <("$sandboxctl_bin" _manifest-extras "$deploy_manifest" 2>/dev/null)
+  fi
+  if [[ -n "$manifest_primary" ]] && \
+     kc -n "$namespace" get svc "$manifest_primary" >/dev/null 2>&1; then
+    svc="$manifest_primary"
+    pick_reason="sandboxctl.yaml primary_service"
+  fi
+
+  # 2. Annotation override
+  if [[ -z "$svc" ]]; then
+    svc="$(kc -n "$namespace" get svc \
+      -o jsonpath="{range .items[?(@.metadata.annotations.sandboxctl\\.io/primary=='true')]}{.metadata.name}{'\n'}{end}" \
+      2>/dev/null | head -n1 || true)"
+    [[ -n "$svc" ]] && pick_reason="annotation sandboxctl.io/primary=true"
+  fi
+
+  # 3. Scored heuristic
+  if [[ -z "$svc" && -n "$sandboxctl_bin" ]]; then
+    local svc_json
+    svc_json="$(kc -n "$namespace" get svc -o json 2>/dev/null || true)"
+    if [[ -n "$svc_json" ]]; then
+      local sname sport sscore sreasons
+      while IFS=$'\t' read -r sname sport sscore sreasons; do
+        if [[ -z "$svc" && -n "$sname" ]]; then
+          svc="$sname"
+          svc_port="$sport"
+          pick_reason="scored ${sscore} (${sreasons})"
+        fi
+      done < <(printf '%s' "$svc_json" | "$sandboxctl_bin" _score-services "$cname" 2>/dev/null)
+    fi
+  fi
+
+  # 4. Fallback (preserves pre-smarts behaviour)
   if [[ -z "$svc" ]]; then
     svc="$(kc -n "$namespace" get svc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    [[ -n "$svc" ]] && pick_reason="first Service in namespace (fallback)"
   fi
+
   if [[ -n "$svc" ]]; then
-    svc_port="$(kc -n "$namespace" get svc "$svc" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo 80)"
+    if [[ -z "$svc_port" ]]; then
+      svc_port="$(kc -n "$namespace" get svc "$svc" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo 80)"
+    fi
+    [[ -z "$svc_port" ]] && svc_port=80
+    log "[${cname}] primary Service: svc/${svc}:${svc_port} (${pick_reason})"
     add_app_route "$hostname" "$namespace" "$svc" "$svc_port"
     add_app_host  "$hostname"
     ok "[${cname}] routed https://${hostname}:${SANDBOX_HTTPS_PORT} → svc/${svc}:${svc_port}"

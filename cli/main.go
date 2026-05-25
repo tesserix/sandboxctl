@@ -69,7 +69,13 @@ func known(sub string) bool {
 	}
 	// Hidden subcommands consumed by sandbox.sh itself, not listed in usage.
 	switch sub {
-	case "secret", "_parse-build-manifest", "_autogen-manifest":
+	case "secret",
+		"_parse-build-manifest",
+		"_autogen-manifest",
+		"_chart-ingress-overrides",
+		"_chart-image-keys",
+		"_score-services",
+		"_manifest-extras":
 		return true
 	}
 	// `cleanup` is a friendlier alias for `prune` — accepted, not advertised.
@@ -112,6 +118,18 @@ func main() {
 	}
 	if sub == "_autogen-manifest" {
 		os.Exit(runAutogenManifest(os.Args[2:]))
+	}
+	if sub == "_chart-ingress-overrides" {
+		os.Exit(runChartIngressOverrides(os.Args[2:]))
+	}
+	if sub == "_chart-image-keys" {
+		os.Exit(runChartImageKeys(os.Args[2:]))
+	}
+	if sub == "_score-services" {
+		os.Exit(runScoreServices(os.Args[2:]))
+	}
+	if sub == "_manifest-extras" {
+		os.Exit(runManifestExtras(os.Args[2:]))
 	}
 
 	if resolveAssetDir() == "" {
