@@ -90,7 +90,7 @@ piece without disturbing the rest.
 | **arctl** (CLI on the Mac) | `--with-arctl` | binary in `/usr/local/bin/arctl` | [agentregistry](https://aregistry.ai) CLI — build/publish/run MCP servers, agents, skills, prompts. Pin with `ARCTL_VERSION`. `SANDBOX_KEEP_ARCTL=1` keeps it on `down`/`purge`. |
 | **CloudNativePG operator** | `--with-cnpg` | (operator only) | Postgres-as-a-CRD; foundation for shared Postgres clusters. Implied by `--with-agentregistry`. |
 | **agentregistry server** | `--with-agentregistry` | `https://aregistry.sandbox.app:8443` | In-cluster registry for MCP/agents/skills, backed by a CNPG Postgres with `pgvector` (semantic search). Implies `--with-cnpg`. |
-| **NATS + JetStream** | `--with-nats` | `nats://nats.sandbox.app:4222` (also `wss://nats.sandbox.app:8443`) | Pub/sub + persistent streams. Adds a LaunchAgent that port-forwards `:4222` to the host. |
+| **NATS + JetStream** | `--with-nats` | `nats://nats.sandbox.app:4222` (also `wss://nats.sandbox.app:8443`) | Pub/sub + persistent streams. Adds a LaunchAgent that port-forwards `:4222` to the host. Pair with `--no-nats-cli` to skip the host-side `nats` CLI install. |
 | **kagent** | `--with-kagent` | `https://kagent.sandbox.app:8443` | [kagent](https://github.com/kagent-dev/kagent) — agentic AI controller + UI (controller-only install; configure model providers out-of-band). |
 | **agentgateway** | `--with-agentgateway` | `https://agentgateway.sandbox.app:8443` | [agentgateway](https://agentgateway.dev) — Linux-Foundation-hosted, [Gateway-API-native](https://gateway-api.sigs.k8s.io/) proxy for AI traffic (MCP / A2A / agent-to-LLM). Drop in `HTTPRoute`s from any namespace. |
 | **Portkey** | `--with-portkey` | `https://portkey.sandbox.app:8443` (console `/public/`) | OSS AI gateway: routing, retries, fallbacks, load-balancing for 250+ LLMs. |
@@ -129,10 +129,20 @@ detects components by namespace presence), so it never silently
 uninstalls something. Removing an add-on means `sandboxctl down` (which
 wipes the cluster) — there is no per-component uninstaller today.
 
+The deprecated `--no-arctl` / `--no-cnpg` / `--no-agentregistry` /
+`--no-nats` / `--no-agentgateway` / `--no-portkey` / `--no-litellm` /
+`--no-mlflow` / `--no-tyk` / `--no-ai-gateway` flags are still parsed as
+no-ops so older scripts keep working — they exist only because these
+components were once default-on. Drop them when you next touch the
+script.
+
 ## Deploying your own app
 
 Run `sandboxctl deploy` from your product directory — the same dir you'd
-run `docker build` from. The CLI will:
+run `docker build` from. To target a different directory without `cd`-ing
+in, pass it positionally (`sandboxctl deploy path/to/repo`) or via
+`--repo path/to/repo`. The same selectors work for `build` and
+`bootstrap`. The CLI will:
 
 1. **Build + push images.** Reads `sandboxctl.yaml` at the dir root if it
    exists (multi-image, dependency-ordered); otherwise walks Dockerfiles
@@ -176,11 +186,13 @@ sandboxctl deploy --chart /abs/path/to/chart
 
 | Flag | What |
 |---|---|
+| `--repo <dir>` | Run against a product repo other than `cwd` (positional `[path]` works too). Same flag is accepted by `build` and `bootstrap`. |
 | `--chart <dir>` | Skip auto-discovery and use this chart |
 | `--values <file>` | Pick a specific values file in the chart (default: `values-sandbox.yaml`, then `values-local.yaml`) |
 | `--name <name>` | Override the Argo App + URL name (default: `Chart.yaml`'s `name`) |
 | `--env <name>` | Namespace suffix only — URL stays `<name>.sandbox.app`. Default `dev`. |
 | `--no-build` | Skip the build step (registry already has the images) |
+| `--purge-old-tags` | Forwarded to the build step (see [Image management](#image-management)). `--no-purge-old-tags` overrides `SANDBOX_BUILD_PURGE_OLD_TAGS=1` from the env. |
 
 `sandboxctl undeploy --name <chart>` reverses everything — removes the
 Argo Application, the VirtualService, and the `/etc/hosts` entry. The
@@ -268,11 +280,16 @@ sandboxctl up --workers 3                 # 3 workers, recommended for 32 GB+ Ma
 sandboxctl status                         # cluster + workload status + URLs
 sandboxctl validate                       # curl each URL and report HTTP codes
 sandboxctl creds                          # admin passwords for Argo CD + Kargo
+sandboxctl argocd-ui                      # print just the Argo CD URL + admin creds
+sandboxctl kargo-ui                       # print just the Kargo URL + admin creds
 sandboxctl restart                        # re-apply installers, keep cluster + state
+sandboxctl restart --rebuild              # full wipe-and-rebuild (alias: --full)
 sandboxctl restart --workers 3            # resize the cluster (implies --rebuild)
 sandboxctl down                           # remove cluster + LaunchAgent + /etc/hosts + CA
 sandboxctl purge                          # down + remove ~/.sandboxctl (prompts)
-sandboxctl tui                            # live status dashboard
+sandboxctl trust-ca                       # re-trust the per-install root CA in the System keychain
+sandboxctl untrust-ca                     # remove the root CA from the System keychain
+sandboxctl tui                            # live status dashboard (Bubble Tea)
 ```
 
 ### Sizing the cluster
@@ -346,9 +363,10 @@ four surfaces, explains each one, and prompts before doing anything:
 
 ```sh
 sandboxctl prune                          # interactive — diagnoses all four
-sandboxctl prune runtime                  # only podman/docker VM
-sandboxctl prune registry                 # only the in-cluster registry
-sandboxctl prune --yes                    # accept every prompt (scripted use)
+sandboxctl prune runtime                  # only podman/docker VM (positional shorthand)
+sandboxctl prune --only registry          # explicit form: host | dmgs | runtime | registry
+sandboxctl prune --yes                    # accept every prompt (scripted use; alias: -y)
+sandboxctl cleanup                        # alias for `prune` — same flags
 ```
 
 Stages, in order:
@@ -475,8 +493,11 @@ Defaults work for most people. Override via env vars:
 | `SANDBOX_RUNTIME` | `podman` | `podman` or `docker` |
 | `PODMAN_MACHINE_CPUS` | `4` | CPUs the podman VM gets at init |
 | `PODMAN_MACHINE_MEMORY_MIB` | `6144` | RAM in MiB |
+| `PODMAN_MACHINE_DISK_GIB` | `60` | virtual-disk size for the podman VM at init. podman has no in-place disk grow — use `setup-podman --disk-size N --recreate` to bump an existing machine. Same as `setup-podman --disk-size N`. |
 | `KIND_NODE_IMAGE` | `kindest/node:v1.35.0` | kind node image |
 | `SANDBOX_WORKER_COUNT` | `1` | kind worker nodes (1–3). Same as `--workers N`. |
+| `SANDBOX_BUILD_PURGE_OLD_TAGS` | `0` | wipe prior tags of each repo before pushing during `build`/`deploy`/`bootstrap`, then registry-GC at the end. Same as `--purge-old-tags`. |
+| `ARGO_HEALTH_ATTEMPTS` | `3` | number of 180s windows `deploy` waits for an Argo Application to become Synced+Healthy (default covers up to 9 min for slow CRD-heavy syncs). |
 | `ARGOCD_CHART_VERSION` | `9.5.13` | argo-cd chart version |
 | `KARGO_CHART_VERSION` | `1.1.1` | kargo chart version |
 | `REFLECTOR_CHART_VERSION` | `9.1.7` | emberstack/reflector chart version |
