@@ -4305,11 +4305,13 @@ _chart_helm_overrides() {
 
   # Read explicit overrides from the build manifest (primary_service is
   # consumed by _route_app_service; we only need chart_image_map here).
-  declare -A chart_image_map=()
+  # macOS still ships bash 3.2 with no associative arrays — flatten the
+  # map to a tab-separated `name<TAB>group` string and look up linearly.
+  local chart_image_map=""
   if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
     while IFS='=' read -r key val; do
       case "$key" in
-        chart_image_map.*) chart_image_map["${key#chart_image_map.}"]="$val" ;;
+        chart_image_map.*) chart_image_map+="${key#chart_image_map.}"$'\t'"${val}"$'\n' ;;
       esac
     done < <("$sandboxctl_bin" _manifest-extras "$deploy_manifest" 2>/dev/null)
   fi
@@ -4331,7 +4333,10 @@ _chart_helm_overrides() {
     local iname _ictx _idf itag _ial _idep
     while IFS=$'\t' read -r iname _ictx _idf itag _ial _idep; do
       [[ -n "$iname" ]] || continue
-      local group_path="${chart_image_map[$iname]:-}"
+      local group_path=""
+      if [[ -n "$chart_image_map" ]]; then
+        group_path="$(printf '%s' "$chart_image_map" | awk -F'\t' -v k="$iname" '$1==k{print $2; exit}')"
+      fi
       if [[ -z "$group_path" ]]; then
         # Heuristic: pick the values group whose dot-path contains the
         # image name as a segment (e.g. image "ui" → group "ui.image").
