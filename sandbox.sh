@@ -4667,7 +4667,7 @@ _restart_app_workloads() {
 # intent rather than asking the user to learn a new convention.
 _route_app_service() {
   local cname="$1" namespace="$2" hostname="$3" deploy_manifest="${4:-}"
-  local sandboxctl_bin svc svc_port pick_reason=""
+  local sandboxctl_bin="" svc="" svc_port="" pick_reason=""
 
   sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
 
@@ -4694,10 +4694,10 @@ _route_app_service() {
 
   # 3. Scored heuristic
   if [[ -z "$svc" && -n "$sandboxctl_bin" ]]; then
-    local svc_json
+    local svc_json=""
     svc_json="$(kc -n "$namespace" get svc -o json 2>/dev/null || true)"
     if [[ -n "$svc_json" ]]; then
-      local sname sport sscore sreasons
+      local sname="" sport="" sscore="" sreasons=""
       while IFS=$'\t' read -r sname sport sscore sreasons; do
         if [[ -z "$svc" && -n "$sname" ]]; then
           svc="$sname"
