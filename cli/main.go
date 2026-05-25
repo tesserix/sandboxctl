@@ -74,7 +74,9 @@ func known(sub string) bool {
 		"_autogen-manifest",
 		"_chart-ingress-overrides",
 		"_chart-image-keys",
+		"_chart-image-strings",
 		"_chart-mimic-values",
+		"_chart-resolve-image-pins",
 		"_score-services",
 		"_manifest-extras":
 		return true
@@ -126,8 +128,14 @@ func main() {
 	if sub == "_chart-image-keys" {
 		os.Exit(runChartImageKeys(os.Args[2:]))
 	}
+	if sub == "_chart-image-strings" {
+		os.Exit(runChartImageStrings(os.Args[2:]))
+	}
 	if sub == "_chart-mimic-values" {
 		os.Exit(runChartMimicValues(os.Args[2:]))
+	}
+	if sub == "_chart-resolve-image-pins" {
+		os.Exit(runChartResolveImagePins(os.Args[2:]))
 	}
 	if sub == "_score-services" {
 		os.Exit(runScoreServices(os.Args[2:]))

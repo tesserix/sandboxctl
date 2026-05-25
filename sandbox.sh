@@ -4309,22 +4309,20 @@ _ensure_sandbox_values_file() {
   [[ -d "$src_dir" ]] || { printf ''; return 0; }
   [[ -f "${src_dir}/values.yaml" ]] || { printf ''; return 0; }
 
-  # Build "<image>=<repo>:<tag>" pins from the build manifest. The
-  # mimic helper matches each pin against the dot-path of every image
-  # group in values.yaml (segment-equal) or the basename of its existing
-  # repository, so charts written with conventions like `backend.image`
-  # vs. `images.api` both light up without per-chart configuration.
+  # Resolve build-manifest images to chart-values slots. Each chart slot
+  # is claimed at most once: the resolver returns one
+  # `<path>\t<kind>\t<image>\t<tag>` row per claim, and we forward those
+  # to the mimic helper as `--by-path` pins. Slots can be of kind:
+  #   • keys   — `{ repository, tag }` group; mimic writes both fields
+  #   • string — inline image scalar; mimic overwrites the value
   local pins=() pin_count=0
   if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
-    local iname _ictx _idf itag _ial _idep entries
-    entries="$("$sandboxctl_bin" _parse-build-manifest "$deploy_manifest" 2>/dev/null || true)"
-    if [[ -n "$entries" ]]; then
-      while IFS=$'\t' read -r iname _ictx _idf itag _ial _idep; do
-        [[ -n "$iname" ]] || continue
-        pins+=("${iname}=localhost:${SANDBOX_REGISTRY_PORT}/${iname}:${itag:-latest}")
-        pin_count=$((pin_count + 1))
-      done <<<"$entries"
-    fi
+    local rpath rkind rimg rtag
+    while IFS=$'\t' read -r rpath rkind rimg rtag; do
+      [[ -n "$rpath" && -n "$rkind" && -n "$rimg" ]] || continue
+      pins+=("--by-path" "${rpath}=${rkind}:localhost:${SANDBOX_REGISTRY_PORT}/${rimg}:${rtag:-latest}")
+      pin_count=$((pin_count + 1))
+    done < <("$sandboxctl_bin" _chart-resolve-image-pins "$src_dir" "$deploy_manifest" "$cname" 2>/dev/null || true)
   fi
 
   local out_path="${src_dir}/values-sandbox.yaml"
@@ -4343,9 +4341,8 @@ _ensure_sandbox_values_file() {
 
 # Compute the full set of Argo helm parameters the chart should be deployed
 # with. Output is one `name=value` line per parameter (sorted, deterministic).
-# Combines three independent passes — each is opt-in and skips silently when
-# its inputs are missing, so legacy single-image charts behave exactly as
-# before:
+# Combines two independent passes — each is opt-in and skips silently when
+# its inputs are missing:
 #
 #   1. Ingress auto-disable.  Any `*.ingress.enabled = true` (or `.create = true`)
 #      key found in the chart's values.yaml is flipped to `false`. sandboxctl
@@ -4353,18 +4350,20 @@ _ensure_sandbox_values_file() {
 #      chart-shipped Ingress would either fight that VirtualService or stall
 #      forever waiting for an IngressClass that this cluster doesn't ship.
 #
-#   2. Multi-image pinning.  Walks the chart's values.yaml for image groups
-#      shaped `{ repository: ..., tag: ... }`, matches each build-manifest
-#      image to a group (explicit `chart_image_map` first; otherwise the
-#      group whose dot-path contains the image name as a segment), and emits
-#      `<group>.repository=localhost:<reg-port>/<image>` + `<group>.tag=<tag>`.
-#      Falls back to the legacy `image.repository`/`image.tag` pair when the
-#      chart exposes a single top-level image (kept compatible with charts
-#      written before sandboxctl learned about nested image groups).
+#   2. Image pinning. The Go helper `_chart-resolve-image-pins` walks the
+#      chart's values.yaml for both `{ repository, tag }` groups AND inline
+#      image-string scalars (e.g. `agentImages.sdk: ghcr.io/.../foo@sha256:…`),
+#      then matches each build-manifest image to one chart slot. The
+#      one-pin-per-slot invariant prevents the bug where N build images all
+#      collapsed onto a single `image.repository` (last-write-wins), which
+#      caused charts to deploy with the wrong image. Build images that find
+#      no slot are skipped — duplicating onto a wrong slot is *worse* than
+#      not pinning at all.
 #
-#   3. Explicit overrides.  Any extra `--set` lines a chart author wants
-#      sandboxctl to pass through — read straight from sandboxctl.yaml
-#      under future-proofed keys via `_manifest-extras`.
+# Per-pin emission shape:
+#   • kind=keys    →  `<path>.repository=…` + `<path>.tag=…`
+#   • kind=string  →  `<path>=<repo>:<tag>`  (Argo helm parameter overwriting
+#                     the inline scalar; helm/Argo accept arbitrary key paths)
 #
 # Diagnostics: each decision is logged with its reason so the deploy
 # transcript shows *why* a particular parameter was injected.
@@ -4382,70 +4381,31 @@ _chart_helm_overrides() {
     log "[${cname}] auto-disabling chart toggle ${toggle}=false (sandboxctl owns external routing)" >&2
   done < <("$sandboxctl_bin" _chart-ingress-overrides "$src_dir" 2>/dev/null)
 
-  # Read explicit overrides from the build manifest (primary_service is
-  # consumed by _route_app_service; we only need chart_image_map here).
-  # macOS still ships bash 3.2 with no associative arrays — flatten the
-  # map to a tab-separated `name<TAB>group` string and look up linearly.
-  local chart_image_map=""
-  if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
-    while IFS='=' read -r key val; do
-      case "$key" in
-        chart_image_map.*) chart_image_map+="${key#chart_image_map.}"$'\t'"${val}"$'\n' ;;
-      esac
-    done < <("$sandboxctl_bin" _manifest-extras "$deploy_manifest" 2>/dev/null)
-  fi
-
-  # Stage 2 — multi-image pinning. Build a name→group lookup from the
-  # chart's values.yaml, then walk the build manifest to pin each image
-  # we know how to place. Charts with no `repository:` anywhere in their
-  # values.yaml emit nothing here, falling back to legacy single-image.
-  local image_groups=""
-  image_groups="$("$sandboxctl_bin" _chart-image-keys "$src_dir" 2>/dev/null || true)"
-
-  local entries=""
-  if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
-    entries="$("$sandboxctl_bin" _parse-build-manifest "$deploy_manifest" 2>/dev/null || true)"
-  fi
-
+  # Stage 2 — image pinning. Resolver guarantees one pin per chart slot.
   local pinned_any=0
-  if [[ -n "$entries" && -n "$image_groups" ]]; then
-    local iname _ictx _idf itag _ial _idep
-    while IFS=$'\t' read -r iname _ictx _idf itag _ial _idep; do
-      [[ -n "$iname" ]] || continue
-      local group_path=""
-      if [[ -n "$chart_image_map" ]]; then
-        group_path="$(printf '%s' "$chart_image_map" | awk -F'\t' -v k="$iname" '$1==k{print $2; exit}')"
-      fi
-      if [[ -z "$group_path" ]]; then
-        # Heuristic: pick the values group whose dot-path contains the
-        # image name as a segment (e.g. image "ui" → group "ui.image").
-        # Falls back to the lone group when there's exactly one — keeps
-        # single-image charts working without naming gymnastics.
-        local group_count
-        group_count="$(printf '%s\n' "$image_groups" | grep -c . || true)"
-        local gp _grepo _gtag
-        while IFS=$'\t' read -r gp _grepo _gtag; do
-          [[ -n "$gp" ]] || continue
-          case ".$gp." in
-            *.$iname.*) group_path="$gp"; break ;;
-          esac
-        done <<<"$image_groups"
-        if [[ -z "$group_path" && "$group_count" == "1" ]]; then
-          group_path="$(printf '%s\n' "$image_groups" | head -n1 | cut -f1)"
-        fi
-      fi
-      [[ -n "$group_path" ]] || continue
-      printf '%s.repository=localhost:%s/%s\n' "$group_path" "$SANDBOX_REGISTRY_PORT" "$iname"
-      printf '%s.tag=%s\n' "$group_path" "${itag:-latest}"
-      log "[${cname}] pinning ${group_path} → localhost:${SANDBOX_REGISTRY_PORT}/${iname}:${itag:-latest}" >&2
+  if [[ -n "$deploy_manifest" && -f "$deploy_manifest" ]]; then
+    local rpath rkind rimg rtag
+    while IFS=$'\t' read -r rpath rkind rimg rtag; do
+      [[ -n "$rpath" && -n "$rkind" && -n "$rimg" ]] || continue
+      case "$rkind" in
+        keys)
+          printf '%s.repository=localhost:%s/%s\n' "$rpath" "$SANDBOX_REGISTRY_PORT" "$rimg"
+          printf '%s.tag=%s\n' "$rpath" "${rtag:-latest}"
+          ;;
+        string)
+          printf '%s=localhost:%s/%s:%s\n' "$rpath" "$SANDBOX_REGISTRY_PORT" "$rimg" "${rtag:-latest}"
+          ;;
+        *) continue ;;
+      esac
+      log "[${cname}] pinning ${rpath} (${rkind}) → localhost:${SANDBOX_REGISTRY_PORT}/${rimg}:${rtag:-latest}" >&2
       pinned_any=1
-    done <<<"$entries"
+    done < <("$sandboxctl_bin" _chart-resolve-image-pins "$src_dir" "$deploy_manifest" "$cname" 2>/dev/null || true)
   fi
 
   # Stage 2 fallback — legacy single-image behaviour. Only fires when the
-  # multi-image walk didn't pin anything (chart has no image groups OR
-  # build manifest empty), to preserve the existing `_image_ref_for_chart`
-  # contract for older charts.
+  # resolver returned nothing (chart with no image surfaces, or no build
+  # manifest images matched), to preserve the `_image_ref_for_chart`
+  # contract for charts written before the resolver existed.
   if [[ "$pinned_any" == "0" && -n "$deploy_manifest" ]]; then
     local legacy_ref
     legacy_ref="$(_image_ref_for_chart "$cname" "$deploy_manifest" "$chart_count")"

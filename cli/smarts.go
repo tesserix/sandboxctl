@@ -228,10 +228,453 @@ func mappingImageFields(node *yaml.Node) (repo, tag string, ok bool) {
 }
 
 // ============================================================================
+// Tier 2B: chart-image-string walker
+// ============================================================================
+
+// chartImageString is one detected scalar whose value parses as an OCI image
+// reference. Many charts (fiber, anything written before the
+// `{ repository, tag }` convention took over) carry the image as one inline
+// string under keys like `agentImages.agent` or `sidecars.testrepos.image`.
+// We detect them so the deploy can pin them just like the structured shape.
+type chartImageString struct {
+	Path       string // dot-path to the scalar, e.g. "agentImages.agent"
+	Key        string // the leaf key, e.g. "agent" — used by the matcher
+	Repository string // pre-tag part, e.g. "ghcr.io/acme/api-gateway"
+	Tag        string // empty when the value is bare repo or has only a digest
+	Digest     string // sha256 hex (no "sha256:" prefix), empty when none
+}
+
+// runChartImageStrings implements `_chart-image-strings <chart-dir>`.
+func runChartImageStrings(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: sandboxctl _chart-image-strings <chart-dir>")
+		return 2
+	}
+	chartDir := args[0]
+	valsPath := filepath.Join(chartDir, "values.yaml")
+	data, err := os.ReadFile(valsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "_chart-image-strings: read %s: %v\n", valsPath, err)
+		return 1
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		fmt.Fprintf(os.Stderr, "_chart-image-strings: parse %s: %v\n", valsPath, err)
+		return 1
+	}
+	for _, s := range findImageStrings(&root) {
+		fmt.Printf("%s\t%s\t%s\t%s\t%s\n", s.Path, s.Key, s.Repository, s.Tag, s.Digest)
+	}
+	return 0
+}
+
+// findImageStrings walks the AST for scalar values that look like image
+// references. We're deliberately conservative: only mapping values whose
+// *key* hints at "image" semantics are considered. Otherwise we'd
+// frequently mis-classify things like resource limits, version strings, or
+// URLs as images and rewrite them at deploy time.
+//
+// Accepted leaf-key shapes (case-insensitive, on the *innermost* mapping
+// key only — the leaf):
+//
+//   - "image"
+//   - any key ending in "Image" / "_image" / "-image"
+//   - any key under a path segment named "image" / "images" /
+//     "agentImages" — the parent already says "image goes here".
+//
+// `repository` / `tag` keys *under* an `{ repository, tag }` group are
+// deliberately excluded: those are already covered by findImageKeys, and
+// double-detecting them would produce two slot candidates for one logical
+// image and confuse the resolver's claim accounting.
+//
+// Accepted value shapes (after trim):
+//
+//	[<host>[:<port>]/]<path>[:<tag>][@sha256:<hex>]
+//
+// We require *either* a host/path with a "/" *or* a tag, to avoid
+// matching plain version strings like "1.25" — and we require the leaf
+// hint above so e.g. `port: 80` never sneaks in.
+func findImageStrings(root *yaml.Node) []chartImageString {
+	var out []chartImageString
+	if root == nil || len(root.Content) == 0 {
+		return out
+	}
+	keyPaths := make(map[string]bool)
+	for _, k := range findImageKeys(root) {
+		keyPaths[k.Path] = true
+	}
+	walkYAML(root.Content[0], nil, func(path []string, key string, value *yaml.Node) {
+		if value.Kind != yaml.ScalarNode {
+			return
+		}
+		// Skip `repository`/`tag` scalars that belong to a detected
+		// `{ repository, tag }` group — those are already represented
+		// by findImageKeys and re-detecting them here would produce
+		// duplicate slots for the resolver.
+		if (key == "repository" || key == "tag") && len(path) > 0 && keyPaths[strings.Join(path, ".")] {
+			return
+		}
+		if !looksLikeImageKey(path, key) {
+			return
+		}
+		repo, tag, digest, ok := parseImageRef(strings.TrimSpace(value.Value))
+		if !ok {
+			return
+		}
+		full := append(append([]string{}, path...), key)
+		out = append(out, chartImageString{
+			Path:       strings.Join(full, "."),
+			Key:        key,
+			Repository: repo,
+			Tag:        tag,
+			Digest:     digest,
+		})
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// looksLikeImageKey returns true when the (path, key) pair is plausibly
+// holding an OCI image reference. The rule set is purely structural — no
+// chart-specific names — so any chart that uses common conventions
+// (`image:`, `*Image:`, anything under an `image`/`images` parent) lights
+// up automatically.
+//
+// Rules (case-insensitive):
+//   - leaf key is "image"
+//   - leaf key ends in "image" with a word boundary (e.g. "fooImage",
+//     "foo_image", "foo-image") — but not e.g. "homepage" which contains
+//     "image" embedded mid-word (the word-boundary check rejects it).
+//   - any path segment is "image" or ends in "images" (e.g. "agentImages",
+//     "containerImages") — the parent already says "image goes here".
+func looksLikeImageKey(path []string, key string) bool {
+	lkey := strings.ToLower(key)
+	if lkey == "image" {
+		return true
+	}
+	if strings.HasSuffix(lkey, "image") && len(lkey) > len("image") {
+		boundary := key[len(key)-len("image")-1]
+		if boundary == '_' || boundary == '-' || isUpper(boundary) {
+			return true
+		}
+	}
+	for _, seg := range path {
+		lseg := strings.ToLower(seg)
+		if lseg == "image" {
+			return true
+		}
+		if strings.HasSuffix(lseg, "images") {
+			return true
+		}
+	}
+	return false
+}
+
+func isUpper(b byte) bool { return b >= 'A' && b <= 'Z' }
+
+// parseImageRef parses [<host>[:<port>]/]<path>[:<tag>][@sha256:<hex>] and
+// returns (repository-without-tag, tag, digest-hex, ok). We refuse values
+// that look more like URLs ("http://..."), file paths ("./foo"), or empty
+// strings.
+func parseImageRef(s string) (repo, tag, digest string, ok bool) {
+	if s == "" {
+		return "", "", "", false
+	}
+	// Reject URLs and file paths up-front — those aren't image refs.
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") ||
+		strings.HasPrefix(s, "/") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+		return "", "", "", false
+	}
+	// Reject anything with whitespace — image refs never contain it.
+	if strings.ContainsAny(s, " \t\n") {
+		return "", "", "", false
+	}
+	work := s
+	if at := strings.Index(work, "@sha256:"); at >= 0 {
+		digest = work[at+len("@sha256:"):]
+		work = work[:at]
+		if !isHex(digest) {
+			return "", "", "", false
+		}
+	}
+	// Tag: a colon AFTER the last slash (so we don't confuse a registry
+	// port like "localhost:5000/foo" for a tag).
+	if colon := strings.LastIndexByte(work, ':'); colon >= 0 {
+		slash := strings.LastIndexByte(work, '/')
+		if colon > slash {
+			tag = work[colon+1:]
+			work = work[:colon]
+			if tag == "" {
+				return "", "", "", false
+			}
+		}
+	}
+	repo = work
+	if repo == "" {
+		return "", "", "", false
+	}
+	// Need at least a "/" (denoting host or path) OR a tag to call it
+	// an image. Bare scalars like "fiber" or "1.25" are rejected.
+	if !strings.Contains(repo, "/") && tag == "" && digest == "" {
+		return "", "", "", false
+	}
+	return repo, tag, digest, true
+}
+
+func isHex(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// ============================================================================
+// Tier 2C: resolve build-manifest images to chart-values pins
+// ============================================================================
+
+// resolvedPin is one (chart-group → build-image) decision. Each chart
+// group is claimed at most once across the resolution: that invariant
+// prevents the regression where N build images all wrote to the same
+// `image.repository`/`image.tag` pair, last-write-wins.
+//
+// The pin is registry-agnostic by design — it only carries the build
+// manifest's image *name* + tag. The shell wrapper (sandbox.sh) is what
+// formats the final repository URL using the live registry host/port,
+// so this helper stays portable across any sandbox configuration.
+type resolvedPin struct {
+	Path  string // dot-path of the chart-values key being claimed
+	Kind  string // "keys" for { repository, tag } groups, "string" for inline
+	Image string // build-manifest image name — caller prefixes with registry host
+	Tag   string // build-manifest tag (defaults to "latest")
+}
+
+// runChartResolveImagePins implements
+//
+//	`_chart-resolve-image-pins <chart-dir> <build-manifest> [<chart-name>]`
+//
+// Output is one tab-separated line per claimed pin:
+//
+//	<group-path>\t<kind>\t<image>\t<repository>\t<tag>
+//
+// Build-manifest images that don't match any chart key produce no output:
+// the chart simply has nothing to receive that image, and silently
+// skipping is the correct behaviour (the alternative — emitting a
+// duplicate `image.repository` pin — is exactly the v2.10.2 bug). A
+// stderr diagnostic is emitted per skip so the user can see what was
+// dropped and why.
+func runChartResolveImagePins(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: sandboxctl _chart-resolve-image-pins <chart-dir> <build-manifest> [<chart-name>]")
+		return 2
+	}
+	chartDir, manifestPath := args[0], args[1]
+	chartName := ""
+	if len(args) >= 3 {
+		chartName = args[2]
+	}
+
+	// Build-manifest images.
+	mdata, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "_chart-resolve-image-pins: read %s: %v\n", manifestPath, err)
+		return 1
+	}
+	var bm buildManifest
+	if err := yaml.Unmarshal(mdata, &bm); err != nil {
+		fmt.Fprintf(os.Stderr, "_chart-resolve-image-pins: parse %s: %v\n", manifestPath, err)
+		return 1
+	}
+
+	// Optional chart_image_map override from the same manifest.
+	var ex manifestExtras
+	_ = yaml.Unmarshal(mdata, &ex)
+
+	// Chart-values image surfaces.
+	var keys []chartImageKey
+	var strs []chartImageString
+	if data, err := os.ReadFile(filepath.Join(chartDir, "values.yaml")); err == nil {
+		var root yaml.Node
+		if err := yaml.Unmarshal(data, &root); err == nil {
+			keys = findImageKeys(&root)
+			strs = findImageStrings(&root)
+		}
+	}
+
+	pins, skipped := resolveImagePins(bm.Images, keys, strs, ex.ChartImageMap, chartName)
+	for _, p := range pins {
+		fmt.Printf("%s\t%s\t%s\t%s\n", p.Path, p.Kind, p.Image, p.Tag)
+	}
+	for _, s := range skipped {
+		fmt.Fprintf(os.Stderr, "_chart-resolve-image-pins: skipped image %q — no matching chart key\n", s)
+	}
+	return 0
+}
+
+// resolveImagePins is the matching algorithm — split out so it's
+// directly testable. The algorithm:
+//
+//  1. Build the candidate-pool of chart slots (keys + strs).
+//  2. For each build-manifest image, claim the first matching slot:
+//     a. explicit chart_image_map override (if its target slot exists)
+//     b. dot-path contains a segment equal to the image name
+//     c. existing repository basename equals image name (tries direct,
+//     then with the chart name stripped as a prefix — fiber-claude-agent
+//     vs. claude-agent)
+//     d. lone `{ repository, tag }` group AND image name == chart name
+//     (the legacy single-image fallback, but only for the chart's
+//     namesake image — never for arbitrary other images)
+//  3. Each slot can be claimed at most once. Build images that find no
+//     slot are reported as skipped.
+//
+// Image ordering follows the build manifest, so the user sees stable
+// pin assignments across deploys.
+func resolveImagePins(
+	images []manifestImage,
+	keys []chartImageKey,
+	strs []chartImageString,
+	chartImageMap map[string]string,
+	chartName string,
+) (pins []resolvedPin, skipped []string) {
+	type slot struct {
+		path string
+		kind string // "keys" or "string"
+		repo string
+	}
+	slots := make([]slot, 0, len(keys)+len(strs))
+	for _, k := range keys {
+		slots = append(slots, slot{path: k.Path, kind: "keys", repo: k.Repository})
+	}
+	for _, s := range strs {
+		slots = append(slots, slot{path: s.Path, kind: "string", repo: s.Repository})
+	}
+
+	claimed := make(map[string]bool, len(slots))
+
+	findFreeSlot := func(predicate func(slot) bool) (slot, bool) {
+		for _, s := range slots {
+			if claimed[s.path] {
+				continue
+			}
+			if predicate(s) {
+				return s, true
+			}
+		}
+		return slot{}, false
+	}
+
+	pins = make([]resolvedPin, 0, len(images))
+	for _, img := range images {
+		if img.Name == "" {
+			continue
+		}
+		tag := img.Tag
+		if tag == "" {
+			tag = "latest"
+		}
+
+		var match slot
+		var ok bool
+
+		if mapped, exists := chartImageMap[img.Name]; exists && mapped != "" {
+			match, ok = findFreeSlot(func(s slot) bool { return s.path == mapped })
+		}
+
+		if !ok {
+			match, ok = findFreeSlot(func(s slot) bool {
+				for _, seg := range strings.Split(s.path, ".") {
+					if seg == img.Name {
+						return true
+					}
+				}
+				return false
+			})
+		}
+
+		// Rule 2.5: dashed-image-name → trailing segment.
+		// e.g. build image "agent-sdk" → chart slot "agentImages.sdk";
+		//      build image "claude-agent" → chart slot "agentImages.agent".
+		// We match the *last* dash-segment of the build image name
+		// against any path segment of the slot. Conservative: only
+		// fires when the image actually contains a dash, so plain
+		// names ("api", "ui") aren't accidentally widened.
+		if !ok && strings.Contains(img.Name, "-") {
+			tail := img.Name[strings.LastIndexByte(img.Name, '-')+1:]
+			match, ok = findFreeSlot(func(s slot) bool {
+				for _, seg := range strings.Split(s.path, ".") {
+					if seg == tail {
+						return true
+					}
+				}
+				return false
+			})
+		}
+
+		if !ok {
+			match, ok = findFreeSlot(func(s slot) bool {
+				base := repoBasename(s.repo)
+				if base == img.Name {
+					return true
+				}
+				if chartName != "" {
+					stripped := strings.TrimPrefix(base, chartName+"-")
+					if stripped == img.Name {
+						return true
+					}
+				}
+				return false
+			})
+		}
+
+		if !ok && chartName != "" && img.Name == chartName {
+			// Legacy single-image fallback: only for the chart's namesake
+			// image, only when the chart has exactly one { repository, tag }
+			// group at top level, and only if it isn't already claimed.
+			if len(keys) == 1 && keys[0].Path == "image" && !claimed[keys[0].Path] {
+				match, ok = slot{path: keys[0].Path, kind: "keys", repo: keys[0].Repository}, true
+			}
+		}
+
+		if !ok {
+			skipped = append(skipped, img.Name)
+			continue
+		}
+		claimed[match.path] = true
+		pins = append(pins, resolvedPin{
+			Path:  match.path,
+			Kind:  match.kind,
+			Image: img.Name,
+			Tag:   tag,
+		})
+	}
+	return pins, skipped
+}
+
+// repoBasename returns the last path segment of a repository value,
+// e.g. "ghcr.io/acme/foo" → "foo". An empty string returns "".
+func repoBasename(repo string) string {
+	if i := strings.LastIndexByte(repo, '/'); i >= 0 {
+		return repo[i+1:]
+	}
+	return repo
+}
+
+// ============================================================================
 // Tier 1C: mimic chart values.yaml as a sandbox-local values file
 // ============================================================================
 
-// runChartMimicValues implements `_chart-mimic-values <chart-dir> <out-path> [<image>=<repo>:<tag>...]`.
+// runChartMimicValues implements `_chart-mimic-values <chart-dir> <out-path> [<pin>...]`.
 //
 // Generates a sandbox-flavoured values file by copying the chart's
 // values.yaml and applying two non-destructive edits:
@@ -242,11 +685,23 @@ func mappingImageFields(node *yaml.Node) (repo, tag string, ok bool) {
 //     templates would either fight the VirtualService or stall waiting
 //     for an IngressClass that this cluster does not ship;
 //
-//  2. rewrite each `{ repository, tag }` image group whose containing
-//     path or repository basename matches one of the supplied
-//     `<image>=<repo>:<tag>` pins. Pins typically come from the build
-//     manifest; charts whose images are not in the build manifest are
-//     left untouched (Argo helm.parameters can still pin them).
+//  2. rewrite chart-values image fields to point at the in-cluster
+//     registry. Two pin forms are accepted:
+//
+//     - heuristic:    <image-name>=<repo>:<tag>
+//     The walker matches the image-name to a `{ repository, tag }`
+//     group by path segment, repo basename, or lone-fallback. Kept
+//     for direct callers and for backward compat.
+//
+//     - resolved:     --by-path <group-path>=<kind>:<repo>:<tag>
+//     <kind> is "keys" (write `repository`/`tag` on the group) or
+//     "string" (overwrite the inline-string scalar at <group-path>).
+//     This form bypasses the heuristic — the deploy flow uses it
+//     after `_chart-resolve-image-pins` has assigned each pin to
+//     exactly one slot, so we never overwrite the same key twice.
+//
+//     Charts whose images aren't named in either form are left untouched
+//     (Argo helm.parameters can still pin them).
 //
 // Output is written atomically (tempfile + rename) so a partially-written
 // file can never replace a good values file. The file is intentionally
@@ -257,11 +712,12 @@ func mappingImageFields(node *yaml.Node) (repo, tag string, ok bool) {
 // only on real I/O or parse failures.
 func runChartMimicValues(args []string) int {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: sandboxctl _chart-mimic-values <chart-dir> <out-path> [<image>=<repo>:<tag>...]")
+		fmt.Fprintln(os.Stderr, "usage: sandboxctl _chart-mimic-values <chart-dir> <out-path> [--by-path <path>=<kind>:<repo>:<tag>] [<image>=<repo>:<tag>...]")
 		return 2
 	}
 	chartDir, outPath := args[0], args[1]
-	pins, err := parseImagePins(args[2:])
+
+	heuristic, resolved, err := parseMimicPins(args[2:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "_chart-mimic-values: %v\n", err)
 		return 2
@@ -283,7 +739,8 @@ func runChartMimicValues(args []string) int {
 		return 1
 	}
 
-	mutateChartValues(&root, pins)
+	mutateChartValues(&root, heuristic)
+	applyResolvedPins(&root, resolved)
 
 	out, err := yaml.Marshal(&root)
 	if err != nil {
@@ -310,15 +767,57 @@ type imagePin struct {
 	Tag  string
 }
 
-// parseImagePins accepts <image-name>=<repo>:<tag> tokens. The image-name
-// is matched against the dot-path of the image group (any path segment
-// equal to the name) and the basename of the existing repository value.
+// parseImagePins parses the legacy heuristic-only form, kept for
+// backward compatibility with direct callers and existing tests.
 func parseImagePins(args []string) (map[string]imagePin, error) {
-	out := map[string]imagePin{}
-	for _, a := range args {
+	heuristic, resolved, err := parseMimicPins(args)
+	if err != nil {
+		return nil, err
+	}
+	if len(resolved) > 0 {
+		return nil, fmt.Errorf("parseImagePins does not accept --by-path pins")
+	}
+	return heuristic, nil
+}
+
+// resolvedMimicPin is one pre-resolved chart-values rewrite. The mimic
+// helper trusts these — the resolver upstream guarantees no two pins
+// touch the same path.
+type resolvedMimicPin struct {
+	Path string
+	Kind string // "keys" or "string"
+	Repo string
+	Tag  string
+}
+
+// parseMimicPins demuxes the post-positional args of _chart-mimic-values.
+// Two forms coexist:
+//
+//	<name>=<repo>:<tag>                     → heuristic pin (legacy form)
+//	--by-path <path>=<kind>:<repo>:<tag>    → already-resolved pin
+//
+// Multiple of either form may be passed. Pins with empty fields are
+// rejected so a malformed pin can't silently no-op.
+func parseMimicPins(args []string) (map[string]imagePin, []resolvedMimicPin, error) {
+	heuristic := map[string]imagePin{}
+	var resolved []resolvedMimicPin
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--by-path" {
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("--by-path needs an argument")
+			}
+			i++
+			r, err := parseResolvedPin(args[i])
+			if err != nil {
+				return nil, nil, err
+			}
+			resolved = append(resolved, r)
+			continue
+		}
 		eq := strings.IndexByte(a, '=')
 		if eq <= 0 {
-			return nil, fmt.Errorf("invalid pin %q (want <name>=<repo>:<tag>)", a)
+			return nil, nil, fmt.Errorf("invalid pin %q (want <name>=<repo>:<tag>)", a)
 		}
 		name, ref := a[:eq], a[eq+1:]
 		colon := strings.LastIndexByte(ref, ':')
@@ -326,9 +825,123 @@ func parseImagePins(args []string) (map[string]imagePin, error) {
 		if colon > 0 && !strings.Contains(ref[colon:], "/") {
 			repo, tag = ref[:colon], ref[colon+1:]
 		}
-		out[name] = imagePin{Repo: repo, Tag: tag}
+		heuristic[name] = imagePin{Repo: repo, Tag: tag}
 	}
-	return out, nil
+	return heuristic, resolved, nil
+}
+
+// parseResolvedPin parses one --by-path argument:
+//
+//	<dot.path>=<kind>:<repo>:<tag>
+//
+// The format uses ':' as field separator, but `<repo>` itself often
+// contains a ':' for the host port (e.g. "localhost:5050/foo"). We split
+// the kind off as the first ':'-delimited field, then split tag off as
+// everything *after the last ':' that isn't followed by a '/'* — which
+// matches the same rule parseImageRef uses to find the tag separator in
+// an image reference.
+func parseResolvedPin(a string) (resolvedMimicPin, error) {
+	eq := strings.IndexByte(a, '=')
+	if eq <= 0 {
+		return resolvedMimicPin{}, fmt.Errorf("invalid --by-path pin %q (want <path>=<kind>:<repo>:<tag>)", a)
+	}
+	path, rest := a[:eq], a[eq+1:]
+	colon := strings.IndexByte(rest, ':')
+	if colon <= 0 {
+		return resolvedMimicPin{}, fmt.Errorf("invalid --by-path pin %q (need kind:repo:tag)", a)
+	}
+	kind := rest[:colon]
+	body := rest[colon+1:]
+	repo, tag, _, ok := parseImageRef(body)
+	if !ok || tag == "" {
+		return resolvedMimicPin{}, fmt.Errorf("invalid --by-path pin %q (could not split %q into repo:tag)", a, body)
+	}
+	if path == "" || repo == "" || (kind != "keys" && kind != "string") {
+		return resolvedMimicPin{}, fmt.Errorf("invalid --by-path pin %q (kind must be keys|string; path/repo/tag must be non-empty)", a)
+	}
+	return resolvedMimicPin{Path: path, Kind: kind, Repo: repo, Tag: tag}, nil
+}
+
+// applyResolvedPins rewrites the chart values tree using the upstream-
+// resolved pin list. Each pin specifies the exact dot-path of the slot
+// to update, so no heuristic matching happens here. For "keys" pins we
+// set/append `repository` and `tag` on the addressed mapping node; for
+// "string" pins we replace the addressed scalar value.
+func applyResolvedPins(root *yaml.Node, pins []resolvedMimicPin) {
+	if root == nil || len(root.Content) == 0 || len(pins) == 0 {
+		return
+	}
+	doc := root.Content[0]
+	for _, p := range pins {
+		switch p.Kind {
+		case "keys":
+			if node := findMappingByPath(doc, strings.Split(p.Path, ".")); node != nil {
+				setMappingScalar(node, "repository", p.Repo)
+				setMappingScalar(node, "tag", p.Tag)
+			}
+		case "string":
+			ref := p.Repo + ":" + p.Tag
+			setScalarByPath(doc, strings.Split(p.Path, "."), ref)
+		}
+	}
+}
+
+// findMappingByPath walks a yaml.Node mapping tree to the dot-path
+// segments and returns the addressed mapping node, or nil if any segment
+// doesn't resolve to a mapping along the way.
+func findMappingByPath(node *yaml.Node, segs []string) *yaml.Node {
+	cur := node
+	for _, seg := range segs {
+		if cur == nil || cur.Kind != yaml.MappingNode {
+			return nil
+		}
+		var next *yaml.Node
+		for i := 0; i+1 < len(cur.Content); i += 2 {
+			k, v := cur.Content[i], cur.Content[i+1]
+			if k.Kind == yaml.ScalarNode && k.Value == seg {
+				next = v
+				break
+			}
+		}
+		if next == nil {
+			return nil
+		}
+		cur = next
+	}
+	if cur == nil || cur.Kind != yaml.MappingNode {
+		return nil
+	}
+	return cur
+}
+
+// setScalarByPath walks to the addressed scalar (creating no nodes —
+// missing paths are silently dropped) and replaces its value.
+func setScalarByPath(node *yaml.Node, segs []string, val string) {
+	if len(segs) == 0 {
+		return
+	}
+	cur := node
+	for i, seg := range segs {
+		if cur == nil || cur.Kind != yaml.MappingNode {
+			return
+		}
+		for j := 0; j+1 < len(cur.Content); j += 2 {
+			k, v := cur.Content[j], cur.Content[j+1]
+			if k.Kind != yaml.ScalarNode || k.Value != seg {
+				continue
+			}
+			if i == len(segs)-1 {
+				if v.Kind == yaml.ScalarNode {
+					v.Value = val
+					v.Tag = "!!str"
+					v.Style = 0
+				}
+				return
+			}
+			cur = v
+			break
+		}
+	}
 }
 
 // mutateChartValues walks the parsed values.yaml node and applies the

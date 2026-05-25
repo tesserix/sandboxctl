@@ -383,6 +383,202 @@ func parseYAML(t *testing.T, body string) *yaml.Node {
 	return &n
 }
 
+// ----------------------------------------------------------------------------
+// Tier 2B: findImageStrings (inline-string image values)
+// ----------------------------------------------------------------------------
+
+func TestFindImageStrings_AgentImagesAndSidecar(t *testing.T) {
+	body := `
+agentImages:
+  agent: ghcr.io/acme/agent@sha256:` + strings.Repeat("a", 64) + `
+  sdk: ghcr.io/acme/sdk:1.2.3
+sidecars:
+  testrepos:
+    image: ghcr.io/acme/repos:latest
+`
+	got := stringsFromYAML(t, body)
+	wantPaths := []string{"agentImages.agent", "agentImages.sdk", "sidecars.testrepos.image"}
+	gotPaths := make([]string, len(got))
+	for i, s := range got {
+		gotPaths[i] = s.Path
+	}
+	if !reflect.DeepEqual(gotPaths, wantPaths) {
+		t.Fatalf("paths got %v want %v", gotPaths, wantPaths)
+	}
+}
+
+func TestFindImageStrings_SkipsRepositoryAndTagUnderImageGroup(t *testing.T) {
+	body := `
+image:
+  repository: ghcr.io/acme/api
+  tag: 1.0
+`
+	got := stringsFromYAML(t, body)
+	// repository/tag belong to a `{ repository, tag }` group — skipped here.
+	if len(got) != 0 {
+		t.Fatalf("expected no inline-string detections, got %#v", got)
+	}
+}
+
+func TestFindImageStrings_RejectsURLsAndPaths(t *testing.T) {
+	body := `
+api:
+  image: https://example.com/foo
+extra:
+  image: ./local/path
+`
+	got := stringsFromYAML(t, body)
+	if len(got) != 0 {
+		t.Fatalf("URLs/paths should not match, got %#v", got)
+	}
+}
+
+func TestParseImageRef_PortAndDigest(t *testing.T) {
+	repo, tag, digest, ok := parseImageRef("localhost:5050/foo:1.2.3@sha256:" + strings.Repeat("a", 64))
+	if !ok || repo != "localhost:5050/foo" || tag != "1.2.3" || len(digest) != 64 {
+		t.Fatalf("got repo=%q tag=%q digest=%q ok=%v", repo, tag, digest, ok)
+	}
+}
+
+func TestParseImageRef_RejectsBareTokens(t *testing.T) {
+	for _, in := range []string{"", "1.25", "fiber", "/abs/path", "./rel"} {
+		if _, _, _, ok := parseImageRef(in); ok {
+			t.Fatalf("expected reject for %q", in)
+		}
+	}
+}
+
+func stringsFromYAML(t *testing.T, body string) []chartImageString {
+	t.Helper()
+	var n yaml.Node
+	if err := yaml.Unmarshal([]byte(body), &n); err != nil {
+		t.Fatal(err)
+	}
+	return findImageStrings(&n)
+}
+
+// ----------------------------------------------------------------------------
+// Tier 2C: resolveImagePins
+// ----------------------------------------------------------------------------
+
+func TestResolveImagePins_OneSlotPerBuildImage(t *testing.T) {
+	keys := []chartImageKey{{Path: "image", Repository: "ghcr.io/acme/app", Tag: "1.0"}}
+	strs := []chartImageString{
+		{Path: "agentImages.sdk", Key: "sdk", Repository: "ghcr.io/acme/sdk"},
+		{Path: "agentImages.agent", Key: "agent", Repository: "ghcr.io/acme/claude-agent"},
+		{Path: "sidecars.testrepos.image", Key: "image", Repository: "ghcr.io/acme/repos"},
+	}
+	images := []manifestImage{
+		{Name: "app"}, {Name: "agent-sdk"}, {Name: "claude-agent"}, {Name: "testrepos"},
+		{Name: "stranger"},
+	}
+	pins, skipped := resolveImagePins(images, keys, strs, nil, "app")
+	wantPaths := []string{"image", "agentImages.sdk", "agentImages.agent", "sidecars.testrepos.image"}
+	gotPaths := make([]string, len(pins))
+	for i, p := range pins {
+		gotPaths[i] = p.Path
+	}
+	if !reflect.DeepEqual(gotPaths, wantPaths) {
+		t.Fatalf("paths got %v want %v", gotPaths, wantPaths)
+	}
+	if !reflect.DeepEqual(skipped, []string{"stranger"}) {
+		t.Fatalf("skipped got %v want [stranger]", skipped)
+	}
+	// No two pins target the same path.
+	seen := map[string]bool{}
+	for _, p := range pins {
+		if seen[p.Path] {
+			t.Fatalf("duplicate claim on %s", p.Path)
+		}
+		seen[p.Path] = true
+	}
+}
+
+func TestResolveImagePins_DoesNotCollapseManyOntoLoneGroup(t *testing.T) {
+	// One image: group, lots of build images. Only the chart's namesake
+	// image (or chart_image_map override) is allowed to claim that single
+	// slot. Everything else is skipped — the bug we're guarding against
+	// is "all 13 build images write to image.repository".
+	keys := []chartImageKey{{Path: "image", Repository: "ghcr.io/acme/app", Tag: "1.0"}}
+	images := []manifestImage{
+		{Name: "app"}, {Name: "agent-sdk"}, {Name: "claude-agent"}, {Name: "extra"},
+	}
+	pins, skipped := resolveImagePins(images, keys, nil, nil, "app")
+	if len(pins) != 1 {
+		t.Fatalf("expected exactly 1 pin, got %d: %#v", len(pins), pins)
+	}
+	if pins[0].Image != "app" || pins[0].Path != "image" {
+		t.Fatalf("expected app→image, got %#v", pins[0])
+	}
+	if !reflect.DeepEqual(skipped, []string{"agent-sdk", "claude-agent", "extra"}) {
+		t.Fatalf("skipped: got %v", skipped)
+	}
+}
+
+func TestResolveImagePins_BasenameStripsChartPrefix(t *testing.T) {
+	strs := []chartImageString{
+		{Path: "agentImages.agent", Repository: "ghcr.io/acme/fiber-claude-agent"},
+	}
+	pins, _ := resolveImagePins(
+		[]manifestImage{{Name: "claude-agent"}},
+		nil, strs, nil, "fiber",
+	)
+	if len(pins) != 1 || pins[0].Path != "agentImages.agent" {
+		t.Fatalf("expected basename-with-strip to claim agentImages.agent, got %#v", pins)
+	}
+}
+
+func TestResolveImagePins_ChartImageMapOverride(t *testing.T) {
+	strs := []chartImageString{{Path: "agentImages.qa", Repository: "ghcr.io/acme/qa"}}
+	chartMap := map[string]string{"quality": "agentImages.qa"}
+	pins, _ := resolveImagePins(
+		[]manifestImage{{Name: "quality"}},
+		nil, strs, chartMap, "fiber",
+	)
+	if len(pins) != 1 || pins[0].Path != "agentImages.qa" || pins[0].Image != "quality" {
+		t.Fatalf("expected chart_image_map to bind quality→agentImages.qa, got %#v", pins)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// applyResolvedPins (mimic helper, by-path mode)
+// ----------------------------------------------------------------------------
+
+func TestApplyResolvedPins_KeysAndString(t *testing.T) {
+	body := `
+image:
+  repository: ghcr.io/acme/app
+  tag: 1.0
+agentImages:
+  sdk: ghcr.io/acme/sdk:1.0
+`
+	root := parseYAML(t, body)
+	applyResolvedPins(root, []resolvedMimicPin{
+		{Path: "image", Kind: "keys", Repo: "localhost:5050/app", Tag: "latest"},
+		{Path: "agentImages.sdk", Kind: "string", Repo: "localhost:5050/sdk", Tag: "latest"},
+	})
+	out, _ := yaml.Marshal(root)
+	for _, want := range []string{
+		"repository: localhost:5050/app",
+		"tag: latest",
+		"sdk: localhost:5050/sdk:latest",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("missing %q in output:\n%s", want, string(out))
+		}
+	}
+}
+
+func TestParseResolvedPin_HandlesPortInRepo(t *testing.T) {
+	got, err := parseResolvedPin("image=keys:localhost:5050/app:latest")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if got.Repo != "localhost:5050/app" || got.Tag != "latest" || got.Kind != "keys" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
 func TestScoreServices_TieBreakAlphabetical(t *testing.T) {
 	svcs := mustSvcList(t, `{"items":[
         {"metadata":{"name":"zeta-thing"},"spec":{"type":"ClusterIP","ports":[]}},
