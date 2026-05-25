@@ -4354,9 +4354,16 @@ EOF
 # Wrapped in with_spinner so the user sees a live elapsed counter
 # instead of a silent pause.
 #
-# Between failed attempts the user is offered an interactive escape
-# hatch (skip remaining waits / abort / keep retrying). On a non-TTY
-# or on read timeout we default to "retry" so CI behavior is unchanged.
+# After a failed attempt we first check the per-resource health Argo
+# reads straight from k8s. When every workload reports Healthy the
+# top-level Application is just lagging — we short-circuit silently
+# instead of burning another 180s window.
+#
+# When the per-resource check is inconclusive, the user is offered an
+# interactive escape hatch (skip remaining waits / keep retrying /
+# abort). On a non-TTY or on read timeout we default to "skip" so
+# deploys finish as soon as the workloads are serving; the deploy
+# summary still surfaces sync/health for verification after the fact.
 ARGO_HEALTH_ATTEMPTS="${ARGO_HEALTH_ATTEMPTS:-3}"
 ARGO_HEALTH_PROMPT_TIMEOUT="${ARGO_HEALTH_PROMPT_TIMEOUT:-15}"
 _wait_argo_health() {
@@ -4370,6 +4377,10 @@ _wait_argo_health() {
       label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s — attempt ${attempt}/${ARGO_HEALTH_ATTEMPTS})"
     fi
     if with_spinner "$label" _wait_argo_health_poll "$cname"; then
+      return 0
+    fi
+    if _argo_app_resources_healthy "$cname"; then
+      ok "[${cname}] all workloads report Healthy — Argo status lagging, continuing without further waits"
       return 0
     fi
     if (( attempt < ARGO_HEALTH_ATTEMPTS )); then
@@ -4391,9 +4402,30 @@ _wait_argo_health() {
   warn "[${cname}] did not become Healthy in ${total}s across ${ARGO_HEALTH_ATTEMPTS} attempts (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
 }
 
+# Returns 0 when every workload Argo tracks for <cname> currently
+# reports Healthy. Reads `.status.resources[*].health.status` directly
+# from the Argo Application — those per-resource values come from k8s
+# without the reconciliation lag of the top-level health field, so a
+# True here means the app IS serving even when Argo's overall status
+# hasn't caught up. Returns 1 when no resource statuses are visible or
+# any one of them is not yet Healthy.
+_argo_app_resources_healthy() {
+  local cname="$1"
+  local healths s
+  healths="$(kc -n "$ARGOCD_NS" get application "$cname" \
+    -o jsonpath='{.status.resources[*].health.status}' 2>/dev/null || true)"
+  [[ -n "$healths" ]] || return 1
+  for s in $healths; do
+    [[ "$s" == "Healthy" ]] || return 1
+  done
+  return 0
+}
+
 # Returns one of: retry | skip | abort on stdout. Side-effects (the
 # prompt itself, status hints) go to stderr so the choice can be
-# captured with $(...).
+# captured with $(...). Defaults (no answer / non-TTY) resolve to
+# "skip" — the deploy summary still surfaces sync/health, so the
+# user can verify after the fact instead of blocking on each chart.
 _argo_health_retry_choice() {
   local cname="$1" attempt="$2"
   local remaining=$(( ARGO_HEALTH_ATTEMPTS - attempt ))
@@ -4402,7 +4434,7 @@ _argo_health_retry_choice() {
   health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
 
   if [[ ! -t 0 || ! -t 2 ]]; then
-    echo retry
+    echo skip
     return
   fi
 
@@ -4414,17 +4446,17 @@ _argo_health_retry_choice() {
 
   local reply=""
   if read -r -t "$ARGO_HEALTH_PROMPT_TIMEOUT" \
-       -p "  > [r]etry / [s]kip remaining waits / [a]bort  (default: retry in ${ARGO_HEALTH_PROMPT_TIMEOUT}s) " \
+       -p "  > [s]kip remaining waits / [r]etry / [a]bort  (default: skip in ${ARGO_HEALTH_PROMPT_TIMEOUT}s) " \
        reply
   then
-    case "${reply:-r}" in
-      s|S|skip|SKIP)   echo skip  ;;
+    case "${reply:-s}" in
+      r|R|retry|RETRY) echo retry ;;
       a|A|abort|ABORT) echo abort ;;
-      *)               echo retry ;;
+      *)               echo skip  ;;
     esac
   else
-    printf '\n  \033[2m> no answer in %ss — continuing with retries\033[0m\n' "$ARGO_HEALTH_PROMPT_TIMEOUT" >&2
-    echo retry
+    printf '\n  \033[2m> no answer in %ss — skipping remaining waits\033[0m\n' "$ARGO_HEALTH_PROMPT_TIMEOUT" >&2
+    echo skip
   fi
 }
 
