@@ -4345,61 +4345,67 @@ EOF
   fi
 }
 
-# Poll Argo CD for an Application to become Synced + Healthy. Each
-# attempt waits up to 180s; we retry up to ARGO_HEALTH_ATTEMPTS times
-# because some charts (image pulls over slow links, CRD-heavy installs,
-# pre-sync hooks) legitimately need more than one 3-minute window before
-# everything settles. Times out with a warning rather than failing —
-# the user can inspect the Argo UI for details and re-run deploy.
-# Wrapped in with_spinner so the user sees a live elapsed counter
-# instead of a silent pause.
+# Poll Argo CD for an Application to become Synced + Healthy with a
+# single 180s attempt — retries are deliberately disabled. In practice
+# the workload is serving long before the top-level Application flips
+# Healthy, so extra 180s windows just delay the deploy without
+# changing the outcome.
 #
-# After a failed attempt we first check the per-resource health Argo
-# reads straight from k8s. When every workload reports Healthy the
-# top-level Application is just lagging — we short-circuit silently
-# instead of burning another 180s window.
+# When the wait window times out we check per-resource health (read
+# straight from k8s via .status.resources[*].health.status). If every
+# workload reports Healthy, the Application is just lagging and we
+# log it as healthy. Otherwise we log the live sync/health values and
+# let the deploy continue — the deploy summary surfaces the final
+# state for verification, and the user can inspect the Argo CD UI.
 #
-# When the per-resource check is inconclusive, the user is offered an
-# interactive escape hatch (skip remaining waits / keep retrying /
-# abort). On a non-TTY or on read timeout we default to "skip" so
-# deploys finish as soon as the workloads are serving; the deploy
-# summary still surfaces sync/health for verification after the fact.
-ARGO_HEALTH_ATTEMPTS="${ARGO_HEALTH_ATTEMPTS:-3}"
-ARGO_HEALTH_PROMPT_TIMEOUT="${ARGO_HEALTH_PROMPT_TIMEOUT:-15}"
+# The previous 3-attempt loop with an interactive [retry/skip/abort]
+# prompt is retained below as commented-out code in case slow links
+# or CRD-heavy installs ever need it back; re-enable by replacing
+# the body with that block and bumping ARGO_HEALTH_ATTEMPTS.
+ARGO_HEALTH_ATTEMPTS="${ARGO_HEALTH_ATTEMPTS:-1}"            # retained for env-var compat; loop is single-shot
+ARGO_HEALTH_PROMPT_TIMEOUT="${ARGO_HEALTH_PROMPT_TIMEOUT:-15}" # retained for env-var compat; prompt is disabled
 _wait_argo_health() {
   local cname="$1"
-  local attempt
-  for (( attempt=1; attempt<=ARGO_HEALTH_ATTEMPTS; attempt++ )); do
-    local label
-    if (( ARGO_HEALTH_ATTEMPTS == 1 )); then
-      label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s)"
-    else
-      label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s — attempt ${attempt}/${ARGO_HEALTH_ATTEMPTS})"
-    fi
-    if with_spinner "$label" _wait_argo_health_poll "$cname"; then
-      return 0
-    fi
-    if _argo_app_resources_healthy "$cname"; then
-      ok "[${cname}] all workloads report Healthy — Argo status lagging, continuing without further waits"
-      return 0
-    fi
-    if (( attempt < ARGO_HEALTH_ATTEMPTS )); then
-      case "$(_argo_health_retry_choice "$cname" "$attempt")" in
-        skip)
-          warn "[${cname}] skipping remaining Argo health waits — continuing with deploy"
-          return 0
-          ;;
-        abort)
-          die "[${cname}] aborted by user during Argo health wait"
-          ;;
-        retry|*) ;;
-      esac
-    fi
-  done
-  local sync health total=$(( ARGO_HEALTH_ATTEMPTS * 180 ))
+  local label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s)"
+  if with_spinner "$label" _wait_argo_health_poll "$cname"; then
+    return 0
+  fi
+  if _argo_app_resources_healthy "$cname"; then
+    ok "[${cname}] all workloads report Healthy — Argo status lagging, continuing without further waits"
+    return 0
+  fi
+  local sync health
   sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
   health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
-  warn "[${cname}] did not become Healthy in ${total}s across ${ARGO_HEALTH_ATTEMPTS} attempts (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
+  warn "[${cname}] not Synced+Healthy after 180s (sync=${sync:-unknown} health=${health:-unknown}) — continuing with deploy; check Argo CD UI for details"
+  return 0
+
+  # --- legacy retry loop (disabled — kept for reference) ---
+  # local attempt
+  # for (( attempt=1; attempt<=ARGO_HEALTH_ATTEMPTS; attempt++ )); do
+  #   local loop_label
+  #   if (( ARGO_HEALTH_ATTEMPTS == 1 )); then
+  #     loop_label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s)"
+  #   else
+  #     loop_label="[${cname}] waiting for Argo CD to sync (Healthy, up to 180s — attempt ${attempt}/${ARGO_HEALTH_ATTEMPTS})"
+  #   fi
+  #   if with_spinner "$loop_label" _wait_argo_health_poll "$cname"; then
+  #     return 0
+  #   fi
+  #   if _argo_app_resources_healthy "$cname"; then
+  #     ok "[${cname}] all workloads report Healthy — Argo status lagging, continuing without further waits"
+  #     return 0
+  #   fi
+  #   if (( attempt < ARGO_HEALTH_ATTEMPTS )); then
+  #     case "$(_argo_health_retry_choice "$cname" "$attempt")" in
+  #       skip)  warn "[${cname}] skipping remaining Argo health waits — continuing with deploy"; return 0 ;;
+  #       abort) die  "[${cname}] aborted by user during Argo health wait" ;;
+  #       retry|*) ;;
+  #     esac
+  #   fi
+  # done
+  # local total=$(( ARGO_HEALTH_ATTEMPTS * 180 ))
+  # warn "[${cname}] did not become Healthy in ${total}s across ${ARGO_HEALTH_ATTEMPTS} attempts (sync=${sync:-unknown} health=${health:-unknown}) — check Argo CD UI"
 }
 
 # Returns 0 when every workload Argo tracks for <cname> currently
@@ -4421,44 +4427,38 @@ _argo_app_resources_healthy() {
   return 0
 }
 
-# Returns one of: retry | skip | abort on stdout. Side-effects (the
-# prompt itself, status hints) go to stderr so the choice can be
-# captured with $(...). Defaults (no answer / non-TTY) resolve to
-# "skip" — the deploy summary still surfaces sync/health, so the
-# user can verify after the fact instead of blocking on each chart.
-_argo_health_retry_choice() {
-  local cname="$1" attempt="$2"
-  local remaining=$(( ARGO_HEALTH_ATTEMPTS - attempt ))
-  local sync health
-  sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
-  health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
-
-  if [[ ! -t 0 || ! -t 2 ]]; then
-    echo skip
-    return
-  fi
-
-  local plural="ies"; (( remaining == 1 )) && plural="y"
-  printf '\n  \033[1;33m[%s]\033[0m attempt %d/%d not healthy yet (sync=%s health=%s) — %d retr%s remaining.\n' \
-    "$cname" "$attempt" "$ARGO_HEALTH_ATTEMPTS" "${sync:-unknown}" "${health:-unknown}" \
-    "$remaining" "$plural" >&2
-  printf '  \033[2mIf the app is already serving traffic in your browser, it is safe to skip remaining waits.\033[0m\n' >&2
-
-  local reply=""
-  if read -r -t "$ARGO_HEALTH_PROMPT_TIMEOUT" \
-       -p "  > [s]kip remaining waits / [r]etry / [a]bort  (default: skip in ${ARGO_HEALTH_PROMPT_TIMEOUT}s) " \
-       reply
-  then
-    case "${reply:-s}" in
-      r|R|retry|RETRY) echo retry ;;
-      a|A|abort|ABORT) echo abort ;;
-      *)               echo skip  ;;
-    esac
-  else
-    printf '\n  \033[2m> no answer in %ss — skipping remaining waits\033[0m\n' "$ARGO_HEALTH_PROMPT_TIMEOUT" >&2
-    echo skip
-  fi
-}
+# Interactive [retry/skip/abort] prompt — disabled along with the retry
+# loop above. Function definition kept commented out so the previous
+# behaviour can be restored from a single file rather than git history.
+# _argo_health_retry_choice() {
+#   local cname="$1" attempt="$2"
+#   local remaining=$(( ARGO_HEALTH_ATTEMPTS - attempt ))
+#   local sync health
+#   sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+#   health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
+#   if [[ ! -t 0 || ! -t 2 ]]; then
+#     echo skip; return
+#   fi
+#   local plural="ies"; (( remaining == 1 )) && plural="y"
+#   printf '\n  \033[1;33m[%s]\033[0m attempt %d/%d not healthy yet (sync=%s health=%s) — %d retr%s remaining.\n' \
+#     "$cname" "$attempt" "$ARGO_HEALTH_ATTEMPTS" "${sync:-unknown}" "${health:-unknown}" \
+#     "$remaining" "$plural" >&2
+#   printf '  \033[2mIf the app is already serving traffic in your browser, it is safe to skip remaining waits.\033[0m\n' >&2
+#   local reply=""
+#   if read -r -t "$ARGO_HEALTH_PROMPT_TIMEOUT" \
+#        -p "  > [s]kip remaining waits / [r]etry / [a]bort  (default: skip in ${ARGO_HEALTH_PROMPT_TIMEOUT}s) " \
+#        reply
+#   then
+#     case "${reply:-s}" in
+#       r|R|retry|RETRY) echo retry ;;
+#       a|A|abort|ABORT) echo abort ;;
+#       *)               echo skip  ;;
+#     esac
+#   else
+#     printf '\n  \033[2m> no answer in %ss — skipping remaining waits\033[0m\n' "$ARGO_HEALTH_PROMPT_TIMEOUT" >&2
+#     echo skip
+#   fi
+# }
 
 _wait_argo_health_poll() {
   local cname="$1"
