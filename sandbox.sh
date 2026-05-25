@@ -788,6 +788,51 @@ require_running_cluster() {
 cmd_setup_podman() {
   [[ "$SANDBOX_RUNTIME" == "podman" ]] || die "SANDBOX_RUNTIME=$SANDBOX_RUNTIME — setup-podman only configures the podman runtime"
 
+  # Per-invocation overrides for the env defaults. --disk-size is the
+  # one that *can't* be applied to an existing machine (podman has no
+  # way to grow the qcow2 in place); --recreate is the escape hatch that
+  # tears the machine down and rebuilds it at the requested size.
+  local opt_disk_gib="$PODMAN_MACHINE_DISK_GIB"
+  local opt_mem_mib="$PODMAN_MACHINE_MEMORY_MIB"
+  local opt_cpus="$PODMAN_MACHINE_CPUS"
+  local opt_recreate=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --disk-size) opt_disk_gib="${2:-}"; shift 2 ;;
+      --memory)    opt_mem_mib="${2:-}";  shift 2 ;;
+      --cpus)      opt_cpus="${2:-}";     shift 2 ;;
+      --recreate)  opt_recreate=1;        shift ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl setup-podman [--disk-size <GiB>] [--memory <MiB>] [--cpus <N>] [--recreate]
+
+Install/configure a rootful podman machine sized for the sandbox.
+
+  --disk-size <GiB>   reserve this much disk for the podman VM (default
+                      ${PODMAN_MACHINE_DISK_GIB} or \$PODMAN_MACHINE_DISK_GIB).
+                      podman cannot grow an existing machine's disk in
+                      place — if the existing machine is smaller, this
+                      command warns and prints the --recreate command
+                      you can run to resize.
+  --memory <MiB>      RAM for the podman VM (default ${PODMAN_MACHINE_MEMORY_MIB} or
+                      \$PODMAN_MACHINE_MEMORY_MIB). Applied to an
+                      existing machine without recreate.
+  --cpus <N>          CPU count (default ${PODMAN_MACHINE_CPUS} or \$PODMAN_MACHINE_CPUS).
+                      Applied to an existing machine without recreate.
+  --recreate          stop + remove + re-init the podman machine at
+                      the requested disk/memory/cpus. DESTRUCTIVE: any
+                      images, containers, or kind clusters living
+                      inside the VM are gone afterwards.
+EOF
+        return 0 ;;
+      *) die "setup-podman: unknown flag: $1 (try --help)" ;;
+    esac
+  done
+
+  [[ "$opt_disk_gib" =~ ^[0-9]+$ ]] || die "setup-podman: --disk-size must be a positive integer (GiB), got '${opt_disk_gib}'"
+  [[ "$opt_mem_mib"  =~ ^[0-9]+$ ]] || die "setup-podman: --memory must be a positive integer (MiB), got '${opt_mem_mib}'"
+  [[ "$opt_cpus"     =~ ^[0-9]+$ ]] || die "setup-podman: --cpus must be a positive integer, got '${opt_cpus}'"
+
   if ! command -v podman >/dev/null 2>&1; then
     command -v brew >/dev/null 2>&1 || die "podman not installed and brew is unavailable"
     log "installing podman via brew"
@@ -795,23 +840,37 @@ cmd_setup_podman() {
   fi
   ok "podman: $(podman --version)"
 
-  if ! podman machine list --format '{{.Name}}' 2>/dev/null | grep -q .; then
-    log "creating podman-machine-default (rootful, ${PODMAN_MACHINE_CPUS} CPU, ${PODMAN_MACHINE_MEMORY_MIB} MiB, ${PODMAN_MACHINE_DISK_GIB} GiB disk)"
+  local machine_exists=0
+  podman machine list --format '{{.Name}}' 2>/dev/null | grep -q . && machine_exists=1
+
+  # --recreate: rip the machine out and rebuild from scratch at the
+  # requested geometry. Only path that can grow disk-size; everything
+  # inside the VM is forfeit.
+  if (( opt_recreate )) && (( machine_exists )); then
+    log "destroying existing podman machine to recreate at ${opt_cpus} CPU / ${opt_mem_mib} MiB / ${opt_disk_gib} GiB"
+    podman machine stop 2>/dev/null || true
+    podman machine rm -f 2>/dev/null || die "could not remove existing podman machine"
+    machine_exists=0
+  fi
+
+  if (( ! machine_exists )); then
+    log "creating podman-machine-default (rootful, ${opt_cpus} CPU, ${opt_mem_mib} MiB, ${opt_disk_gib} GiB disk)"
     podman machine init \
-      --cpus "$PODMAN_MACHINE_CPUS" \
-      --memory "$PODMAN_MACHINE_MEMORY_MIB" \
-      --disk-size "$PODMAN_MACHINE_DISK_GIB" \
+      --cpus "$opt_cpus" \
+      --memory "$opt_mem_mib" \
+      --disk-size "$opt_disk_gib" \
       --rootful
   fi
 
-  local state rootful mem
+  local state rootful mem cur_disk_gib
   state="$(podman machine inspect --format '{{.State}}' 2>/dev/null || echo unknown)"
   rootful="$(podman machine inspect --format '{{.Rootful}}' 2>/dev/null || echo false)"
   mem="$(podman machine inspect --format '{{.Resources.Memory}}' 2>/dev/null || echo 0)"
+  cur_disk_gib="$(podman machine inspect --format '{{.Resources.DiskSize}}' 2>/dev/null || echo 0)"
 
   local needs_apply=0
-  [[ "$rootful" != "true" ]]                          && needs_apply=1
-  [[ "${mem:-0}" -lt "$PODMAN_MACHINE_MEMORY_MIB" ]]  && needs_apply=1
+  [[ "$rootful" != "true" ]]               && needs_apply=1
+  [[ "${mem:-0}" -lt "$opt_mem_mib" ]]     && needs_apply=1
 
   if [[ "$needs_apply" == "1" ]]; then
     if [[ "$state" == "running" ]]; then
@@ -819,8 +878,18 @@ cmd_setup_podman() {
       podman machine stop
       state="stopped"
     fi
-    log "configuring podman machine: rootful=true, memory>=${PODMAN_MACHINE_MEMORY_MIB} MiB"
-    podman machine set --rootful --memory "$PODMAN_MACHINE_MEMORY_MIB"
+    log "configuring podman machine: rootful=true, memory>=${opt_mem_mib} MiB"
+    podman machine set --rootful --memory "$opt_mem_mib"
+  fi
+
+  # podman has no in-place disk grow. If the user asked for more than
+  # what's there, tell them exactly which command to run instead of
+  # silently keeping the smaller disk.
+  if (( cur_disk_gib > 0 )) && (( cur_disk_gib < opt_disk_gib )); then
+    warn "podman machine disk is ${cur_disk_gib} GiB, requested ${opt_disk_gib} GiB"
+    warn "podman cannot grow a machine's disk in place. To resize:"
+    warn "  sandboxctl setup-podman --disk-size ${opt_disk_gib} --memory ${opt_mem_mib} --cpus ${opt_cpus} --recreate"
+    warn "  (this destroys all images/containers/kind clusters inside the VM — back up first if needed)"
   fi
 
   if [[ "$state" != "running" ]]; then
@@ -2578,7 +2647,7 @@ cmd_bootstrap() {
         up_args+=("$1" "$2"); shift 2 ;;
       --env|--chart|--values|--name)
         deploy_args+=("$1" "${2:-}"); shift 2 ;;
-      --no-build)
+      --no-build|--purge-old-tags|--no-purge-old-tags)
         deploy_args+=("$1"); shift ;;
       -h|--help)
         cat <<EOF
@@ -3122,6 +3191,26 @@ registry_drop_tag_if_present() {
   fi
 }
 
+# registry_purge_repo_tags <repo>
+#
+# Wipe every tag of <repo> in our in-cluster registry. Used by
+# --purge-old-tags so a fresh push leaves only the just-built tag behind
+# instead of stacking new tags on top of every previous one (the case
+# that quietly fills the registry PVC). Best-effort — failures fall
+# through; the upcoming push will surface a real error if the registry
+# is unreachable.
+registry_purge_repo_tags() {
+  local repo="$1"
+  curl -sf --max-time 2 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/" >/dev/null 2>&1 || return 0
+  local tags; tags="$(registry_tags "$repo" 2>/dev/null || true)"
+  [[ -n "$tags" ]] || return 0
+  log "purging existing tags of ${repo}: ${tags}"
+  local t
+  for t in $tags; do
+    registry_images_rm "${repo}:${t}" >/dev/null 2>&1 || true
+  done
+}
+
 # build_and_push <image> <dockerfile> <context> [extra build args]
 build_and_push() {
   local image="$1" dockerfile="$2" context="$3"; shift 3
@@ -3140,6 +3229,15 @@ build_and_push() {
     log "transferring ${image} from ${builder} to ${pusher} for push"
     "$builder" save "$image" 2>/dev/null | "$pusher" load 2>&1 | tail -3 || \
       die "could not transfer ${image} from ${builder} to ${pusher}"
+  fi
+
+  if [[ "${BUILD_PURGE_OLD_TAGS:-0}" == "1" ]]; then
+    case "$image" in
+      "localhost:${SANDBOX_REGISTRY_PORT}/"*)
+        local _ref="${image#localhost:${SANDBOX_REGISTRY_PORT}/}"
+        registry_purge_repo_tags "${_ref%:*}"
+        ;;
+    esac
   fi
 
   registry_drop_tag_if_present "$image"
@@ -3167,12 +3265,15 @@ cmd_build() {
   #   3. no Dockerfiles at all → fall through to the legacy auto-walk
   #      (which dies with a clear "no Dockerfile found" message).
   local repo_flag="" positional="" tag="latest"
+  local purge_old_tags="${SANDBOX_BUILD_PURGE_OLD_TAGS:-0}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo) repo_flag="${2:-}"; shift 2 ;;
+      --purge-old-tags) purge_old_tags=1; shift ;;
+      --no-purge-old-tags) purge_old_tags=0; shift ;;
       -h|--help)
         cat <<EOF
-sandboxctl build [path] [--repo <dir>]
+sandboxctl build [path] [--repo <dir>] [--purge-old-tags]
 
 Find Dockerfiles under the product repo, build them, and push to the
 in-cluster registry. The product repo can be specified by:
@@ -3183,6 +3284,15 @@ in-cluster registry. The product repo can be specified by:
 Build precedence inside the repo:
   1. existing sandboxctl.yaml/.yml — used as-is
   2. Dockerfiles only              — auto-generates sandboxctl.yaml
+
+Tag retention:
+  --purge-old-tags     Before each push, delete every existing tag of the
+                       repo being built and run a registry GC at the end,
+                       so the registry only ever holds the just-pushed tag
+                       per image. Useful when iterating with content-
+                       addressed tags (sha-<commit>) that would otherwise
+                       stack up on the PVC. Same effect as setting
+                       SANDBOX_BUILD_PURGE_OLD_TAGS=1 in the environment.
 EOF
         return 0 ;;
       -*) die "build: unknown flag: $1" ;;
@@ -3197,6 +3307,8 @@ EOF
   target="$(_resolve_product_repo "$repo_flag" "$positional" build)" || return 1
 
   _ensure_registry_reachable
+
+  export BUILD_PURGE_OLD_TAGS="$purge_old_tags"
 
   local manifest=""
   for candidate in "${target}/sandboxctl.yaml" "${target}/sandboxctl.yml" "$(pwd)/sandboxctl.yaml"; do
@@ -3231,6 +3343,15 @@ EOF
     cmd_build_from_manifest "$manifest"
   else
     cmd_build_auto_walk "$target" "$tag"
+  fi
+
+  # When purge-old-tags ran during the push loop we marked old manifests
+  # for deletion but the blobs they referenced still occupy the PVC
+  # until the registry's GC sweeps them. Run gc once at the end so disk
+  # usage stays flat across repeated builds (the whole point of the flag).
+  if [[ "${BUILD_PURGE_OLD_TAGS:-0}" == "1" ]]; then
+    log "running registry gc to reclaim blobs from purged tags"
+    registry_images_gc || warn "registry gc failed — see output above"
   fi
 }
 
@@ -3335,15 +3456,18 @@ cmd_build_from_manifest() {
 }
 
 cmd_images() {
-  # list / rm <ref> / prune / gc — see usage block.
+  # list / rm <ref> / prune / purge / gc — see usage block.
+  # `purge` is an alias for `prune` (delete every image then GC) — same
+  # behaviour, different name for users who came from podman/docker
+  # where "prune" only sweeps dangling images.
   local sub="${1:-list}"; shift || true
   case "$sub" in
-    list|"")  registry_images_list ;;
-    rm)       [[ $# -ge 1 ]] || die "usage: sandboxctl images rm <image>[:tag]"
-              registry_images_rm "$1"; registry_images_gc ;;
-    prune)    registry_images_prune; registry_images_gc ;;
-    gc)       registry_images_gc ;;
-    *)        die "unknown 'images' subcommand: $sub (use list, rm, prune, gc)" ;;
+    list|"")        registry_images_list ;;
+    rm)             [[ $# -ge 1 ]] || die "usage: sandboxctl images rm <image>[:tag]"
+                    registry_images_rm "$1"; registry_images_gc ;;
+    prune|purge)    registry_images_prune; registry_images_gc ;;
+    gc)             registry_images_gc ;;
+    *)              die "unknown 'images' subcommand: $sub (use list, rm, prune, purge, gc)" ;;
   esac
 }
 
@@ -3817,6 +3941,7 @@ cmd_deploy() {
   #                          [--values <file>] [--name <name>] [--no-build]
   local positional="" repo_flag="" env="dev" do_build=1
   local chart_override="" values_override="" name_override=""
+  local purge_old_tags="${SANDBOX_BUILD_PURGE_OLD_TAGS:-0}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo)     repo_flag="$2"; shift 2 ;;
@@ -3825,11 +3950,13 @@ cmd_deploy() {
       --values)   values_override="$2"; shift 2 ;;
       --name)     name_override="$2"; shift 2 ;;
       --no-build) do_build=0; shift ;;
+      --purge-old-tags)    purge_old_tags=1; shift ;;
+      --no-purge-old-tags) purge_old_tags=0; shift ;;
       -h|--help)
         cat <<EOF
 sandboxctl deploy [path] [--repo <dir>] [--env <name>]
                   [--chart <dir>] [--values <file>] [--name <name>]
-                  [--no-build]
+                  [--no-build] [--purge-old-tags]
 
 Builds + pushes images, applies secrets, pushes the chart to the
 in-cluster Gitea, creates one Argo CD Application per chart, and
@@ -3981,8 +4108,10 @@ EOF
         || find "$target" -type f -name Dockerfile -not -path '*/.git/*' \
              -not -path '*/node_modules/*' -not -path '*/vendor/*' \
              -not -path '*/dist/*' -print -quit 2>/dev/null | grep -q .; then
-      log "running 'sandboxctl build ${target}' first (use --no-build to skip)"
-      cmd_build "$target"
+      local build_args=("$target")
+      [[ "$purge_old_tags" == "1" ]] && build_args+=(--purge-old-tags)
+      log "running 'sandboxctl build ${build_args[*]}' first (use --no-build to skip)"
+      cmd_build "${build_args[@]}"
     else
       log "no Dockerfiles or sandboxctl.yaml under ${target} — skipping build step"
     fi
@@ -4717,7 +4846,9 @@ usage() {
 sandbox.sh — local kind sandbox with Argo CD + Kargo + Istio ambient
 
 usage:
-  sandbox.sh setup-podman   install/configure rootful podman machine (one-time)
+  sandbox.sh setup-podman [--disk-size <GiB>] [--memory <MiB>] [--cpus <N>] [--recreate]
+                            install/configure rootful podman machine; --recreate is required
+                            to grow an existing machine's disk-size (podman can't grow it in place)
   sandbox.sh trust-ca       trust the sandbox root CA in macOS System keychain (sudo)
   sandbox.sh untrust-ca     remove the sandbox root CA from System keychain (sudo)
   sandbox.sh up [--workers N] [--with-arctl] [--with-cnpg] [--with-agentregistry] [--with-nats] [--with-kagent]
@@ -4737,14 +4868,16 @@ usage:
   sandbox.sh creds          print login details (URLs + admin creds)
   sandbox.sh argocd-ui      print Argo CD URL + admin creds
   sandbox.sh kargo-ui       print Kargo URL + admin creds
-  sandbox.sh build [path] [--repo <dir>]
+  sandbox.sh build [path] [--repo <dir>] [--purge-old-tags]
                                      find Dockerfiles under the product repo (path/--repo/cwd),
-                                     build + push to the cluster registry
+                                     build + push to the cluster registry; --purge-old-tags
+                                     wipes prior tags of each repo before pushing (and runs
+                                     a registry GC at the end) so disk stays flat
   sandbox.sh images                  list images in the cluster registry
   sandbox.sh images rm <ref>         delete an image (e.g. 'myapp:v1' or 'myapp' for all tags)
-  sandbox.sh images prune            delete every image, then GC blobs
+  sandbox.sh images prune            delete every image, then GC blobs (alias: 'purge')
   sandbox.sh images gc               run registry garbage-collector to reclaim disk now
-  sandbox.sh deploy [path] [--repo <dir>] [--env <name>] [--no-build]
+  sandbox.sh deploy [path] [--repo <dir>] [--env <name>] [--no-build] [--purge-old-tags]
                                      auto-discover every chart under the product repo,
                                      build + push every Dockerfile, apply k8s/secrets.yaml, push each chart
                                      to in-cluster Gitea, create one Argo CD Application per chart, and
@@ -4814,7 +4947,7 @@ EOF
 
 main() {
   case "${1:-}" in
-    setup-podman)       cmd_setup_podman ;;
+    setup-podman)       shift; cmd_setup_podman "$@" ;;
     trust-ca)           trust_root_ca ;;
     untrust-ca)         untrust_root_ca ;;
     up)                 shift; cmd_up "$@" ;;

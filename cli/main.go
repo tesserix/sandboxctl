@@ -31,7 +31,7 @@ func resolveAssetDir() string {
 type command struct{ name, desc string }
 
 var commands = []command{
-	{"setup-podman", "install/configure rootful podman machine (one-time)"},
+	{"setup-podman", "install/configure rootful podman machine (one-time; --disk-size/--memory/--cpus, --recreate to resize disk)"},
 	{"trust-ca", "trust the sandbox root CA in macOS System keychain (sudo)"},
 	{"untrust-ca", "remove the sandbox root CA from System keychain (sudo)"},
 	{"up", "create cluster + install argocd/kargo/demo + gitea + ingress + PKI + arctl CLI (kagent opt-in via --with-kagent or --install all; skip arctl via --no-arctl)"},
@@ -44,7 +44,7 @@ var commands = []command{
 	{"argocd-ui", "print Argo CD URL + admin creds"},
 	{"kargo-ui", "print Kargo  URL + admin creds"},
 	{"build", "build + push Dockerfiles in the product repo (--repo <dir> | [path] | cwd)"},
-	{"images", "list / rm <ref> / prune / gc — manage images in the cluster registry"},
+	{"images", "list / rm <ref> / prune / purge / gc — manage images in the cluster registry"},
 	{"deploy", "discover charts in the product repo (--repo <dir> | [path] | cwd) + push to Gitea + create Argo Apps"},
 	{"undeploy", "remove the Argo Application + route created by 'deploy'"},
 	{"bootstrap", "'up' (if needed) + 'deploy' in one command (--repo <dir> | [path] | cwd)"},

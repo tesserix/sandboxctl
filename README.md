@@ -245,12 +245,19 @@ images without deploying.
 
 ```sh
 sandboxctl build                          # build + push all Dockerfiles in cwd
+sandboxctl build --purge-old-tags         # wipe prior tags of each repo before pushing,
+                                          #   then GC; only the just-pushed tag remains
+                                          #   (env equivalent: SANDBOX_BUILD_PURGE_OLD_TAGS=1)
 sandboxctl images                         # list everything in the registry
 sandboxctl images rm myapp:v1             # delete one tag
 sandboxctl images rm myapp                # delete every tag of an image
-sandboxctl images prune                   # delete every image, then GC blobs
+sandboxctl images prune                   # delete every image, then GC blobs (alias: purge)
+sandboxctl images purge                   # same as prune — for users coming from podman/docker
 sandboxctl images gc                      # garbage-collect blobs only
 ```
+
+`--purge-old-tags` is also accepted by `sandboxctl deploy` and
+`sandboxctl bootstrap`, where it forwards to the build step.
 
 ## Cluster lifecycle
 
@@ -366,7 +373,22 @@ the local root CA in the System keychain. Subsequent runs are silent.
 - ≈6 GiB free RAM for the kind node + cluster workloads
 
 `sandboxctl setup-podman` installs and configures podman for you (rootful,
-6 GiB memory) if it isn't ready yet.
+6 GiB memory, 60 GiB disk) if it isn't ready yet. To pick a different
+size on first run:
+
+```sh
+sandboxctl setup-podman --disk-size 80 --memory 8192 --cpus 6
+```
+
+Existing machine too small? podman can't grow a VM's disk in place —
+the only way to bump `--disk-size` is to recreate the machine, which
+wipes its images, containers, and any kind cluster living inside:
+
+```sh
+sandboxctl down                            # tear the cluster down first
+sandboxctl setup-podman --disk-size 80 --recreate
+sandboxctl up                              # rebuild the cluster
+```
 
 ### kagent model providers
 
