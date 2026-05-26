@@ -152,6 +152,12 @@ SANDBOX_REGISTRY_PORT="${SANDBOX_REGISTRY_PORT:-5050}"
 SANDBOX_REGISTRY_STORAGE="${SANDBOX_REGISTRY_STORAGE:-12Gi}"
 SANDBOX_STATE_DIR="${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}"
 SANDBOX_STATE_FILE="${SANDBOX_STATE_DIR}/setup.yaml"
+# Persisted Podman VM sizing — written by `sandboxctl up`/`restart` when
+# the user passes --podman-cpus/--podman-memory/--podman-disk, and read
+# at script start so subsequent invocations remember the chosen size
+# without re-passing the flag. Plain `KEY=VALUE` shell file so it's safe
+# to source.
+SANDBOX_PODMAN_CONFIG="${SANDBOX_PODMAN_CONFIG:-${SANDBOX_STATE_DIR}/podman.env}"
 SANDBOX_LAUNCHAGENT_DIR="${SANDBOX_LAUNCHAGENT_DIR:-$HOME/Library/LaunchAgents}"
 SANDBOX_LAUNCHAGENT_LABEL="${SANDBOX_LAUNCHAGENT_LABEL:-io.github.sandboxctl.portfwd}"
 SANDBOX_LAUNCHAGENT_PLIST="${SANDBOX_LAUNCHAGENT_DIR}/${SANDBOX_LAUNCHAGENT_LABEL}.plist"
@@ -171,9 +177,36 @@ SANDBOX_HOSTS_MARKER="# managed by sandboxctl (${SANDBOX_DOMAIN})"
 SANDBOX_SECRETS_FILE="${SANDBOX_STATE_DIR}/secrets.env"
 
 SANDBOX_RUNTIME="${SANDBOX_RUNTIME:-podman}"
+# Source persisted Podman sizing first so saved values become defaults.
+# Anything the user already exported in their environment still wins via
+# the `${VAR:-…}` fallbacks below — env > saved > built-in.
+if [[ -f "$SANDBOX_PODMAN_CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  . "$SANDBOX_PODMAN_CONFIG" 2>/dev/null || true
+fi
 PODMAN_MACHINE_CPUS="${PODMAN_MACHINE_CPUS:-4}"
 PODMAN_MACHINE_MEMORY_MIB="${PODMAN_MACHINE_MEMORY_MIB:-6144}"
 PODMAN_MACHINE_DISK_GIB="${PODMAN_MACHINE_DISK_GIB:-60}"
+
+# ----- Build sizing -------------------------------------------------------
+# `podman build` and the kind nodes share the same Podman VM. A burst-y
+# Go compile (e.g. `go build` on a multi-module repo) can claim every CPU
+# and most of the VM's RAM, at which point kubelet on the kind control-
+# plane misses heartbeats and the cluster goes "down" mid-build. These
+# defaults cap the build container at ~half of each axis so kind keeps
+# headroom by default — set to empty / 0 to opt out, or override via
+# --build-cpus / --build-memory / SANDBOX_BUILD_CPUS / SANDBOX_BUILD_MEMORY.
+# Effective only for the podman builder (docker's daemon already has its
+# own resource pool).
+SANDBOX_BUILD_CPUS="${SANDBOX_BUILD_CPUS-auto}"
+SANDBOX_BUILD_MEMORY="${SANDBOX_BUILD_MEMORY-auto}"
+# Override the runtime used for `<runtime> build` (independent of
+# SANDBOX_RUNTIME, which controls the runtime that hosts kind). The
+# canonical use case: keep podman for kind, but build with docker so the
+# compile runs in Docker Desktop's VM and never touches the Podman VM
+# kind lives in. The push step already handles cross-runtime via the
+# existing save|load handoff.
+SANDBOX_BUILD_RUNTIME="${SANDBOX_BUILD_RUNTIME:-}"
 case "$SANDBOX_RUNTIME" in
   podman) export KIND_EXPERIMENTAL_PROVIDER=podman ;;
   docker) ;;
@@ -194,6 +227,26 @@ ok()   { printf '\033[1;32mOK:\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1 (install via brew)"; }
+
+# Normalize a human memory string ("8g", "12gib", "8192", "8192m") into
+# integer MiB. Returns empty + non-zero on a malformed input so callers
+# can `die` with a flag-specific message.
+_normalize_mem_to_mib() {
+  local raw="${1:-}"
+  [[ -n "$raw" ]] || return 1
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    *gib) printf '%d' "$(( ${raw%gib} * 1024 ))"; return 0 ;;
+    *gb)  printf '%d' "$(( ${raw%gb}  * 1024 ))"; return 0 ;;
+    *g)   printf '%d' "$(( ${raw%g}   * 1024 ))"; return 0 ;;
+    *mib) printf '%d' "${raw%mib}";               return 0 ;;
+    *mb)  printf '%d' "${raw%mb}";                return 0 ;;
+    *m)   printf '%d' "${raw%m}";                 return 0 ;;
+    *)
+      [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+      printf '%d' "$raw"; return 0 ;;
+  esac
+}
 
 # ----- celebration / sad-trombone banners ----------------------------------
 #
@@ -784,6 +837,77 @@ require_running_cluster() {
 # ============================================================================
 # Setup-podman
 # ============================================================================
+
+# Apply Podman VM sizing without going through cmd_setup_podman's full
+# install/init pipeline. Used by `sandboxctl up`/`restart` when the user
+# passes --podman-cpus/--podman-memory/--podman-disk: we just want to
+# resize an existing rootful machine, write the persisted config, and
+# keep going. cmd_setup_podman is still the right tool for first-time
+# install or a full --recreate.
+#
+# Args (all optional, blank = leave alone): cpus, mem_mib, disk_gib.
+_apply_podman_sizing() {
+  [[ "$SANDBOX_RUNTIME" == "podman" ]] || {
+    warn "--podman-* flags ignored: SANDBOX_RUNTIME=${SANDBOX_RUNTIME}"
+    return 0
+  }
+  local cpus="${1:-}" mem_mib="${2:-}" disk_gib="${3:-}"
+
+  # Feed the requested values into the env vars that the rest of the
+  # script reads, so `setup-podman` (auto-invoked from bring_up_cluster
+  # when needed) and `cmd_setup_podman` see the user's choice as the new
+  # default for this run.
+  [[ -n "$cpus"     ]] && PODMAN_MACHINE_CPUS="$cpus"
+  [[ -n "$mem_mib"  ]] && PODMAN_MACHINE_MEMORY_MIB="$mem_mib"
+  [[ -n "$disk_gib" ]] && PODMAN_MACHINE_DISK_GIB="$disk_gib"
+  export PODMAN_MACHINE_CPUS PODMAN_MACHINE_MEMORY_MIB PODMAN_MACHINE_DISK_GIB
+
+  # Persist before any podman command runs — even if a resize fails the
+  # user's intent is recorded so the next `restart --rebuild` honours it.
+  write_podman_config "$cpus" "$mem_mib" "$disk_gib"
+  log "saved podman sizing → $SANDBOX_PODMAN_CONFIG (cpus=${PODMAN_MACHINE_CPUS:-unchanged}, memory=${PODMAN_MACHINE_MEMORY_MIB:-unchanged} MiB, disk=${PODMAN_MACHINE_DISK_GIB:-unchanged} GiB)"
+
+  if ! command -v podman >/dev/null 2>&1; then
+    log "podman not installed yet — skipping live resize; values will apply on next 'sandboxctl setup-podman'"
+    return 0
+  fi
+
+  local machine_exists=0
+  podman machine list --format '{{.Name}}' 2>/dev/null | grep -q . && machine_exists=1
+
+  if (( ! machine_exists )); then
+    log "no podman machine yet — values will apply on first 'sandboxctl setup-podman'"
+    return 0
+  fi
+
+  local cur_disk_gib state
+  cur_disk_gib="$(podman machine inspect --format '{{.Resources.DiskSize}}' 2>/dev/null || echo 0)"
+  state="$(podman machine inspect --format '{{.State}}' 2>/dev/null || echo unknown)"
+
+  # Live `podman machine set` only handles cpus/memory/rootful; disk
+  # changes need --recreate, which is destructive. If the user asked for
+  # a bigger disk, surface the exact command — never silently no-op.
+  if [[ -n "$disk_gib" ]] && (( cur_disk_gib > 0 )) && (( cur_disk_gib < disk_gib )); then
+    warn "podman machine disk is ${cur_disk_gib} GiB — requested ${disk_gib} GiB"
+    warn "podman cannot grow a machine's disk in place. To resize disk:"
+    warn "  sandboxctl setup-podman --disk-size ${disk_gib} --memory ${PODMAN_MACHINE_MEMORY_MIB} --cpus ${PODMAN_MACHINE_CPUS} --recreate"
+    warn "  (this destroys all images/containers/kind clusters inside the VM — back up first)"
+  fi
+
+  if [[ -n "$cpus" || -n "$mem_mib" ]]; then
+    if [[ "$state" == "running" ]]; then
+      log "stopping podman machine to apply sizing changes"
+      podman machine stop || warn "podman machine stop failed — continuing"
+    fi
+    local set_args=(--rootful)
+    [[ -n "$cpus"    ]] && set_args+=(--cpus    "$cpus")
+    [[ -n "$mem_mib" ]] && set_args+=(--memory  "$mem_mib")
+    log "podman machine set ${set_args[*]}"
+    podman machine set "${set_args[@]}" || warn "podman machine set failed — continuing"
+    log "starting podman machine"
+    podman machine start || die "podman machine start failed — inspect 'podman machine list'"
+  fi
+}
 
 cmd_setup_podman() {
   [[ "$SANDBOX_RUNTIME" == "podman" ]] || die "SANDBOX_RUNTIME=$SANDBOX_RUNTIME — setup-podman only configures the podman runtime"
@@ -2223,6 +2347,38 @@ EOF
 # State file (~/.sandboxctl/setup.yaml)
 # ============================================================================
 
+# Persist the chosen Podman VM sizing so subsequent invocations re-apply
+# it without the user passing flags again. Sourced at the top of the
+# script (SANDBOX_PODMAN_CONFIG); env vars still win when set explicitly.
+# Only writes keys that have a value, so it doesn't leak `unset` over a
+# previously-saved value when the user only updates one dimension.
+write_podman_config() {
+  mkdir -p "$SANDBOX_STATE_DIR"
+  local cpus="${1:-${PODMAN_MACHINE_CPUS:-}}"
+  local mem_mib="${2:-${PODMAN_MACHINE_MEMORY_MIB:-}}"
+  local disk_gib="${3:-${PODMAN_MACHINE_DISK_GIB:-}}"
+
+  # Merge with whatever's already saved so a partial update preserves
+  # untouched dimensions (e.g. saving only --podman-disk shouldn't
+  # forget a previously-saved --podman-memory).
+  if [[ -f "$SANDBOX_PODMAN_CONFIG" ]]; then
+    local prev_cpus prev_mem prev_disk
+    prev_cpus="$(awk -F= '$1=="PODMAN_MACHINE_CPUS"{print $2; exit}' "$SANDBOX_PODMAN_CONFIG" 2>/dev/null || true)"
+    prev_mem="$(awk -F= '$1=="PODMAN_MACHINE_MEMORY_MIB"{print $2; exit}' "$SANDBOX_PODMAN_CONFIG" 2>/dev/null || true)"
+    prev_disk="$(awk -F= '$1=="PODMAN_MACHINE_DISK_GIB"{print $2; exit}' "$SANDBOX_PODMAN_CONFIG" 2>/dev/null || true)"
+    [[ -z "$cpus"     && -n "$prev_cpus" ]] && cpus="$prev_cpus"
+    [[ -z "$mem_mib"  && -n "$prev_mem"  ]] && mem_mib="$prev_mem"
+    [[ -z "$disk_gib" && -n "$prev_disk" ]] && disk_gib="$prev_disk"
+  fi
+
+  {
+    printf '# managed by sandboxctl — Podman VM sizing remembered between runs\n'
+    [[ -n "$cpus" ]]     && printf 'PODMAN_MACHINE_CPUS=%s\n' "$cpus"
+    [[ -n "$mem_mib" ]]  && printf 'PODMAN_MACHINE_MEMORY_MIB=%s\n' "$mem_mib"
+    [[ -n "$disk_gib" ]] && printf 'PODMAN_MACHINE_DISK_GIB=%s\n' "$disk_gib"
+  } > "$SANDBOX_PODMAN_CONFIG"
+}
+
 write_state_file() {
   mkdir -p "$SANDBOX_STATE_DIR"
   cat > "$SANDBOX_STATE_FILE" <<EOF
@@ -2384,6 +2540,8 @@ cmd_up() {
   # demo app. Toggle add-ons individually (--with-X) or all at once
   # (--install all).
   INSTALL_KAGENT=0
+  local opt_podman_cpus="" opt_podman_memory_mib="" opt_podman_disk_gib=""
+  local podman_resize_requested=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with-kagent)        INSTALL_KAGENT=1; shift ;;
@@ -2408,6 +2566,28 @@ cmd_up() {
         SANDBOX_WORKER_COUNT="${2:-}"
         validate_worker_count "$SANDBOX_WORKER_COUNT" "sandboxctl up"
         shift 2 ;;
+      --podman-cpus)
+        opt_podman_cpus="${2:-}"
+        [[ "$opt_podman_cpus" =~ ^[0-9]+$ ]] || die "--podman-cpus must be a positive integer (got '${opt_podman_cpus}')"
+        podman_resize_requested=1
+        shift 2 ;;
+      --podman-memory)
+        # Accept '<N>g' / '<N>G' / '<N>gib' (GiB) or '<N>m' / '<N>mib' (MiB)
+        # or a bare integer in MiB to mirror PODMAN_MACHINE_MEMORY_MIB.
+        local _mem_in="${2:-}"
+        opt_podman_memory_mib="$(_normalize_mem_to_mib "$_mem_in")" \
+          || die "--podman-memory must look like '8g', '12gib', '8192' or '8192m' (got '${_mem_in}')"
+        podman_resize_requested=1
+        shift 2 ;;
+      --podman-disk)
+        # GiB only — that's what `podman machine init --disk-size` takes.
+        local _disk_in="${2:-}"
+        # Allow trailing 'g' / 'gib' for clarity ("80g", "80gib").
+        _disk_in="$(printf '%s' "$_disk_in" | tr '[:upper:]' '[:lower:]' | sed 's/gib$//;s/g$//')"
+        [[ "$_disk_in" =~ ^[0-9]+$ ]] || die "--podman-disk must be a positive integer in GiB (e.g. 80, 80g)"
+        opt_podman_disk_gib="$_disk_in"
+        podman_resize_requested=1
+        shift 2 ;;
       --install)
         case "${2:-}" in
           all)
@@ -2427,6 +2607,7 @@ cmd_up() {
       -h|--help)
         cat <<EOF
 sandboxctl up [--workers N]
+              [--podman-cpus N] [--podman-memory SIZE] [--podman-disk GiB]
               [--with-arctl] [--with-cnpg] [--with-agentregistry] [--with-nats] [--with-kagent]
               [--with-agentgateway | --with-ai-gateway | --with-portkey | --with-litellm | --with-mlflow | --with-tyk]
               [--install all]
@@ -2445,6 +2626,19 @@ Cluster topology:
                    Higher values fail fast: a 4-worker kind cluster on a
                    Mac runs out of host memory before the cluster does.
                    Env override: SANDBOX_WORKER_COUNT=N sandboxctl up.
+
+Podman VM sizing (remembered between runs in ${SANDBOX_PODMAN_CONFIG}):
+  --podman-cpus N        CPUs allocated to the rootful Podman VM.
+  --podman-memory SIZE   RAM allocated to the Podman VM. Accepts '8g',
+                         '12gib', '8192m', or a bare integer (MiB).
+  --podman-disk GiB      Disk size, e.g. 80 (or '80g'). Growing disk
+                         requires a destructive recreate — sandboxctl
+                         will print the exact 'setup-podman --recreate'
+                         command instead of silently downgrading.
+
+  All three are persisted, so 'sandboxctl up --podman-disk 80' once is
+  enough — future 'up'/'restart' invocations remember 80 GiB without
+  the flag. To inspect current sizing: 'cat ${SANDBOX_PODMAN_CONFIG}'.
 
 Default-on (always installed):
   Argo CD          https://argo.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
@@ -2519,6 +2713,14 @@ EOF
     install_arctl
   else
     log "skipping arctl (pass --with-arctl or --install all to enable)"
+  fi
+
+  # Apply Podman VM sizing before kind starts, so the cluster comes up
+  # against the right resources. Persist the chosen sizes so future
+  # `up`/`restart`/`setup-podman` invocations remember them without the
+  # user re-passing flags.
+  if (( podman_resize_requested )); then
+    _apply_podman_sizing "$opt_podman_cpus" "$opt_podman_memory_mib" "$opt_podman_disk_gib"
   fi
 
   bring_up_cluster
@@ -2841,15 +3043,39 @@ EOF
 cmd_restart() {
   local rebuild=0
   local up_args=()
+  local opt_podman_cpus="" opt_podman_memory_mib="" opt_podman_disk_gib=""
+  local podman_resize_requested=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --rebuild|--full) rebuild=1; shift ;;
       --workers)
         validate_worker_count "${2:-}" "sandboxctl restart"
         up_args+=("$1" "$2"); shift 2 ;;
+      --podman-cpus)
+        opt_podman_cpus="${2:-}"
+        [[ "$opt_podman_cpus" =~ ^[0-9]+$ ]] || die "--podman-cpus must be a positive integer (got '${opt_podman_cpus}')"
+        podman_resize_requested=1
+        up_args+=("$1" "$2")
+        shift 2 ;;
+      --podman-memory)
+        local _mem_in="${2:-}"
+        opt_podman_memory_mib="$(_normalize_mem_to_mib "$_mem_in")" \
+          || die "--podman-memory must look like '8g', '12gib', '8192' or '8192m' (got '${_mem_in}')"
+        podman_resize_requested=1
+        up_args+=("$1" "$2")
+        shift 2 ;;
+      --podman-disk)
+        local _disk_in="${2:-}"
+        _disk_in="$(printf '%s' "$_disk_in" | tr '[:upper:]' '[:lower:]' | sed 's/gib$//;s/g$//')"
+        [[ "$_disk_in" =~ ^[0-9]+$ ]] || die "--podman-disk must be a positive integer in GiB (e.g. 80, 80g)"
+        opt_podman_disk_gib="$_disk_in"
+        podman_resize_requested=1
+        up_args+=("$1" "$2")
+        shift 2 ;;
       -h|--help)
         cat <<EOF
 sandboxctl restart [--rebuild] [--workers N]
+                   [--podman-cpus N] [--podman-memory SIZE] [--podman-disk GiB]
 
 Non-destructive: keeps the kind cluster, all PVCs (incl. NATS JetStream
 state and the in-cluster registry), Argo Apps, and Gitea repos.
@@ -2862,6 +3088,14 @@ refreshes /etc/hosts and dnsmasq, and reloads the LaunchAgents.
   --workers N     Resize the cluster (1–${SANDBOX_WORKER_COUNT_MAX} workers). Implies --rebuild
                   because kind doesn't support adding nodes to an existing
                   cluster — the cluster is recreated with the new worker count.
+
+Podman VM sizing (remembered between runs in ${SANDBOX_PODMAN_CONFIG}):
+  --podman-cpus N        Live-resize CPUs on the rootful Podman VM.
+  --podman-memory SIZE   Live-resize RAM. '8g' / '12gib' / '8192' (MiB).
+  --podman-disk GiB      Disk grow needs a recreate — sandboxctl prints
+                         the exact destructive command instead of
+                         silently downgrading.
+  All three are persisted so future 'up'/'restart' inherits the size.
 EOF
         return 0 ;;
       *) die "unknown flag: $1 (try 'sandboxctl restart --help')" ;;
@@ -2890,6 +3124,13 @@ EOF
   log "restart: keeping kind cluster '$CLUSTER_NAME', re-applying everything else"
   require_tools
   ensure_tooling
+
+  # Apply Podman sizing changes before talking to the cluster, since
+  # `podman machine set` requires the machine to be stopped (and
+  # restarting it bounces kind anyway, which we'll bring back below).
+  if (( podman_resize_requested )); then
+    _apply_podman_sizing "$opt_podman_cpus" "$opt_podman_memory_mib" "$opt_podman_disk_gib"
+  fi
 
   # The cluster might be stopped (machine reboot). Bring it back to
   # Ready before any kc/helm calls.
@@ -3129,14 +3370,45 @@ cmd_kargo_ui() {
 
 # ----- Build + push (registry) -----
 
-# Prefer podman: matches the rest of the pipeline (detect_pusher requires
-# podman) and avoids the cross-runtime save|load handoff. Docker is only a
-# fallback for hosts where podman is unavailable.
+# Default: build on the host's docker daemon (Docker Desktop) when it's
+# available. Rationale: kind runs inside the Podman VM, so a `podman
+# build` shares CPU/RAM with the kind nodes. A heavy compile (Go, Rust,
+# Java) can starve kind's kubelet and silently bring the cluster down
+# mid-build. Building with docker keeps the compile load in Docker
+# Desktop's separate VM; the existing save|load handoff still ferries
+# the image back to podman for the push to the in-cluster registry.
+#
+# Override hierarchy:
+#   1. SANDBOX_BUILD_RUNTIME / --build-runtime — explicit user choice.
+#   2. docker daemon reachable                 — host build, default.
+#   3. podman fallback                          — only when docker is
+#                                                  unavailable; warn so
+#                                                  the kind-down risk
+#                                                  isn't silent.
 detect_builder() {
-  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then echo podman
-  elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then echo docker
-  else die "neither podman nor docker is available — install podman ('sandboxctl setup-podman') to build images"
+  if [[ -n "${SANDBOX_BUILD_RUNTIME:-}" ]]; then
+    case "$SANDBOX_BUILD_RUNTIME" in
+      podman)
+        command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1 \
+          || die "SANDBOX_BUILD_RUNTIME=podman but podman is not available"
+        echo podman; return ;;
+      docker)
+        command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
+          || die "SANDBOX_BUILD_RUNTIME=docker but docker daemon is not running (start Docker Desktop?)"
+        echo docker; return ;;
+      *) die "SANDBOX_BUILD_RUNTIME must be 'podman' or 'docker', got '${SANDBOX_BUILD_RUNTIME}'" ;;
+    esac
   fi
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    log "build runtime: docker (host VM, isolated from kind). Override with SANDBOX_BUILD_RUNTIME=podman or --build-runtime podman" >&2
+    echo docker; return
+  fi
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    warn "docker daemon not available — falling back to 'podman build' (shares the VM with kind; heavy compiles may starve the cluster)"
+    warn "  to silence this: start Docker Desktop, or pin with SANDBOX_BUILD_RUNTIME=podman"
+    echo podman; return
+  fi
+  die "neither podman nor docker is available — install podman ('sandboxctl setup-podman') to build images"
 }
 
 # Docker BuildKit needs the buildx CLI plugin. On hosts without Docker
@@ -3219,9 +3491,69 @@ build_and_push() {
   builder="$(detect_builder)"
   pusher="$(detect_pusher)"
 
-  log "building ${image}  (context: ${context}, builder: ${builder})"
+  # Build resource caps. Flag spelling differs across runtimes/frontends:
+  #   podman build  : --cpuset-cpus 0-(N-1) , --memory <SIZE>
+  #   docker build  : legacy builder rejects --cpus/--memory; BuildKit
+  #                   doesn't expose them either. We skip caps for
+  #                   docker — its daemon runs in a separate VM from
+  #                   kind, so the starvation problem doesn't apply.
+  # Resolve "auto" to half-the-VM caps that leave kind a working set.
+  # Empty / 0 disables capping entirely (opt-out).
+  local effective_cpus="${SANDBOX_BUILD_CPUS:-}"
+  local effective_memory="${SANDBOX_BUILD_MEMORY:-}"
+  if [[ "$builder" == "podman" ]]; then
+    if [[ "$effective_cpus" == "auto" ]]; then
+      local _vm_cpus _half
+      _vm_cpus="$(podman machine inspect --format '{{.Resources.CPUs}}' 2>/dev/null || echo "")"
+      if [[ "$_vm_cpus" =~ ^[0-9]+$ ]] && (( _vm_cpus >= 2 )); then
+        _half=$(( _vm_cpus / 2 ))
+        (( _half < 1 )) && _half=1
+        effective_cpus="$_half"
+      else
+        effective_cpus=""
+      fi
+    fi
+    if [[ "$effective_memory" == "auto" ]]; then
+      local _vm_mem_str _vm_mem_mib _half_mib
+      # podman reports memory as "8GiB" / "8192" depending on version
+      _vm_mem_str="$(podman machine inspect --format '{{.Resources.Memory}}' 2>/dev/null || echo "")"
+      _vm_mem_mib="$(_normalize_mem_to_mib "$_vm_mem_str" 2>/dev/null || echo "")"
+      if [[ "$_vm_mem_mib" =~ ^[0-9]+$ ]] && (( _vm_mem_mib >= 2048 )); then
+        _half_mib=$(( _vm_mem_mib / 2 ))
+        effective_memory="${_half_mib}m"
+      else
+        effective_memory=""
+      fi
+    fi
+  else
+    # docker builder: caps don't apply
+    if [[ "$effective_cpus"   == "auto" ]]; then effective_cpus=""; fi
+    if [[ "$effective_memory" == "auto" ]]; then effective_memory=""; fi
+    if [[ -n "$effective_cpus" || -n "$effective_memory" ]]; then
+      log "build runtime is docker; --build-cpus/--build-memory ignored (docker runs in its own VM, isolated from kind)"
+      effective_cpus=""
+      effective_memory=""
+    fi
+  fi
+
+  local resource_args=()
+  if [[ "$builder" == "podman" ]]; then
+    if [[ -n "$effective_cpus" && "$effective_cpus" != "0" ]]; then
+      local _last=$(( effective_cpus - 1 ))
+      (( _last < 0 )) && _last=0
+      resource_args+=(--cpuset-cpus "0-${_last}")
+    fi
+    if [[ -n "$effective_memory" && "$effective_memory" != "0" ]]; then
+      resource_args+=(--memory "$effective_memory")
+    fi
+  fi
+
+  local _log_cpus="" _log_mem=""
+  [[ -n "$effective_cpus"   && "$effective_cpus"   != "0" ]] && _log_cpus=", cpus=${effective_cpus}"
+  [[ -n "$effective_memory" && "$effective_memory" != "0" ]] && _log_mem=", memory=${effective_memory}"
+  log "building ${image}  (context: ${context}, builder: ${builder}${_log_cpus}${_log_mem})"
   if [[ "$builder" == "docker" ]]; then docker_build_env; fi
-  "$builder" build -t "$image" "$@" -f "$dockerfile" "$context" || \
+  "$builder" build ${resource_args[@]+"${resource_args[@]}"} -t "$image" "$@" -f "$dockerfile" "$context" || \
     die "build failed for ${image}"
 
   # docker save | podman load is the universal handoff — `podman pull
@@ -3267,14 +3599,28 @@ cmd_build() {
   #      (which dies with a clear "no Dockerfile found" message).
   local repo_flag="" positional="" tag="latest"
   local purge_old_tags="${SANDBOX_BUILD_PURGE_OLD_TAGS:-0}"
+  local opt_build_cpus="${SANDBOX_BUILD_CPUS:-}"
+  local opt_build_memory="${SANDBOX_BUILD_MEMORY:-}"
+  local opt_build_runtime="${SANDBOX_BUILD_RUNTIME:-}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo) repo_flag="${2:-}"; shift 2 ;;
       --purge-old-tags) purge_old_tags=1; shift ;;
       --no-purge-old-tags) purge_old_tags=0; shift ;;
+      --build-cpus) opt_build_cpus="${2:-}"; shift 2 ;;
+      --build-memory) opt_build_memory="${2:-}"; shift 2 ;;
+      --build-runtime) opt_build_runtime="${2:-}"; shift 2 ;;
+      --on-host)
+        # Convenience: pin to the host's docker daemon (Docker Desktop)
+        # explicitly. Resource caps don't apply to docker (its daemon
+        # already lives in its own VM, isolated from the Podman VM that
+        # hosts kind), so we just set the runtime.
+        opt_build_runtime="docker" ; shift ;;
       -h|--help)
         cat <<EOF
 sandboxctl build [path] [--repo <dir>] [--purge-old-tags]
+                         [--build-cpus N] [--build-memory SIZE]
+                         [--build-runtime podman|docker] [--on-host]
 
 Find Dockerfiles under the product repo, build them, and push to the
 in-cluster registry. The product repo can be specified by:
@@ -3285,6 +3631,25 @@ in-cluster registry. The product repo can be specified by:
 Build precedence inside the repo:
   1. existing sandboxctl.yaml/.yml — used as-is
   2. Dockerfiles only              — auto-generates sandboxctl.yaml
+
+Resource caps (only meaningful for the podman runtime):
+  --build-cpus N         pin the podman build to N cores (--cpuset-cpus
+                         0..N-1). Default: half the Podman VM's CPUs so
+                         kind keeps headroom during a hot compile. Pass
+                         0 to disable. SANDBOX_BUILD_CPUS env equivalent.
+                         Ignored when building with docker — its daemon
+                         already runs in a separate VM from kind.
+  --build-memory SIZE    cap the podman build's RAM (e.g. '4g',
+                         '1500m'). Default: half the Podman VM's RAM.
+                         Pass 0 to disable. SANDBOX_BUILD_MEMORY env
+                         equivalent. Same docker-runtime caveat applies.
+  --build-runtime R      pick 'podman' or 'docker'. Default: docker
+                         when its daemon is reachable, else podman.
+                         Note: on a podman-only host where 'docker' is
+                         the podman CLI in disguise, both runtimes land
+                         in the same VM and caps still matter.
+                         SANDBOX_BUILD_RUNTIME env equivalent.
+  --on-host              shorthand for '--build-runtime docker'.
 
 Tag retention:
   --purge-old-tags     Before each push, delete every existing tag of the
@@ -3304,12 +3669,29 @@ EOF
         fi ;;
     esac
   done
+
+  if [[ -n "$opt_build_runtime" && "$opt_build_runtime" != "podman" && "$opt_build_runtime" != "docker" ]]; then
+    die "build: --build-runtime must be 'podman' or 'docker', got '${opt_build_runtime}'"
+  fi
+  # "auto" / "0" / empty are sentinels handled by build_and_push.
+  if [[ -n "$opt_build_cpus" && "$opt_build_cpus" != "auto" && "$opt_build_cpus" != "0" \
+        && ! "$opt_build_cpus" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    die "build: --build-cpus must be a number (e.g. 2 or 1.5), 'auto', or '0' to disable; got '${opt_build_cpus}'"
+  fi
+  if [[ -n "$opt_build_memory" && "$opt_build_memory" != "auto" && "$opt_build_memory" != "0" \
+        && ! "$opt_build_memory" =~ ^[0-9]+([bkmg])?$ ]]; then
+    die "build: --build-memory must look like '4g' / '1500m' / '512m', 'auto', or '0' to disable; got '${opt_build_memory}'"
+  fi
+
   local target
   target="$(_resolve_product_repo "$repo_flag" "$positional" build)" || return 1
 
   _ensure_registry_reachable
 
   export BUILD_PURGE_OLD_TAGS="$purge_old_tags"
+  export SANDBOX_BUILD_CPUS="$opt_build_cpus"
+  export SANDBOX_BUILD_MEMORY="$opt_build_memory"
+  export SANDBOX_BUILD_RUNTIME="$opt_build_runtime"
 
   local manifest=""
   for candidate in "${target}/sandboxctl.yaml" "${target}/sandboxctl.yml" "$(pwd)/sandboxctl.yaml"; do
@@ -3961,6 +4343,9 @@ cmd_deploy() {
   local chart_override="" values_override="" name_override=""
   local purge_old_tags="${SANDBOX_BUILD_PURGE_OLD_TAGS:-0}"
   local redeploy=0
+  local opt_build_cpus="${SANDBOX_BUILD_CPUS:-}"
+  local opt_build_memory="${SANDBOX_BUILD_MEMORY:-}"
+  local opt_build_runtime="${SANDBOX_BUILD_RUNTIME:-}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo)     repo_flag="$2"; shift 2 ;;
@@ -3972,6 +4357,11 @@ cmd_deploy() {
       --redeploy) redeploy=1; do_build=0; shift ;;
       --purge-old-tags)    purge_old_tags=1; shift ;;
       --no-purge-old-tags) purge_old_tags=0; shift ;;
+      --build-cpus)    opt_build_cpus="${2:-}"; shift 2 ;;
+      --build-memory)  opt_build_memory="${2:-}"; shift 2 ;;
+      --build-runtime) opt_build_runtime="${2:-}"; shift 2 ;;
+      --on-host)
+        opt_build_runtime="docker" ; shift ;;
       -h|--help)
         cat <<EOF
 sandboxctl deploy [path] [--repo <dir>] [--env <name>]
@@ -4148,6 +4538,9 @@ EOF
              -not -path '*/dist/*' -print -quit 2>/dev/null | grep -q .; then
       local build_args=("$target")
       [[ "$purge_old_tags" == "1" ]] && build_args+=(--purge-old-tags)
+      [[ -n "$opt_build_cpus" ]]    && build_args+=(--build-cpus    "$opt_build_cpus")
+      [[ -n "$opt_build_memory" ]]  && build_args+=(--build-memory  "$opt_build_memory")
+      [[ -n "$opt_build_runtime" ]] && build_args+=(--build-runtime "$opt_build_runtime")
       log "running 'sandboxctl build ${build_args[*]}' first (use --no-build to skip)"
       cmd_build "${build_args[@]}"
     else
