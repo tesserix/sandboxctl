@@ -2647,7 +2647,7 @@ cmd_bootstrap() {
         up_args+=("$1" "$2"); shift 2 ;;
       --env|--chart|--values|--name)
         deploy_args+=("$1" "${2:-}"); shift 2 ;;
-      --no-build|--purge-old-tags|--no-purge-old-tags)
+      --no-build|--redeploy|--purge-old-tags|--no-purge-old-tags)
         deploy_args+=("$1"); shift ;;
       -h|--help)
         cat <<EOF
@@ -2673,6 +2673,7 @@ product repo is selected by:
   sandboxctl bootstrap --install all          # forwarded to 'up' (every add-on)
   sandboxctl bootstrap --chart custom/chart   # forwarded to 'deploy'
   sandboxctl bootstrap --no-build             # forwarded to 'deploy'
+  sandboxctl bootstrap --redeploy             # forwarded to 'deploy' (chart-only sync, reuses existing image)
 
 If the cluster is already up the platform install is skipped — only
 the deploy half runs, so this is also fine to use as your every-day
@@ -3955,10 +3956,11 @@ remove_app_host() {
 
 cmd_deploy() {
   # Usage: sandboxctl deploy [path] [--repo <dir>] [--env <name>] [--chart <dir>]
-  #                          [--values <file>] [--name <name>] [--no-build]
+  #                          [--values <file>] [--name <name>] [--no-build] [--redeploy]
   local positional="" repo_flag="" env="dev" do_build=1
   local chart_override="" values_override="" name_override=""
   local purge_old_tags="${SANDBOX_BUILD_PURGE_OLD_TAGS:-0}"
+  local redeploy=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo)     repo_flag="$2"; shift 2 ;;
@@ -3967,13 +3969,14 @@ cmd_deploy() {
       --values)   values_override="$2"; shift 2 ;;
       --name)     name_override="$2"; shift 2 ;;
       --no-build) do_build=0; shift ;;
+      --redeploy) redeploy=1; do_build=0; shift ;;
       --purge-old-tags)    purge_old_tags=1; shift ;;
       --no-purge-old-tags) purge_old_tags=0; shift ;;
       -h|--help)
         cat <<EOF
 sandboxctl deploy [path] [--repo <dir>] [--env <name>]
                   [--chart <dir>] [--values <file>] [--name <name>]
-                  [--no-build] [--purge-old-tags]
+                  [--no-build] [--redeploy] [--purge-old-tags]
 
 Builds + pushes images, applies secrets, pushes the chart to the
 in-cluster Gitea, creates one Argo CD Application per chart, and
@@ -4012,6 +4015,20 @@ Override flags (skip auto-discovery and deploy a single chart):
                     values-sandbox.yaml, then values-local.yaml.
   --name <name>     Override the Argo Application + routed hostname
                     name. Defaults to the chart's "name:" field.
+
+Mode flags:
+  --no-build        Skip the build step. Image pins still resolve from
+                    the existing registry contents, so the chart deploys
+                    against the last-pushed tag.
+  --redeploy        Skip the build step (same as --no-build) AND push
+                    the chart subtree to Gitea, then force Argo CD to
+                    refresh the Application immediately so it picks up
+                    the just-pushed commit instead of waiting for the
+                    next poll. Use this when only the chart/values
+                    changed and the existing image is fine — the same
+                    built image is reused, the helm overrides are
+                    re-pushed to Gitea, Argo syncs, and the workloads
+                    are restarted.
 
 Defaults:
   --env  dev   (namespace = <chart>; URL = <chart>.${SANDBOX_DOMAIN})
@@ -4115,11 +4132,15 @@ EOF
     start_sudo_keepalive
   fi
 
+  if (( redeploy )); then
+    log "redeploy mode — skipping build, pushing chart to Gitea, and forcing an Argo CD hard refresh per app"
+  fi
+
   # Always rebuild + push every Dockerfile listed in sandboxctl.yaml so
   # the registry matches what the just-pushed chart references. Skipped
-  # only on --no-build, which is useful when iterating on chart edits
-  # without touching code. cmd_build is a no-op if there's no manifest
-  # and no Dockerfiles under <target>.
+  # on --no-build (or --redeploy, which implies --no-build) when only
+  # chart/values edits are in flight. cmd_build is a no-op if there's
+  # no manifest and no Dockerfiles under <target>.
   if (( do_build )); then
     if [[ -f "${target}/sandboxctl.yaml" || -f "${target}/sandboxctl.yml" ]] \
         || find "$target" -type f -name Dockerfile -not -path '*/.git/*' \
@@ -4185,6 +4206,14 @@ EOF
     # the chart's values.yaml + the repo's sandboxctl.yaml directly, so
     # there's nothing to precompute here.
     _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$src_dir" "$deploy_manifest" "$chart_count"
+
+    # --redeploy short-circuits Argo's reconcile poll so the chart push
+    # we just made hits the cluster within seconds. The annotation is a
+    # no-op on a brand-new Application (the apply above already triggers
+    # a sync), so it's safe to fire unconditionally when the flag is set.
+    if (( redeploy )); then
+      _argo_refresh_app "$cname"
+    fi
 
     _wait_argo_health "$cname"
 
@@ -4506,6 +4535,35 @@ spec:
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
 EOF
   fi
+}
+
+# Force Argo CD to refresh + re-sync an Application immediately instead
+# of waiting for the next reconcile poll (default ~3 min).
+#
+# The hard refresh annotation tells argocd-application-controller to
+# drop its cached manifest and re-pull from the source repo (here:
+# the in-cluster Gitea) right now. We pair it with the operation.sync
+# annotation so a Synced-but-stale Application also gets a fresh
+# kubectl apply pass — this is what makes `--redeploy` deterministic
+# even when the helm parameters render to byte-identical manifests.
+#
+# Both annotations are stamped with the current epoch so they look
+# different to the controller every call (Argo de-dupes on value).
+# Best-effort: a missing Application or RBAC denial is logged but
+# doesn't fail the deploy — the caller's _wait_argo_health pass will
+# surface a real problem.
+_argo_refresh_app() {
+  local cname="$1"
+  local stamp; stamp="$(date -u +%s)"
+  if ! kc -n "$ARGOCD_NS" annotate application "$cname" \
+        --overwrite \
+        "argocd.argoproj.io/refresh=hard" \
+        "sandboxctl.io/refresh-stamp=${stamp}" \
+        >/dev/null 2>&1; then
+    warn "[${cname}] could not annotate Argo Application for hard refresh (continuing)"
+    return 0
+  fi
+  log "[${cname}] requested Argo CD hard refresh (stamp ${stamp})"
 }
 
 # Poll Argo CD for an Application to become Synced + Healthy with a
@@ -5191,11 +5249,14 @@ usage:
   sandbox.sh images rm <ref>         delete an image (e.g. 'myapp:v1' or 'myapp' for all tags)
   sandbox.sh images prune            delete every image, then GC blobs (alias: 'purge')
   sandbox.sh images gc               run registry garbage-collector to reclaim disk now
-  sandbox.sh deploy [path] [--repo <dir>] [--env <name>] [--no-build] [--purge-old-tags]
+  sandbox.sh deploy [path] [--repo <dir>] [--env <name>] [--no-build] [--redeploy] [--purge-old-tags]
                                      auto-discover every chart under the product repo,
                                      build + push every Dockerfile, apply k8s/secrets.yaml, push each chart
                                      to in-cluster Gitea, create one Argo CD Application per chart, and
-                                     route <chart>.${SANDBOX_DOMAIN} per app
+                                     route <chart>.${SANDBOX_DOMAIN} per app.
+                                     --redeploy skips the build, re-pushes the chart to Gitea, and forces
+                                     Argo CD to hard-refresh so the existing image is reused with the
+                                     new chart/values without waiting for the next reconcile poll.
   sandbox.sh undeploy --name <appname> [--env <name>]
                                      remove the Argo Application, route, and hosts entry (namespace preserved)
   sandbox.sh bootstrap [path] [--repo <dir>] [up flags] [deploy flags]

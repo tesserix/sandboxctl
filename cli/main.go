@@ -45,7 +45,7 @@ var commands = []command{
 	{"kargo-ui", "print Kargo  URL + admin creds"},
 	{"build", "build + push Dockerfiles in the product repo (--repo <dir> | [path] | cwd)"},
 	{"images", "list / rm <ref> / prune / purge / gc — manage images in the cluster registry"},
-	{"deploy", "discover charts in the product repo (--repo <dir> | [path] | cwd) + push to Gitea + create Argo Apps"},
+	{"deploy", "discover charts in the product repo (--repo <dir> | [path] | cwd) + push to Gitea + create Argo Apps (--redeploy: chart-only sync, reuse existing image, force Argo refresh)"},
 	{"undeploy", "remove the Argo Application + route created by 'deploy'"},
 	{"bootstrap", "'up' (if needed) + 'deploy' in one command (--repo <dir> | [path] | cwd)"},
 	{"prune", "diagnose + clean disk: host / mounted DMGs / runtime VM / cluster registry (prompts before each step; alias: cleanup)"},
