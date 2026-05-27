@@ -485,6 +485,38 @@ Stages, in order:
 4. **In-cluster registry** — runs registry GC (safe, blob-only) and, on a
    separate prompt, a full prune of every tag.
 
+### Deep clean + redeploy
+
+When the Podman VM is genuinely full and you want to reset every cached
+layer before a fresh build, chain a runtime-wide prune with
+`--purge-old-tags`:
+
+```sh
+podman system prune -a -f --volumes \
+  && podman builder prune -af \
+  && sandboxctl deploy --chart path/to/your/chart --purge-old-tags
+```
+
+What this does, in order:
+
+1. `podman system prune -a -f --volumes` — drop every stopped container,
+   every dangling and unused image, every unused network, and every
+   unused volume on the Podman VM. Running containers (the kind nodes
+   and their attached volumes) are kept, so the cluster itself survives.
+2. `podman builder prune -af` — wipe BuildKit's build-cache layers,
+   which `system prune` doesn't always reach.
+3. `sandboxctl deploy … --purge-old-tags` — rebuild and push, deleting
+   every prior tag of each repo from the in-cluster registry before the
+   new push and registry-GC'ing at the end, so only the tag you just
+   pushed survives.
+
+Useful as an occasional "reset the disk" pass before a clean build —
+e.g. after a long sprint of churny image rebuilds. It is heavier than
+`sandboxctl prune`: `--volumes` removes any unused anonymous volumes,
+including ones from prior `kind` clusters or other podman projects on
+the same VM. If you have unrelated podman work on the host, prefer
+`sandboxctl prune` instead.
+
 The first `up` prompts for `sudo` once — it edits `/etc/hosts` and trusts
 the local root CA in the System keychain. Subsequent runs are silent.
 
