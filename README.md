@@ -193,6 +193,8 @@ sandboxctl deploy --chart /abs/path/to/chart
 | `--env <name>` | Namespace suffix only — URL stays `<name>.sandbox.app`. Default `dev`. |
 | `--no-build` | Skip the build step (registry already has the images) |
 | `--purge-old-tags` | Forwarded to the build step (see [Image management](#image-management)). `--no-purge-old-tags` overrides `SANDBOX_BUILD_PURGE_OLD_TAGS=1` from the env. |
+| `--build-cpus N` / `--build-memory SIZE` | Forwarded to the build step. Cap the podman build container so a hot Go/Rust compile can't starve kind. Default: half the Podman VM along each axis; `0` opts out. See [Image management](#image-management). |
+| `--build-runtime podman\|docker` / `--on-host` | Forwarded to the build step. Pick the build runtime; `--on-host` is shorthand for `--build-runtime docker`. |
 
 `sandboxctl undeploy --name <chart>` reverses everything — removes the
 Argo Application, the VirtualService, and the `/etc/hosts` entry. The
@@ -319,6 +321,11 @@ sandboxctl build                          # build + push all Dockerfiles in cwd
 sandboxctl build --purge-old-tags         # wipe prior tags of each repo before pushing,
                                           #   then GC; only the just-pushed tag remains
                                           #   (env equivalent: SANDBOX_BUILD_PURGE_OLD_TAGS=1)
+sandboxctl build --build-cpus 2 --build-memory 4g
+                                          # cap the podman build at 2 cores / 4 GiB
+                                          #   so kind keeps headroom during a hot compile
+sandboxctl build --build-cpus 0           # opt out of capping (use the whole VM)
+sandboxctl build --on-host                # alias for --build-runtime docker
 sandboxctl images                         # list everything in the registry
 sandboxctl images rm myapp:v1             # delete one tag
 sandboxctl images rm myapp                # delete every tag of an image
@@ -327,8 +334,32 @@ sandboxctl images purge                   # same as prune — for users coming f
 sandboxctl images gc                      # garbage-collect blobs only
 ```
 
-`--purge-old-tags` is also accepted by `sandboxctl deploy` and
-`sandboxctl bootstrap`, where it forwards to the build step.
+`--purge-old-tags`, `--build-cpus`, `--build-memory`, `--build-runtime`,
+and `--on-host` are also accepted by `sandboxctl deploy` and
+`sandboxctl bootstrap`, where they forward to the build step.
+
+### Why the build caps exist
+
+`sandboxctl build` runs `podman build`, and `podman build` shares the
+Podman VM with the kind cluster. A burst-y Go/Rust compile can claim
+every CPU and most of the VM's RAM — kubelet on the kind control-plane
+then misses heartbeats and the cluster goes "down" mid-build.
+
+Default behaviour: pin the build to half the Podman VM's CPUs (via
+`--cpuset-cpus 0..N-1`) and half its RAM (via `--memory`), resolved at
+runtime from `podman machine inspect`. Override with
+`--build-cpus`/`--build-memory`, opt out with `0`, or move the build
+off the Podman VM entirely with `--build-runtime docker` /
+`--on-host` (only meaningful when `docker` points at a separate daemon
+like Docker Desktop — on a podman-only host, `docker` is the podman
+CLI in disguise and lands in the same VM).
+
+| Flag | Env var | What |
+|---|---|---|
+| `--build-cpus N` | `SANDBOX_BUILD_CPUS` | Pin podman build to N cores. Default `auto` (= half the VM). `0` disables. |
+| `--build-memory SIZE` | `SANDBOX_BUILD_MEMORY` | RAM cap, e.g. `4g`, `1500m`. Default `auto`. `0` disables. |
+| `--build-runtime podman\|docker` | `SANDBOX_BUILD_RUNTIME` | Force a specific runtime. Default: docker if its daemon is reachable, else podman. |
+| `--on-host` | — | Shorthand for `--build-runtime docker`. |
 
 ## Cluster lifecycle
 
@@ -336,6 +367,9 @@ sandboxctl images gc                      # garbage-collect blobs only
 sandboxctl up                             # bring everything up (1 worker, ~5 GB RAM)
 sandboxctl up --workers 2                 # 2 workers, more headroom for concurrent pods
 sandboxctl up --workers 3                 # 3 workers, recommended for 32 GB+ Macs
+sandboxctl up --podman-disk 80 --podman-memory 12g
+                                          # resize the Podman VM and remember the size
+                                          #   (persisted to ~/.sandboxctl/podman.env)
 sandboxctl status                         # cluster + workload status + URLs
 sandboxctl validate                       # curl each URL and report HTTP codes
 sandboxctl creds                          # admin passwords for Argo CD + Kargo
@@ -344,6 +378,8 @@ sandboxctl kargo-ui                       # print just the Kargo URL + admin cre
 sandboxctl restart                        # re-apply installers, keep cluster + state
 sandboxctl restart --rebuild              # full wipe-and-rebuild (alias: --full)
 sandboxctl restart --workers 3            # resize the cluster (implies --rebuild)
+sandboxctl restart --podman-cpus 8        # live-resize the Podman VM (cpu/memory only;
+                                          #   disk grow surfaces a setup-podman --recreate hint)
 sandboxctl down                           # remove cluster + LaunchAgent + /etc/hosts + CA
 sandboxctl purge                          # down + remove ~/.sandboxctl (prompts)
 sandboxctl trust-ca                       # re-trust the per-install root CA in the System keychain
@@ -405,13 +441,23 @@ The default `up` (agentgateway + platform) fits comfortably in the default
 data-plane proxy pod (~150 MB total). Turning on the heavier opt-ins —
 especially `--with-litellm` (~700 MB image, ~1-2 GB RAM) or
 `--with-ai-gateway` (all of them) — is when it's worth bumping the podman
-VM:
+VM. Use the `--podman-*` flags so the choice is remembered across runs:
 
 ```sh
-podman machine stop
-podman machine set --cpus 6 --memory 10240   # 10 GB; host should have >= 16 GB
-podman machine start
+sandboxctl restart --podman-cpus 6 --podman-memory 10g
+# or, on a fresh machine:
+sandboxctl up --podman-cpus 6 --podman-memory 10g --podman-disk 80
 ```
+
+`--podman-cpus` and `--podman-memory` are applied live to an existing
+rootful machine (`podman machine set …` under the hood). `--podman-disk`
+needs a destructive recreate — sandboxctl prints the exact
+`setup-podman --disk-size N --recreate` command instead of silently
+downgrading. All three values are persisted to
+`~/.sandboxctl/podman.env` and re-applied on every later `up`/`restart`,
+so you only pass each flag once. The raw `podman machine set …`
+recipe still works if you prefer it; sandboxctl will pick the new size
+up via the existing `PODMAN_MACHINE_*` env vars.
 
 ## Reclaiming disk
 
@@ -457,15 +503,27 @@ size on first run:
 sandboxctl setup-podman --disk-size 80 --memory 8192 --cpus 6
 ```
 
+Or, equivalently — and persisted, so you don't have to re-pass the
+flags every time:
+
+```sh
+sandboxctl up --podman-disk 80 --podman-memory 8g --podman-cpus 6
+```
+
 Existing machine too small? podman can't grow a VM's disk in place —
-the only way to bump `--disk-size` is to recreate the machine, which
-wipes its images, containers, and any kind cluster living inside:
+the only way to bump disk size is to recreate the machine, which wipes
+its images, containers, and any kind cluster living inside:
 
 ```sh
 sandboxctl down                            # tear the cluster down first
 sandboxctl setup-podman --disk-size 80 --recreate
 sandboxctl up                              # rebuild the cluster
 ```
+
+`sandboxctl restart --podman-disk 80` does **not** silently recreate;
+it prints the exact `setup-podman --recreate` command above so the
+destructive step stays explicit. CPU and memory changes via
+`--podman-cpus`/`--podman-memory` are non-destructive and applied live.
 
 ### kagent model providers
 
@@ -550,12 +608,16 @@ Defaults work for most people. Override via env vars:
 | `SANDBOX_HTTPS_PORT` | `8443` | host HTTPS port |
 | `SANDBOX_REGISTRY_PORT` | `5050` | host port for the in-cluster registry |
 | `SANDBOX_RUNTIME` | `podman` | `podman` or `docker` |
-| `PODMAN_MACHINE_CPUS` | `4` | CPUs the podman VM gets at init |
-| `PODMAN_MACHINE_MEMORY_MIB` | `6144` | RAM in MiB |
-| `PODMAN_MACHINE_DISK_GIB` | `60` | virtual-disk size for the podman VM at init. podman has no in-place disk grow — use `setup-podman --disk-size N --recreate` to bump an existing machine. Same as `setup-podman --disk-size N`. |
+| `PODMAN_MACHINE_CPUS` | `4` | CPUs the podman VM gets at init. Saved value from `--podman-cpus` (in `~/.sandboxctl/podman.env`) wins over this default; an explicit env var still wins over both. |
+| `PODMAN_MACHINE_MEMORY_MIB` | `6144` | RAM in MiB. Same precedence as `PODMAN_MACHINE_CPUS`. |
+| `PODMAN_MACHINE_DISK_GIB` | `60` | virtual-disk size for the podman VM at init. podman has no in-place disk grow — use `setup-podman --disk-size N --recreate` to bump an existing machine. Same as `setup-podman --disk-size N` or `--podman-disk N` (persisted). |
+| `SANDBOX_PODMAN_CONFIG` | `~/.sandboxctl/podman.env` | Persisted Podman VM sizing — written by `--podman-cpus`/`--podman-memory`/`--podman-disk` and sourced on every run so saved values become defaults. |
 | `KIND_NODE_IMAGE` | `kindest/node:v1.35.0` | kind node image |
 | `SANDBOX_WORKER_COUNT` | `1` | kind worker nodes (1–3). Same as `--workers N`. |
 | `SANDBOX_BUILD_PURGE_OLD_TAGS` | `0` | wipe prior tags of each repo before pushing during `build`/`deploy`/`bootstrap`, then registry-GC at the end. Same as `--purge-old-tags`. |
+| `SANDBOX_BUILD_CPUS` | `auto` | cap podman build CPU. `auto` resolves to half the Podman VM's CPUs at runtime; `0` disables. Same as `--build-cpus`. |
+| `SANDBOX_BUILD_MEMORY` | `auto` | cap podman build memory (e.g. `4g`, `1500m`). `auto` resolves to half the VM's RAM; `0` disables. Same as `--build-memory`. |
+| `SANDBOX_BUILD_RUNTIME` | (empty) | force `podman` or `docker` for the build leg. Default: docker if reachable, else podman. Same as `--build-runtime`. |
 | `ARGO_HEALTH_ATTEMPTS` | `3` | number of 180s windows `deploy` waits for an Argo Application to become Synced+Healthy (default covers up to 9 min for slow CRD-heavy syncs). |
 | `ARGOCD_CHART_VERSION` | `9.5.13` | argo-cd chart version |
 | `KARGO_CHART_VERSION` | `1.1.1` | kargo chart version |
