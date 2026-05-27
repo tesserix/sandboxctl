@@ -3370,21 +3370,54 @@ cmd_kargo_ui() {
 
 # ----- Build + push (registry) -----
 
-# Default: build on the host's docker daemon (Docker Desktop) when it's
-# available. Rationale: kind runs inside the Podman VM, so a `podman
-# build` shares CPU/RAM with the kind nodes. A heavy compile (Go, Rust,
-# Java) can starve kind's kubelet and silently bring the cluster down
-# mid-build. Building with docker keeps the compile load in Docker
-# Desktop's separate VM; the existing save|load handoff still ferries
-# the image back to podman for the push to the in-cluster registry.
+# Returns 0 when the `docker` CLI is talking to a *real* Docker engine
+# (Docker Desktop / dockerd) rather than a podman daemon wearing a docker
+# hat. On the latter, the `docker buildx` plugin is absent and
+# DOCKER_BUILDKIT=0 doesn't help — `docker build` aborts with
+# "BuildKit is enabled but the buildx component is missing".
+#
+# Heuristic: real Docker reports a 20+ server version on a Docker Desktop
+# OS line; podman's docker-shim reports its podman version (e.g. 5.x) and
+# the host distro (e.g. fedora). We probe both — anything that doesn't
+# look unmistakably like Docker Engine is treated as a shim.
+_docker_is_real_engine() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker info >/dev/null 2>&1 || return 1
+
+  local server_ver os
+  server_ver="$(docker info --format '{{.ServerVersion}}' 2>/dev/null || true)"
+  os="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
+
+  # Docker Desktop spells the OS line "Docker Desktop"; native dockerd
+  # on Linux says e.g. "Ubuntu 22.04". Podman's shim says "fedora" (or
+  # whatever distro the podman VM runs).
+  case "$os" in
+    *"Docker Desktop"*|*"Docker Engine"*) return 0 ;;
+  esac
+
+  # Fall back to version: real Docker is 18+ today; podman is 4.x/5.x.
+  # A version starting with 18-29 plus an OS that doesn't look like a
+  # podman VM distro is a reasonable "real docker" signal.
+  case "$server_ver" in
+    1[8-9].*|2[0-9].*|3[0-9].*) return 0 ;;
+  esac
+  return 1
+}
+
+# Default: build on the host's docker engine when it's a *real* Docker
+# (Docker Desktop / dockerd) — that compile lands in a separate VM from
+# kind so kubelet keeps its CPU/RAM. Otherwise use podman directly:
+# either we don't have docker at all, or the `docker` CLI is a podman
+# docker-shim that lacks buildx and would just fail with the BuildKit
+# error. The save|load handoff in build_and_push handles cross-runtime
+# pushes when needed.
 #
 # Override hierarchy:
 #   1. SANDBOX_BUILD_RUNTIME / --build-runtime — explicit user choice.
-#   2. docker daemon reachable                 — host build, default.
-#   3. podman fallback                          — only when docker is
-#                                                  unavailable; warn so
-#                                                  the kind-down risk
-#                                                  isn't silent.
+#   2. real docker engine reachable            — host build, default.
+#   3. podman                                  — everything else
+#                                                (no Docker Desktop
+#                                                required).
 detect_builder() {
   if [[ -n "${SANDBOX_BUILD_RUNTIME:-}" ]]; then
     case "$SANDBOX_BUILD_RUNTIME" in
@@ -3394,21 +3427,28 @@ detect_builder() {
         echo podman; return ;;
       docker)
         command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
-          || die "SANDBOX_BUILD_RUNTIME=docker but docker daemon is not running (start Docker Desktop?)"
+          || die "SANDBOX_BUILD_RUNTIME=docker but docker daemon is not running"
+        # Honour the user's explicit choice even when the CLI is a
+        # podman shim — but warn so the BuildKit error isn't a surprise.
+        if ! _docker_is_real_engine; then
+          warn "SANDBOX_BUILD_RUNTIME=docker but the docker CLI is talking to podman (no real Docker engine detected)."
+          warn "  buildx is unavailable on this shim — the build will likely fail with 'BuildKit is enabled but the buildx component is missing'."
+          warn "  drop --build-runtime / unset SANDBOX_BUILD_RUNTIME to let sandboxctl pick podman directly."
+        fi
         echo docker; return ;;
       *) die "SANDBOX_BUILD_RUNTIME must be 'podman' or 'docker', got '${SANDBOX_BUILD_RUNTIME}'" ;;
     esac
   fi
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    log "build runtime: docker (host VM, isolated from kind). Override with SANDBOX_BUILD_RUNTIME=podman or --build-runtime podman" >&2
+  if _docker_is_real_engine; then
+    log "build runtime: docker (host engine, isolated from kind). Override with SANDBOX_BUILD_RUNTIME=podman." >&2
     echo docker; return
   fi
   if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    warn "docker daemon not available — falling back to 'podman build' (shares the VM with kind; heavy compiles may starve the cluster)"
-    warn "  to silence this: start Docker Desktop, or pin with SANDBOX_BUILD_RUNTIME=podman"
+    # Silent fall-through: this is the right default on a podman-only
+    # box. Resource caps in build_and_push keep kind from starving.
     echo podman; return
   fi
-  die "neither podman nor docker is available — install podman ('sandboxctl setup-podman') to build images"
+  die "neither podman nor a usable docker engine is available — install podman ('sandboxctl setup-podman') to build images"
 }
 
 # Docker BuildKit needs the buildx CLI plugin. On hosts without Docker
