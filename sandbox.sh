@@ -5195,6 +5195,67 @@ _restart_app_workloads() {
   ok "[${cname}] workloads restarted"
 }
 
+# _wait_services_stable polls Services in $namespace until two consecutive
+# reads return the same set (or the cap is hit). Argo applies Services
+# over a few seconds and the routing picker is otherwise racy: the first
+# `kc get svc` on a fresh deploy can land before the chart's primary
+# Service exists, picking a sibling and baking the wrong VS until next
+# deploy. Polling makes the picker correct without operator action.
+#
+# Cap: 30s by default — enough for an Argo sync to settle on a healthy
+# cluster, short enough not to block deploys when nothing is racing.
+# Override via SANDBOXCTL_SVC_STABLE_TIMEOUT.
+_wait_services_stable() {
+  local namespace="$1"
+  local cap="${SANDBOXCTL_SVC_STABLE_TIMEOUT:-30}"
+  local prev="" cur="" stable_for=0 elapsed=0
+  while (( elapsed < cap )); do
+    cur="$(kc -n "$namespace" get svc -o name 2>/dev/null | sort | tr '\n' ',' || true)"
+    if [[ -n "$cur" && "$cur" == "$prev" ]]; then
+      (( stable_for++ ))
+      # Two consecutive identical reads, ~2s apart, is enough.
+      (( stable_for >= 1 )) && return 0
+    else
+      stable_for=0
+    fi
+    prev="$cur"
+    sleep 2
+    (( elapsed += 2 ))
+  done
+  # Caller continues even if cap expired — failing closed here would
+  # block deploys for charts that never settle. The picker will still
+  # warn loudly via _probe_route below if it landed on a bad upstream.
+  return 0
+}
+
+# _probe_route validates that the just-applied VirtualService actually
+# routes traffic to a working upstream. Spawns a one-shot Pod inside
+# the cluster (so we hit the gateway over its real ClusterIP rather
+# than relying on the operator's host DNS / kind port-forward), curls
+# https://$hostname:$SANDBOX_HTTPS_PORT/, and prints the response code.
+# Empty output ⇒ unreachable.
+_probe_route() {
+  local hostname="$1"
+  local svc_addr="istio-ingress.${ISTIO_INGRESS_NS}.svc.cluster.local"
+  # `kubectl run --rm` is the simplest way; we use curlimages/curl which
+  # is small (~5MB) and guaranteed to have curl. Failures are silent —
+  # the caller decides what an empty/non-2xx result means.
+  local code=""
+  code="$(kc run -n "$ISTIO_INGRESS_NS" --rm -i --restart=Never --quiet \
+    --image=curlimages/curl:8.10.1 --image-pull-policy=IfNotPresent \
+    "sandboxctl-probe-$RANDOM" -- \
+    curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
+    --resolve "${hostname}:${SANDBOX_HTTPS_PORT}:$(kc -n "$ISTIO_INGRESS_NS" get svc istio-ingress -o jsonpath='{.spec.clusterIP}' 2>/dev/null)" \
+    "https://${hostname}:${SANDBOX_HTTPS_PORT}/" 2>/dev/null || true)"
+  # Strip anything that isn't a 3-digit code (kubectl wrapper noise on
+  # some platforms emits "pod/... deleted" lines).
+  code="$(printf '%s' "$code" | grep -oE '[0-9]{3}' | tail -n1 || true)"
+  printf '%s\n' "${code:-unreachable}"
+  # Suppress the unused-var warning shellcheck would otherwise emit
+  # for svc_addr (we keep it for readability of the hostname split).
+  : "$svc_addr"
+}
+
 # Wire one Istio VirtualService + /etc/hosts entry for the app's primary
 # Service. Selection order, first match wins:
 #
@@ -5217,9 +5278,20 @@ _restart_app_workloads() {
 # encodes intent (which Service exposes port 80, which one is named
 # "ui", which one is annotated), so the heuristic just reads that
 # intent rather than asking the user to learn a new convention.
+#
+# Observability contract: every line is prefixed `[cname/namespace]` so
+# multi-chart deploys (sandboxctl walks every app it discovered) are
+# unambiguous in the log. When the scored heuristic fires, the full
+# ranked candidate table is printed alongside a one-line hint telling
+# the operator how to make the choice deterministic for next deploy.
+# After the route applies, we probe it from inside the cluster and warn
+# loudly with a remediation pointer when the upstream returns a non-OK
+# code — that's the safety net for charts where the heuristic guessed
+# wrong, so the operator finds out at deploy time, not in the browser.
 _route_app_service() {
   local cname="$1" namespace="$2" hostname="$3" deploy_manifest="${4:-}"
   local sandboxctl_bin="" svc="" svc_port="" pick_reason=""
+  local tag="[${cname}/${namespace}]"
 
   sandboxctl_bin="$(command -v sandboxctl 2>/dev/null || true)"
 
@@ -5236,6 +5308,14 @@ _route_app_service() {
     pick_reason="sandboxctl.yaml primary_service"
   fi
 
+  # If we have an explicit pick, skip the stability wait — the operator
+  # told us exactly which Service to use, no scanning is needed. For
+  # the heuristic and fallback paths, wait briefly so a still-syncing
+  # Argo doesn't fool us into picking the wrong sibling.
+  if [[ -z "$svc" ]]; then
+    _wait_services_stable "$namespace"
+  fi
+
   # 2. Annotation override
   if [[ -z "$svc" ]]; then
     svc="$(kc -n "$namespace" get svc \
@@ -5249,14 +5329,28 @@ _route_app_service() {
     local svc_json=""
     svc_json="$(kc -n "$namespace" get svc -o json 2>/dev/null || true)"
     if [[ -n "$svc_json" ]]; then
-      local sname="" sport="" sscore="" sreasons=""
-      while IFS=$'\t' read -r sname sport sscore sreasons; do
-        if [[ -z "$svc" && -n "$sname" ]]; then
-          svc="$sname"
-          svc_port="$sport"
-          pick_reason="scored ${sscore} (${sreasons})"
-        fi
-      done < <(printf '%s' "$svc_json" | "$sandboxctl_bin" _score-services "$cname" 2>/dev/null)
+      local scored=""
+      scored="$(printf '%s' "$svc_json" | "$sandboxctl_bin" _score-services "$cname" 2>/dev/null || true)"
+      if [[ -n "$scored" ]]; then
+        # Surface the full ranked candidate table so the operator can
+        # tell at a glance whether the picker chose what they expected.
+        log "${tag} primary Service candidates:"
+        local sname="" sport="" sscore="" sreasons=""
+        while IFS=$'\t' read -r sname sport sscore sreasons; do
+          [[ -n "$sname" ]] || continue
+          printf '  %-32s %-6s %5s  %s\n' "$sname" "$sport" "$sscore" "$sreasons"
+          if [[ -z "$svc" ]]; then
+            svc="$sname"
+            svc_port="$sport"
+            pick_reason="scored ${sscore} (${sreasons})"
+          fi
+        done <<<"$scored"
+        # shellcheck disable=SC2016 # backticks are literal in this help text.
+        printf '%s hint: set `deploy.primary_service: <name>` in sandboxctl.yaml,\n' "$tag"
+        # shellcheck disable=SC2016
+        printf '%s       or annotate the chosen Service with `sandboxctl.io/primary: "true"`,\n' "$tag"
+        printf '%s       to skip the heuristic on next deploy.\n' "$tag"
+      fi
     fi
   fi
 
@@ -5271,12 +5365,37 @@ _route_app_service() {
       svc_port="$(kc -n "$namespace" get svc "$svc" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo 80)"
     fi
     [[ -z "$svc_port" ]] && svc_port=80
-    log "[${cname}] primary Service: svc/${svc}:${svc_port} (${pick_reason})"
+    log "${tag} primary Service: svc/${svc}:${svc_port} (${pick_reason})"
     add_app_route "$hostname" "$namespace" "$svc" "$svc_port"
     add_app_host  "$hostname"
-    ok "[${cname}] routed https://${hostname}:${SANDBOX_HTTPS_PORT} → svc/${svc}:${svc_port}"
+    ok "${tag} routed https://${hostname}:${SANDBOX_HTTPS_PORT} → svc/${svc}:${svc_port}"
+
+    # Sanity check: if the chosen upstream isn't actually serving the
+    # app's HTTP surface (e.g. the heuristic raced and picked a sibling
+    # that 404s on `/`), warn now with a remediation pointer rather
+    # than letting the operator discover it in a browser later.
+    if [[ "${SANDBOXCTL_SKIP_ROUTE_PROBE:-}" != "1" ]]; then
+      local code=""
+      code="$(_probe_route "$hostname")"
+      case "$code" in
+        2??|3??)
+          ok "${tag} probe ${hostname} → HTTP ${code}"
+          ;;
+        unreachable|"")
+          warn "${tag} route applied but the gateway probe could not reach https://${hostname}:${SANDBOX_HTTPS_PORT}/."
+          warn "${tag} the chosen Service may not be serving on the picked port, or the gateway may still be programming the route."
+          warn "${tag} re-run 'sandboxctl deploy' shortly, or set 'deploy.primary_service: <name>' in sandboxctl.yaml to pin the choice."
+          ;;
+        *)
+          warn "${tag} route applied but https://${hostname}:${SANDBOX_HTTPS_PORT}/ returned HTTP ${code}."
+          warn "${tag} svc/${svc}:${svc_port} may not host the app's HTTP entrypoint."
+          warn "${tag} pin the right Service via 'deploy.primary_service: <name>' in sandboxctl.yaml,"
+          warn "${tag} or annotate it with 'sandboxctl.io/primary: \"true\"', then re-run 'sandboxctl deploy'."
+          ;;
+      esac
+    fi
   else
-    warn "[${cname}] no Service found in ${namespace} yet — Argo may still be syncing. Re-run 'sandboxctl deploy' once pods are up to wire the route."
+    warn "${tag} no Service found in ${namespace} yet — Argo may still be syncing. Re-run 'sandboxctl deploy' once pods are up to wire the route."
   fi
 }
 
