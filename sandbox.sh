@@ -2448,6 +2448,7 @@ validate_urls() {
   # Only check it when NATS was actually opted into — otherwise a
   # core-only `up` (no --with-nats) would always FAIL on a port that
   # was never meant to be bound.
+  local nats_failed=0
   if declare -F nats_present >/dev/null && nats_present \
      && [[ -n "${NATS_HOST:-}" && -n "${SANDBOX_NATS_PORT:-}" ]]; then
     local ntag="nats://${NATS_HOST}:${SANDBOX_NATS_PORT}"
@@ -2456,10 +2457,19 @@ validate_urls() {
     else
       printf '  %-50s FAIL (tcp)\n' "$ntag"
       failed=1
+      nats_failed=1
     fi
   fi
   if (( failed )); then
     warn "one or more URLs are not reachable from the Mac — see ${SANDBOX_PF_LOG} and 'sandboxctl status'"
+    if (( nats_failed )); then
+      # Common cause: an earlier `up` ran without --with-nats but the
+      # cluster still has NATS, so /etc/hosts maps nats.${SANDBOX_DOMAIN}
+      # to 127.0.0.1 with nothing listening. cmd_restart re-runs
+      # install_nats_portfwd because it auto-detects in-cluster NATS.
+      warn "  NATS TCP is bound by a LaunchAgent (${NATS_LAUNCHAGENT_LABEL:-io.github.sandboxctl.nats-portfwd})."
+      warn "  If this is a fresh sandbox or after a reboot, run: sandboxctl restart"
+    fi
     return 1
   fi
   ok "all URLs reachable"
@@ -2767,7 +2777,19 @@ EOF
   install_gitea
   install_istio_ambient
   install_routes
+  # Self-heal pattern (matches cmd_restart): if NATS is already in the
+  # cluster from a previous run, treat it as installed even when the
+  # caller did not pass --with-nats. Without this, a second `up` without
+  # the flag leaves NATS pods running, nats.${SANDBOX_DOMAIN} still in
+  # /etc/hosts (via _managed_hosts → nats_present), but no LaunchAgent
+  # → validate_urls reports `nats://nats.sandbox.app:4222 FAIL (tcp)`.
+  local up_nats_present=0
+  if declare -F nats_present >/dev/null && nats_present; then up_nats_present=1; fi
   if (( INSTALL_NATS )); then
+    install_nats
+  elif (( up_nats_present )); then
+    log "NATS already present in-cluster — re-applying chart + LaunchAgent (pass --with-nats to make this explicit)"
+    INSTALL_NATS=1
     install_nats
   else
     log "skipping NATS (pass --with-nats or --install all to enable)"
