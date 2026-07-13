@@ -80,6 +80,8 @@ func known(sub string) bool {
 		"_resolve-latest",
 		"_semver-lt",
 		"_render-args",
+		"_tool-check",
+		"_ensure-tools",
 		"_parse-build-manifest",
 		"_autogen-manifest",
 		"_chart-ingress-overrides",
@@ -146,6 +148,9 @@ func main() {
 	}
 	if sub == "_render-args" {
 		os.Exit(runRenderArgs(os.Args[2:]))
+	}
+	if sub == "_tool-check" {
+		os.Exit(runToolCheck(os.Args[2:]))
 	}
 	if sub == "_parse-build-manifest" {
 		os.Exit(runParseBuildManifest(os.Args[2:]))

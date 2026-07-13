@@ -84,6 +84,37 @@ func TestPinnedHonoursEnvOverride(t *testing.T) {
 	}
 }
 
+func TestParseToolVersion(t *testing.T) {
+	cases := []struct {
+		tool, raw, want string
+	}{
+		{"kind", "kind v0.32.0 go1.26.3 darwin/arm64", "v0.32.0"},
+		{"kind", "garbage", ""},
+		{"kubectl", "clientVersion:\n  gitVersion: v1.35.0\n  platform: darwin/arm64", "v1.35.0"},
+		{"kubectl", "gitVersion: \"v1.31.2\"", "v1.31.2"},
+		{"kubectl", "no version here", ""},
+		{"helm", "v3.19.0+g3bb50bb", "v3.19.0+g3bb50bb"},
+		{"helm", "not a version", ""},
+	}
+	for _, c := range cases {
+		if got := ParseToolVersion(c.tool, c.raw); got != c.want {
+			t.Errorf("ParseToolVersion(%s, %q) = %q, want %q", c.tool, c.raw, got, c.want)
+		}
+	}
+}
+
+func TestToolFloorsAreSane(t *testing.T) {
+	for _, tool := range ToolRegistry {
+		if _, pre, ok := parseSemver(tool.Floor); !ok || pre {
+			t.Errorf("%s floor %q is not a stable semver", tool.Name, tool.Floor)
+		}
+	}
+	// The floor comparison itself: helm build metadata must not trip it.
+	if SemverLess("v3.19.0+g3bb50bb", "3.16.0") {
+		t.Error("helm version with build metadata compared wrong")
+	}
+}
+
 // TestRegistryLockstepWithSandboxSh enforces the single most important
 // invariant of this package: the Go defaults and the sandbox.sh
 // *_CHART_VERSION defaults never drift. Skipped when the script isn't

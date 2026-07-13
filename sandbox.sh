@@ -599,7 +599,57 @@ helm_uninstall_if_present() {
 # Container runtime + cluster predicates
 # ============================================================================
 
-require_tools() { need kind; need kubectl; need helm; ensure_runtime; }
+# Toolchain auto-heal: a missing kind/kubectl/helm is brew-installed, a
+# version below the tested floor is brew-upgraded, healthy tools are
+# never touched. Rationale: host toolchains drift underneath users (a
+# podman major upgrade broke kind's cluster listing in the wild) and
+# "install via brew" errors push that drift onto them. Every action is
+# logged; anything unexpected (no brew, unparseable version, failed
+# upgrade) degrades to a warning and the run continues — this must
+# never brick a working setup. Opt out: SANDBOX_NO_TOOL_AUTOFIX=1.
+ensure_tools() {
+  if [[ "${SANDBOX_NO_TOOL_AUTOFIX:-0}" == "1" ]]; then
+    need kind; need kubectl; need helm
+    return 0
+  fi
+  local line name installed floor action have_brew=0
+  command -v brew >/dev/null 2>&1 && have_brew=1
+  while IFS=' ' read -r name installed floor action; do
+    [[ -n "$name" ]] || continue
+    case "$action" in
+      ok) ;;
+      install)
+        if (( have_brew )); then
+          log "$name is missing — installing via brew"
+          brew install "$name" >/dev/null 2>&1 \
+            || die "auto-install of $name failed — install it manually (brew install $name)"
+          ok "$name installed"
+        else
+          die "missing required command: $name (brew unavailable for auto-install)"
+        fi
+        ;;
+      upgrade)
+        if (( have_brew )); then
+          log "$name $installed is below the tested floor $floor — upgrading via brew"
+          if brew upgrade "$name" >/dev/null 2>&1 || brew install "$name" >/dev/null 2>&1; then
+            ok "$name upgraded"
+          else
+            warn "could not auto-upgrade $name (installed: $installed, tested floor: $floor) — continuing anyway"
+          fi
+        else
+          warn "$name $installed is below the tested floor $floor and brew is unavailable — continuing anyway"
+        fi
+        ;;
+      *)
+        warn "$name version could not be parsed — leaving it untouched"
+        ;;
+    esac
+  done < <(command -v sandboxctl >/dev/null 2>&1 && sandboxctl _tool-check 2>/dev/null || true)
+  # Whatever the auto-heal managed, the hard requirements still hold.
+  need kind; need kubectl; need helm
+}
+
+require_tools() { ensure_tools; ensure_runtime; }
 
 # _looks_like_product_repo <dir>
 # A "product repo" for sandboxctl is anything with at least one
@@ -6078,6 +6128,7 @@ main() {
     untrust-ca)         untrust_root_ca ;;
     up)                 shift; cmd_up "$@" ;;
     _onboard-check)     shift; _up_onboarding_check "${1:-$PWD}" ;;
+    _ensure-tools)      ensure_tools ;;
     down)               cmd_down ;;
     purge)              cmd_purge ;;
     status)             cmd_status ;;
