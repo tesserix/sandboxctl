@@ -14,6 +14,10 @@ func httpApp() reposcan.App {
 	return reposcan.App{
 		Name: "api", Path: "apps/api", Language: "go", Framework: "gin",
 		Dockerfile: "apps/api/Dockerfile", Port: 8080, Kind: "http",
+		Env: []reposcan.EnvRef{
+			{Name: "DATABASE_URL", Location: "apps/api/main.go:4", Secret: true},
+			{Name: "LOG_LEVEL", Location: "apps/api/main.go:6", Secret: false},
+		},
 	}
 }
 
@@ -56,7 +60,11 @@ func TestSingleAppUsesRecommendedLayout(t *testing.T) {
 	}
 
 	values := string(opByPath(t, res.Ops, "k8s/chart/values.yaml").Body)
-	for _, want := range []string{"repository: localhost:5050/api", "port: 8080", "enabled: false"} {
+	for _, want := range []string{
+		"repository: localhost:5050/api", "port: 8080", "enabled: false",
+		"envFromSecret: api-secrets",         // secret refs wire envFrom
+		"#   LOG_LEVEL (apps/api/main.go:6)", // config surfaced as comment
+	} {
 		if !strings.Contains(values, want) {
 			t.Fatalf("values.yaml missing %q:\n%s", want, values)
 		}
@@ -164,9 +172,15 @@ func TestHelmLintAndTemplate(t *testing.T) {
 			if !strings.Contains(rendered, "containerPort: 8080") {
 				t.Fatalf("api chart missing containerPort:\n%s", rendered)
 			}
+			if !strings.Contains(rendered, "name: api-secrets") {
+				t.Fatalf("api chart missing envFrom secretRef:\n%s", rendered)
+			}
 		case "jobs":
 			if hasService {
 				t.Fatalf("worker chart rendered a Service:\n%s", rendered)
+			}
+			if strings.Contains(rendered, "envFrom") {
+				t.Fatalf("secretless worker rendered envFrom:\n%s", rendered)
 			}
 		}
 	}

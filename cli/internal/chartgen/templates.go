@@ -32,6 +32,17 @@ service:
   type: ClusterIP
   port: [[.Port]]
 [[end]]
+[[if .SecretName]]# Secret providing the app's environment (template generated at
+# k8s/secrets.example.yaml; Reloader rolls the pods when it changes).
+envFromSecret: [[.SecretName]]
+[[else]]# Name a Secret here to inject it as environment via envFrom.
+envFromSecret: ""
+[[end]]
+[[if .ConfigVars]]# Non-secret configuration referenced by the app — add entries as
+# {name: ..., value: ...}:
+[[range .ConfigVars]]#   [[.]]
+[[end]][[end]]env: []
+
 serviceAccount:
   create: true
   name: ""
@@ -121,6 +132,15 @@ spec:
         - name: [[.Name]]
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.envFromSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.envFromSecret }}
+          {{- end }}
+          {{- with .Values.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- with .Values.service }}
           ports:
             - name: http
