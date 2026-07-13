@@ -50,10 +50,10 @@ func opPaths(ops []genwrite.Op) []string {
 func TestSingleAppUsesRecommendedLayout(t *testing.T) {
 	app := httpApp()
 	app.Path = "."
-	res := Ops(&reposcan.Model{Apps: []reposcan.App{app}}, "")
+	res := Ops(&reposcan.Model{Apps: []reposcan.App{app}}, Config{})
 
-	if len(res.Ops) != 7 {
-		t.Fatalf("ops = %v, want 7 chart files", opPaths(res.Ops))
+	if len(res.Ops) != 8 {
+		t.Fatalf("ops = %v, want 8 chart files", opPaths(res.Ops))
 	}
 	if res.ChartDirs["api"] != "k8s/chart" {
 		t.Fatalf("chart dir = %q, want k8s/chart for single-app", res.ChartDirs["api"])
@@ -82,17 +82,17 @@ func TestSingleAppUsesRecommendedLayout(t *testing.T) {
 }
 
 func TestMonorepoUsesPerAppChartDirs(t *testing.T) {
-	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, "")
+	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, Config{})
 	if res.ChartDirs["api"] != "k8s/charts/api" || res.ChartDirs["jobs"] != "k8s/charts/jobs" {
 		t.Fatalf("chart dirs = %v", res.ChartDirs)
 	}
-	if len(res.Ops) != 14 {
-		t.Fatalf("ops = %d, want 7 per app", len(res.Ops))
+	if len(res.Ops) != 16 {
+		t.Fatalf("ops = %d, want 8 per app", len(res.Ops))
 	}
 }
 
 func TestWorkerChartHasNoServiceBlock(t *testing.T) {
-	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, "")
+	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, Config{})
 	values := string(opByPath(t, res.Ops, "k8s/charts/jobs/values.yaml").Body)
 	if strings.Contains(values, "service:") {
 		t.Fatalf("worker values.yaml has a service block:\n%s", values)
@@ -104,7 +104,7 @@ func TestSkipsExistingChartAndDockerlessApps(t *testing.T) {
 	covered.Existing.Chart = "k8s/chart"
 	dockerless := reposcan.App{Name: "mobile", Path: "apps/mobile", Language: "ts", Kind: "frontend"}
 
-	res := Ops(&reposcan.Model{Apps: []reposcan.App{covered, dockerless}}, "")
+	res := Ops(&reposcan.Model{Apps: []reposcan.App{covered, dockerless}}, Config{})
 	if len(res.Ops) != 0 {
 		t.Fatalf("expected no ops, got %v", opPaths(res.Ops))
 	}
@@ -118,10 +118,32 @@ func TestSkipsExistingChartAndDockerlessApps(t *testing.T) {
 }
 
 func TestRegistryOverride(t *testing.T) {
-	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, "localhost:6060")
+	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, Config{Registry: "localhost:6060"})
 	values := string(opByPath(t, res.Ops, "k8s/charts/api/values.yaml").Body)
 	if !strings.Contains(values, "repository: localhost:6060/api") {
 		t.Fatalf("registry override ignored:\n%s", values)
+	}
+}
+
+func TestSandboxValuesCarryVirtualService(t *testing.T) {
+	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}},
+		Config{Domain: "sb.test", GatewayRef: "gw-ns/gw"})
+
+	api := string(opByPath(t, res.Ops, "k8s/charts/api/values-sandbox.yaml").Body)
+	for _, want := range []string{"enabled: true", "host: api.sb.test", "gateway: gw-ns/gw"} {
+		if !strings.Contains(api, want) {
+			t.Fatalf("api values-sandbox missing %q:\n%s", want, api)
+		}
+	}
+	// Workers have no port → no VS block in their sandbox values.
+	jobs := string(opByPath(t, res.Ops, "k8s/charts/jobs/values-sandbox.yaml").Body)
+	if strings.Contains(jobs, "virtualService") {
+		t.Fatalf("worker values-sandbox has a VS block:\n%s", jobs)
+	}
+	// Portable default: values.yaml ships the block disabled.
+	vals := string(opByPath(t, res.Ops, "k8s/charts/api/values.yaml").Body)
+	if !strings.Contains(vals, "enabled: false") || !strings.Contains(vals, "virtualService:") {
+		t.Fatalf("values.yaml missing disabled VS default:\n%s", vals)
 	}
 }
 
@@ -136,7 +158,7 @@ func TestHelmLintAndTemplate(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, "")
+	res := Ops(&reposcan.Model{Apps: []reposcan.App{httpApp(), workerApp()}}, Config{})
 	plan, err := genwrite.BuildPlan(root, res.Ops)
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +181,27 @@ func TestHelmLintAndTemplate(t *testing.T) {
 			t.Fatalf("helm template %s failed:\n%s", app, out)
 		}
 		rendered := string(out)
+		// Portable default: no VirtualService without the sandbox values.
+		if strings.Contains(rendered, "kind: VirtualService") {
+			t.Fatalf("%s: default render carries a VirtualService:\n%s", app, rendered)
+		}
+
+		// With the sandbox values, http charts route; workers still don't.
+		sbx := exec.Command(helm, "template", app, chartPath, "-f", filepath.Join(chartPath, "values-sandbox.yaml"))
+		sbxOut, err := sbx.CombinedOutput()
+		if err != nil {
+			t.Fatalf("helm template -f values-sandbox %s failed:\n%s", app, sbxOut)
+		}
+		sbxRendered := string(sbxOut)
+		hasVS := strings.Contains(sbxRendered, "kind: VirtualService")
+		if app == "api" {
+			if !hasVS || !strings.Contains(sbxRendered, `"api.sandbox.app"`) {
+				t.Fatalf("api sandbox render missing VirtualService/host:\n%s", sbxRendered)
+			}
+		}
+		if app == "jobs" && hasVS {
+			t.Fatalf("worker sandbox render carries a VirtualService:\n%s", sbxRendered)
+		}
 		if !strings.Contains(rendered, "kind: Deployment") {
 			t.Fatalf("%s: no Deployment rendered:\n%s", app, rendered)
 		}

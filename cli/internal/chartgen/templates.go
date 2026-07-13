@@ -51,10 +51,19 @@ serviceAccount:
   name: ""
 
 ingress:
-  # sandboxctl routes <app>.sandbox.app through the Istio gateway; a
-  # chart-shipped Ingress would fight that route. Enable only when
-  # deploying outside the sandbox.
+  # Kubernetes Ingress stays off: in the sandbox, routing is the
+  # VirtualService below; off-sandbox, enable whichever you use.
   enabled: false
+
+sandbox:
+  # The chart carries its own Istio VirtualService so GitOps owns the
+  # app's URL end to end — no hand-written routing per app. Disabled
+  # here so the chart stays portable; values-sandbox.yaml turns it on
+  # with the sandbox host + gateway.
+  virtualService:
+    enabled: false
+    host: ""
+    gateway: ""
 
 resources: {}
 
@@ -71,7 +80,13 @@ image:
   repository: [[.ImageRepo]]
   tag: latest
   digest: ""
-`
+[[if .Port]]
+sandbox:
+  virtualService:
+    enabled: true
+    host: [[.Host]]
+    gateway: [[.Gateway]]
+[[end]]`
 
 const helpersTmpl = `{{- define "[[.Name]].name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
@@ -191,6 +206,32 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: http
       protocol: TCP
+{{- end }}
+`
+
+// virtualServiceTmpl renders only when the chart exposes a Service AND
+// the sandbox values enable it — so default renders stay portable and
+// worker charts stay routeless. The chained `and` is nil-safe because
+// template and/or short-circuit (and helm 4's Values type rejects
+// sprig's dig, so this is also the portable spelling).
+const virtualServiceTmpl = `{{- if and .Values.service .Values.sandbox .Values.sandbox.virtualService .Values.sandbox.virtualService.enabled }}
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: {{ include "[[.Name]].fullname" . }}
+  labels:
+    {{- include "[[.Name]].labels" . | nindent 4 }}
+spec:
+  hosts:
+    - {{ .Values.sandbox.virtualService.host | quote }}
+  gateways:
+    - {{ .Values.sandbox.virtualService.gateway | quote }}
+  http:
+    - route:
+        - destination:
+            host: {{ include "[[.Name]].fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
 {{- end }}
 `
 

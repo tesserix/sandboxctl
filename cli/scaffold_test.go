@@ -21,7 +21,7 @@ func scaffoldTwoCharts(t *testing.T) (root string, dirs map[string]string, res *
 	gen := chartgen.Ops(&reposcan.Model{Apps: []reposcan.App{
 		{Name: "api", Path: "apps/api", Language: "go", Dockerfile: "apps/api/Dockerfile", Port: 8080, Kind: "http"},
 		{Name: "web", Path: "apps/web", Language: "ts", Dockerfile: "apps/web/Dockerfile", Port: 3000, Kind: "http"},
-	}}, "")
+	}}, chartgen.Config{})
 	plan, err := genwrite.BuildPlan(root, gen.Ops)
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestLintGateRollsBackFailingChartOnly(t *testing.T) {
 	o := out.String()
 	if !strings.Contains(o, "helm lint FAILED  k8s/charts/api") ||
 		!strings.Contains(o, "template: boom") ||
-		!strings.Contains(o, "rolled back 7 file(s) under k8s/charts/api") ||
+		!strings.Contains(o, "rolled back 8 file(s) under k8s/charts/api") ||
 		!strings.Contains(o, "helm lint ok  k8s/charts/web") {
 		t.Fatalf("gate output wrong:\n%s", o)
 	}

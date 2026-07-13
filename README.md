@@ -209,10 +209,14 @@ secrets:
 chart yet — `k8s/chart/` for single-app repos, `k8s/charts/<name>/` for
 monorepos. The values use the same `{ image: { repository, tag } }`
 shape the deploy-time pin resolver understands, image coordinates point
-at the in-cluster registry, chart-level Ingress ships disabled
-(sandboxctl routes via Istio), workers get no Service, and apps that
-reference secret-like variables are wired to their Secret via
-`envFrom`. A `values-sandbox.yaml` is emitted so `deploy` picks the
+at the in-cluster registry, chart-level Ingress ships disabled, and
+each http app's chart carries its **own Istio VirtualService** —
+enabled by `values-sandbox.yaml` with the right host + gateway, so
+GitOps owns the URL end to end and nothing needs hand-written routing
+(`deploy` detects the chart-managed route, skips its imperative one,
+and still handles `/etc/hosts` + the URL probe). Workers get no
+Service, and apps that reference secret-like variables are wired to
+their Secret via `envFrom`. A `values-sandbox.yaml` is emitted so `deploy` picks the
 chart up with zero flags, and `k8s/secrets.example.yaml` +
 `.gitignore` handling is automatic (see [Secrets](#secrets)).
 
