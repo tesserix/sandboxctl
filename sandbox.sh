@@ -413,6 +413,38 @@ with_spinner() {
 #      — a non-destructive adoption that never deletes data or PVCs — and
 #      retries. It loops a few times because Helm reports such conflicts
 #      one resource at a time. Any other failure is surfaced unchanged.
+# Wait until cert-manager's validating webhook actually answers. helm
+# --wait proves the webhook POD is Ready, not that the endpoint serves —
+# upgrades and container-runtime blips (seen in the wild: all three
+# cert-manager pods restarted with exit 255 mid-`up`) leave a window
+# where every Certificate write gets connection-refused. A server-side
+# dry-run Certificate exercises the exact call path consumers fail on.
+wait_for_cert_manager_webhook() {
+  local i
+  for ((i=1; i<=40; i++)); do
+    if kc apply --dry-run=server -f - >/dev/null 2>&1 <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: sandboxctl-webhook-probe
+  namespace: ${CERT_MANAGER_NS}
+spec:
+  secretName: sandboxctl-webhook-probe-tls
+  issuerRef:
+    name: sandboxctl-webhook-probe
+    kind: Issuer
+  dnsNames: ["probe.invalid"]
+EOF
+    then
+      ok "cert-manager webhook answering"
+      return 0
+    fi
+    sleep 3
+  done
+  warn "cert-manager webhook still not answering after ~120s"
+  return 1
+}
+
 helm_install() {
   local label="$1"; shift
   local -a cmd=("$@")
@@ -456,6 +488,14 @@ helm_install() {
        && grep -q "cannot be imported into the current release" "$logfile" \
        && helm_adopt_conflict "$release" "$ns" "$logfile"; then
       continue
+    fi
+    # Transient cert-manager webhook outage (upgrade rollout or a
+    # container-runtime blip): wait for the webhook to answer, retry.
+    if grep -qE 'failed calling webhook.*cert-manager|webhook\.cert-manager\.io' "$logfile"; then
+      warn "cert-manager's webhook was unavailable during '${label}' — waiting for it, then retrying"
+      if wait_for_cert_manager_webhook; then
+        continue
+      fi
     fi
     break
   done
@@ -1277,6 +1317,10 @@ install_cert_manager() {
       --set 'webhook.resources.requests.cpu=10m'   --set 'webhook.resources.requests.memory=32Mi' \
       --set 'cainjector.resources.requests.cpu=10m' --set 'cainjector.resources.requests.memory=64Mi' \
       --wait --timeout 5m
+  # Post-install/upgrade settle: the webhook Deployment being Ready is
+  # not the same as the webhook answering — prove the call path before
+  # anything downstream creates Certificates.
+  wait_for_cert_manager_webhook || true
   ok "cert-manager ready"
 }
 
