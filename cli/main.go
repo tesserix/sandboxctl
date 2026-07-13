@@ -8,7 +8,9 @@ import (
 )
 
 // assetDir is injected at build time via:
-//   go build -ldflags "-X main.assetDir=/abs/path/to/sandboxctl"
+//
+//	go build -ldflags "-X main.assetDir=/abs/path/to/sandboxctl"
+//
 // It points at the directory containing sandbox.sh + manifests/.
 //
 // Packaged installs (e.g. Homebrew) leave assetDir empty at build time and
@@ -70,6 +72,7 @@ func known(sub string) bool {
 	// Hidden subcommands consumed by sandbox.sh itself, not listed in usage.
 	switch sub {
 	case "secret",
+		"_analyze",
 		"_parse-build-manifest",
 		"_autogen-manifest",
 		"_chart-ingress-overrides",
@@ -115,6 +118,9 @@ func main() {
 	// something locally.
 	if sub == "secret" {
 		os.Exit(runSecret(os.Args[2:]))
+	}
+	if sub == "_analyze" {
+		os.Exit(runAnalyze(os.Args[2:]))
 	}
 	if sub == "_parse-build-manifest" {
 		os.Exit(runParseBuildManifest(os.Args[2:]))
