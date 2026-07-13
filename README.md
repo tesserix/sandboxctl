@@ -80,6 +80,7 @@ secrets template) from what it detects in your repo — see
 | `sandboxctl status` / `tui` | cluster + workload status, URLs |
 | `sandboxctl versions` | component doctor: pinned (chart→app) vs latest vs installed, with compatibility floors |
 | `sandboxctl creds` | Argo CD + Kargo URLs and admin credentials |
+| `sandboxctl kubeconfig` | path of the sandbox-owned kubeconfig; `--export` for `eval`, `--merge` to opt-in merge into `~/.kube/config` |
 | `sandboxctl undeploy` / `down` / `purge` | remove an app / the cluster / everything |
 
 Run any command with `--help` for its flags.
@@ -903,6 +904,22 @@ tail -f ~/.sandboxctl/portfwd.log         # port-forward output
 ```
 
 Common issues:
+
+- **`kubectl` can't see the sandbox.** By design: sandboxctl keeps its
+  cluster in its own kubeconfig and never touches `~/.kube/config` (on
+  work laptops that file belongs to other clusters, and hijacking
+  `current-context` broke people). Point your tools at it per shell:
+
+  ```sh
+  eval "$(sandboxctl kubeconfig --export)"
+  ```
+
+  or opt in to merging it into your default config (your
+  current-context is preserved, a backup is written):
+
+  ```sh
+  sandboxctl kubeconfig --merge
+  ```
 
 - **Browser cert warning.** Keychain trust didn't take. `sandboxctl trust-ca`
   re-applies it.

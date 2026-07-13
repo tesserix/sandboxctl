@@ -43,6 +43,7 @@ var commands = []command{
 	{"restart", "re-apply installers, keep cluster + state (--rebuild for full wipe)"},
 	{"validate", "curl each URL from the Mac and print HTTP codes"},
 	{"creds", "print login details (URLs + admin creds) for Argo CD + Kargo"},
+	{"kubeconfig", "print the sandbox kubeconfig path (--export for an eval-able line; --merge to opt-in merge into ~/.kube/config without changing your current-context)"},
 	{"argocd-ui", "print Argo CD URL + admin creds"},
 	{"kargo-ui", "print Kargo  URL + admin creds"},
 	{"scaffold", "analyze the repo (monorepo-aware) + generate Helm chart(s) with sandbox values — skips existing files, asks before overwriting edits (--dry-run/--yes/--force)"},
