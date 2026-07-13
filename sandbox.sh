@@ -26,15 +26,15 @@ LEGACY_INGRESS_NS="${LEGACY_INGRESS_NS:-ingress-nginx}"
 LEGACY_TRAEFIK_NS="${LEGACY_TRAEFIK_NS:-traefik}"
 LEGACY_GUESTBOOK_NS="${LEGACY_GUESTBOOK_NS:-guestbook}"
 
-ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-9.5.13}"
-KARGO_CHART_VERSION="${KARGO_CHART_VERSION:-1.1.1}"
+ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-10.1.3}"
+KARGO_CHART_VERSION="${KARGO_CHART_VERSION:-1.10.8}"
 REFLECTOR_NS="${REFLECTOR_NS:-reflector}"
-REFLECTOR_CHART_VERSION="${REFLECTOR_CHART_VERSION:-9.1.7}"
+REFLECTOR_CHART_VERSION="${REFLECTOR_CHART_VERSION:-10.0.58}"
 RELOADER_NS="${RELOADER_NS:-reloader}"
-RELOADER_CHART_VERSION="${RELOADER_CHART_VERSION:-2.2.11}"
+RELOADER_CHART_VERSION="${RELOADER_CHART_VERSION:-2.2.14}"
 CERT_MANAGER_NS="${CERT_MANAGER_NS:-cert-manager}"
-CERT_MANAGER_CHART_VERSION="${CERT_MANAGER_CHART_VERSION:-v1.16.2}"
-ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.29.2}"
+CERT_MANAGER_CHART_VERSION="${CERT_MANAGER_CHART_VERSION:-v1.21.0}"
+ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.30.2}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.35.0}"
 
 # Number of kind worker nodes to spin up alongside the control-plane.
@@ -56,7 +56,7 @@ SANDBOX_WORKER_COUNT_MAX=3
 # model provider here — no Ollama, no API-key providers, no model pulls.
 # Users configure providers/models out-of-band after the install.
 KAGENT_NS="${KAGENT_NS:-kagent}"
-KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.4}"
+KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.11}"
 
 # arctl — the agentregistry CLI (https://aregistry.ai). Installed onto the
 # *Mac* (not the cluster) by `up`/`bootstrap` when --with-arctl is passed,
@@ -122,7 +122,7 @@ INSTALL_CNPG="${INSTALL_CNPG:-0}"
 # git creds. Chart pinned for reproducibility; rootless image + sqlite
 # keeps the install footprint tiny (one Pod + a 1Gi PVC).
 GITEA_NS="${GITEA_NS:-gitea}"
-GITEA_CHART_VERSION="${GITEA_CHART_VERSION:-12.5.0}"
+GITEA_CHART_VERSION="${GITEA_CHART_VERSION:-12.6.0}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-sandbox}"
 # Org under which `sandboxctl deploy` pushes chart repos. Must NOT
 # collide with GITEA_ADMIN_USER — Gitea's API rejects org creation with
@@ -227,6 +227,21 @@ ok()   { printf '\033[1;32mOK:\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1 (install via brew)"; }
+
+# Resolve a *_CHART_VERSION variable set to the literal "latest" into a
+# concrete version via `sandboxctl _resolve-latest <component>` (same
+# opt-in channel ARCTL_VERSION=latest already provides). Pinned values
+# pass through untouched — reproducible installs stay the default.
+resolve_chart_version() {
+  local var="$1" component="$2" resolved
+  [[ "${!var}" == "latest" ]] || return 0
+  command -v sandboxctl >/dev/null 2>&1 \
+    || die "$var=latest needs the sandboxctl binary on PATH to resolve it"
+  resolved="$(sandboxctl _resolve-latest "$component" 2>/dev/null)" \
+    || die "could not resolve the latest $component chart version (offline? pin $var explicitly instead)"
+  log "$var=latest → ${resolved}"
+  printf -v "$var" '%s' "$resolved"
+}
 
 # Normalize a human memory string ("8g", "12gib", "8192", "8192m") into
 # integer MiB. Returns empty + non-zero on a malformed input so callers
@@ -1239,16 +1254,17 @@ EOF
 }
 
 install_argocd() {
+  resolve_chart_version ARGOCD_CHART_VERSION argo-cd
   log "installing Argo CD (ns: $ARGOCD_NS, chart $ARGOCD_CHART_VERSION)"
   helm repo add argo https://argoproj.github.io/argo-helm >/dev/null 2>&1 || true
   helm repo update argo >/dev/null
   # server.insecure=true makes argocd-server speak HTTP on :80 so the gateway
   # can terminate TLS without re-encrypting upstream.
   #
-  # Lean profile (single-user sandbox): drop the three default-on
-  # subcomponents nobody here uses — dex (SSO), applicationset, and
-  # notifications — removing three always-on pods. Pin every component to a
-  # single replica and give each a small request so the scheduler packs them
+  # Full-featured profile minus SSO: applicationset (needed by the
+  # scaffold-generated GitOps wiring) and notifications stay enabled;
+  # only dex is dropped — a single-user sandbox has no SSO to broker.
+  # Every component gets a small request so the scheduler packs them
   # tightly and the control plane keeps its memory.
   helm_install "Argo CD helm install (typically 2–5 min)" \
     helm upgrade --install argocd argo/argo-cd \
@@ -1256,15 +1272,15 @@ install_argocd() {
       --version "$ARGOCD_CHART_VERSION" \
       --set 'configs.params.server\.insecure=true' \
       --set 'dex.enabled=false' \
-      --set 'notifications.enabled=false' \
-      --set 'applicationset.enabled=false' \
+      --set 'applicationSet.resources.requests.cpu=25m'   --set 'applicationSet.resources.requests.memory=64Mi' \
+      --set 'notifications.resources.requests.cpu=10m'    --set 'notifications.resources.requests.memory=64Mi' \
       --set 'controller.replicas=1' \
       --set 'controller.resources.requests.cpu=50m'      --set 'controller.resources.requests.memory=256Mi' \
       --set 'repoServer.resources.requests.cpu=25m'      --set 'repoServer.resources.requests.memory=128Mi' \
       --set 'server.resources.requests.cpu=25m'          --set 'server.resources.requests.memory=128Mi' \
       --set 'redis.resources.requests.cpu=25m'           --set 'redis.resources.requests.memory=64Mi' \
       --wait --timeout 10m
-  ok "Argo CD ready (lean: no dex/applicationset/notifications)"
+  ok "Argo CD ready (applicationset + notifications on; dex off)"
 }
 
 install_reflector() {
@@ -1307,6 +1323,14 @@ install_reloader() {
 }
 
 install_kargo() {
+  resolve_chart_version KARGO_CHART_VERSION kargo
+  # Scaffold-generated Kargo manifests use the yaml-update promotion
+  # vocabulary, which needs Kargo >= 1.3 (helm-update-image was removed
+  # there). Warn early when an operator override pins something older.
+  if command -v sandboxctl >/dev/null 2>&1 \
+      && sandboxctl _semver-lt "$KARGO_CHART_VERSION" 1.3.0 2>/dev/null; then
+    warn "KARGO_CHART_VERSION=$KARGO_CHART_VERSION is below 1.3.0 — scaffold-generated promotion manifests will not work on it"
+  fi
   log "installing Kargo (ns: $KARGO_NS, chart $KARGO_CHART_VERSION)"
   helm_install "Kargo helm install (typically 2–4 min)" \
     helm upgrade --install kargo oci://ghcr.io/akuity/kargo-charts/kargo \
@@ -1314,6 +1338,7 @@ install_kargo() {
       --version "$KARGO_CHART_VERSION" \
       --set api.adminAccount.passwordHash="$KARGO_ADMIN_PASSWORD_HASH" \
       --set api.adminAccount.tokenSigningKey="$KARGO_TOKEN_SIGNING_KEY" \
+      --set controller.argocd.namespace="$ARGOCD_NS" \
       --set 'api.resources.requests.cpu=25m'        --set 'api.resources.requests.memory=128Mi' \
       --set 'controller.resources.requests.cpu=25m' --set 'controller.resources.requests.memory=128Mi' \
       --wait --timeout 10m

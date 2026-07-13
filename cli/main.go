@@ -51,6 +51,7 @@ var commands = []command{
 	{"deploy", "discover charts in the product repo (--repo <dir> | [path] | cwd) + push to Gitea + create Argo Apps (--redeploy: chart-only sync, reuse existing image, force Argo refresh)"},
 	{"undeploy", "remove the Argo Application + route created by 'deploy'"},
 	{"bootstrap", "'up' (if needed) + 'deploy' in one command (--repo <dir> | [path] | cwd)"},
+	{"versions", "component version doctor: pinned (chart→app) vs latest vs installed, with compatibility floors (--offline/--json; exits 1 on a floor violation)"},
 	{"prune", "diagnose + clean disk: host / mounted DMGs / runtime VM / cluster registry (prompts before each step; alias: cleanup)"},
 	{"tui", "live status dashboard (Bubble Tea)"},
 	{"version", "print sandboxctl version, commit, and build date"},
@@ -74,6 +75,9 @@ func known(sub string) bool {
 	switch sub {
 	case "secret",
 		"_analyze",
+		"_resolve-latest",
+		"_semver-lt",
+		"_render-args",
 		"_parse-build-manifest",
 		"_autogen-manifest",
 		"_chart-ingress-overrides",
@@ -125,6 +129,18 @@ func main() {
 	}
 	if sub == "scaffold" {
 		os.Exit(runScaffold(os.Args[2:]))
+	}
+	if sub == "versions" {
+		os.Exit(runVersions(os.Args[2:]))
+	}
+	if sub == "_resolve-latest" {
+		os.Exit(runResolveLatest(os.Args[2:]))
+	}
+	if sub == "_semver-lt" {
+		os.Exit(runSemverLt(os.Args[2:]))
+	}
+	if sub == "_render-args" {
+		os.Exit(runRenderArgs(os.Args[2:]))
 	}
 	if sub == "_parse-build-manifest" {
 		os.Exit(runParseBuildManifest(os.Args[2:]))

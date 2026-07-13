@@ -57,6 +57,26 @@ sandboxctl deploy                  # build + push images, deploy via Argo CD
 
 Open `https://<your-chart-name>.sandbox.app:8443` in your browser.
 
+No Helm chart yet? `sandboxctl scaffold` generates one (plus the
+secrets template) from what it detects in your repo — see
+[Scaffolding charts](#scaffolding-charts-from-your-repo).
+
+### Command overview
+
+| Command | What it does |
+|---|---|
+| `sandboxctl up` | create the kind cluster + install the platform (Argo CD, Kargo, Gitea, Istio, registry, PKI, …) |
+| `sandboxctl scaffold` | analyze the repo (monorepo-aware) and generate Helm chart(s), sandbox values, and the secrets template — skips what exists, asks before overwriting your edits |
+| `sandboxctl build` | build + push the repo's images to the in-cluster registry |
+| `sandboxctl deploy` | apply secrets, push chart(s) to Gitea, create Argo CD Applications, wire `https://<app>.sandbox.app` URLs |
+| `sandboxctl bootstrap` | `up` (if needed) + `deploy` in one shot |
+| `sandboxctl status` / `tui` | cluster + workload status, URLs |
+| `sandboxctl versions` | component doctor: pinned (chart→app) vs latest vs installed, with compatibility floors |
+| `sandboxctl creds` | Argo CD + Kargo URLs and admin credentials |
+| `sandboxctl undeploy` / `down` / `purge` | remove an app / the cluster / everything |
+
+Run any command with `--help` for its flags.
+
 ## What's running after `sandboxctl up`
 
 A plain `sandboxctl up` (no flags) is intentionally small — it only stands
@@ -135,6 +155,71 @@ The deprecated `--no-arctl` / `--no-cnpg` / `--no-agentregistry` /
 no-ops so older scripts keep working — they exist only because these
 components were once default-on. Drop them when you next touch the
 script.
+
+## Scaffolding charts from your repo
+
+`sandboxctl scaffold [dir]` turns a repo without Kubernetes manifests
+into one that deploys — it analyzes the code, generates the Helm
+chart(s) with sandbox-ready values, discovers the environment variables
+the apps need, and writes everything through a safe-write engine that
+never destroys your work.
+
+```
+$ sandboxctl scaffold
+~/code/shop — monorepo (pnpm), 3 app(s)
+  NAME    RUNTIME   PATH         PORT  KIND    DOCKERFILE  ENV(SEC)  CHART
+  api     go/gin    apps/api     8080  http    yes         2(2)      -
+  web     ts/next   apps/web     3000  http    yes         1(0)      -
+  worker  go        apps/worker  -     worker  yes         1(1)      -
+
+Plan for ~/code/shop (23 file(s))
+  create  k8s/charts/api/…            Helm chart for app api (go/gin, port 8080)
+  create  k8s/secrets.example.yaml    secret template — 2 app(s) reference secret-like variables
+  append  .gitignore                  keep k8s/secrets.yaml and .env out of git
+Proceed? [y/N]
+```
+
+**What it detects.** Repo layout (single-app vs monorepo via pnpm/npm
+workspaces, `go.work`, Cargo workspaces, docker compose, or plain
+Dockerfile placement), and per app: language, framework, Dockerfile,
+listen port (compose port → Dockerfile `EXPOSE` → framework default),
+and env references. Every conclusion carries a reason —
+`sandboxctl _analyze --json` shows the full model. Wrong guess? Pin it
+in `sandboxctl.yaml`:
+
+```yaml
+apps:
+  - path: apps/api
+    port: 9090          # beats detection
+secrets:
+  include: [MY_OPAQUE_VAR]
+  exclude: [NATS_URL]
+```
+
+**What it generates.** One chart per app that has a Dockerfile and no
+chart yet — `k8s/chart/` for single-app repos, `k8s/charts/<name>/` for
+monorepos. The values use the same `{ image: { repository, tag } }`
+shape the deploy-time pin resolver understands, image coordinates point
+at the in-cluster registry, chart-level Ingress ships disabled
+(sandboxctl routes via Istio), workers get no Service, and apps that
+reference secret-like variables are wired to their Secret via
+`envFrom`. A `values-sandbox.yaml` is emitted so `deploy` picks the
+chart up with zero flags, and `k8s/secrets.example.yaml` +
+`.gitignore` handling is automatic (see [Secrets](#secrets)).
+
+**What it will never do.** Files you authored are never touched — not
+even with `--force`. Files scaffold generated earlier regenerate only
+while you haven't edited them; edited ones prompt with a diff
+(`[s]kip / [o]verwrite / [d]iff / [a]ll-skip / [q]uit`, Enter keeps
+yours). Every chart written is `helm lint`-ed immediately; a failure
+rolls that chart's files back so a broken chart never lands. Flags:
+`--dry-run` (plan only), `--yes` (skip the confirm), `--force`
+(overwrite your edits — still never touches files scaffold didn't
+create). Exit codes: `0` clean, `1` lint-gate failure or abort, `3`
+conflicts were kept (useful in CI to detect drift).
+
+After scaffolding: `sandboxctl deploy` (or `bootstrap`) builds the
+images, pushes the charts to Gitea, and wires the URLs.
 
 ## Deploying your own app
 
@@ -435,10 +520,11 @@ sandboxctl down && sandboxctl up --workers 2
 `*-control-plane` line plus N `*-worker*` lines).
 
 **Lean by default.** Every component sandboxctl installs is tuned for a
-laptop: Argo CD ships without its `dex`/`applicationset`/`notifications`
-subcomponents (3 fewer pods), everything runs a single replica with small
-CPU/memory requests (no CPU limits — only memory limits, so nothing
-balloons or gets CPU-throttled), and the shared Postgres has capped memory.
+laptop: Argo CD runs full-featured minus SSO (`applicationset` and
+`notifications` stay on — the GitOps scaffolding uses them — only `dex`
+is dropped), everything runs a single replica with small CPU/memory
+requests (no CPU limits — only memory limits, so nothing balloons or
+gets CPU-throttled), and the shared Postgres has capped memory.
 The default `up` (agentgateway + platform) fits comfortably in the default
 **4 CPU / 6 GB** VM — agentgateway adds a control-plane pod and one
 data-plane proxy pod (~150 MB total). Turning on the heavier opt-ins —
@@ -654,13 +740,13 @@ Defaults work for most people. Override via env vars:
 | `SANDBOX_BUILD_MEMORY` | `auto` | cap podman build memory (e.g. `4g`, `1500m`). `auto` resolves to half the VM's RAM; `0` disables. Same as `--build-memory`. |
 | `SANDBOX_BUILD_RUNTIME` | (empty) | force `podman` or `docker` for the build leg. Default: docker if reachable, else podman. Same as `--build-runtime`. |
 | `ARGO_HEALTH_ATTEMPTS` | `3` | number of 180s windows `deploy` waits for an Argo Application to become Synced+Healthy (default covers up to 9 min for slow CRD-heavy syncs). |
-| `ARGOCD_CHART_VERSION` | `9.5.13` | argo-cd chart version |
-| `KARGO_CHART_VERSION` | `1.1.1` | kargo chart version |
-| `REFLECTOR_CHART_VERSION` | `9.1.7` | emberstack/reflector chart version |
-| `CERT_MANAGER_CHART_VERSION` | `v1.16.2` | cert-manager chart version |
-| `ISTIO_CHART_VERSION` | `1.29.2` | Istio chart version |
-| `KAGENT_CHART_VERSION` | `0.9.4` | kagent chart version |
-| `GITEA_CHART_VERSION` | `12.5.0` | Gitea chart version |
+| `ARGOCD_CHART_VERSION` | `10.1.3` | argo-cd chart version (ships Argo CD `v3.4.5`); `latest` resolves at install time |
+| `KARGO_CHART_VERSION` | `1.10.8` | kargo chart version (chart tracks the app version); `latest` resolves at install time; scaffold-generated manifests need ≥ `1.3.0` |
+| `REFLECTOR_CHART_VERSION` | `10.0.58` | emberstack/reflector chart version |
+| `CERT_MANAGER_CHART_VERSION` | `v1.21.0` | cert-manager chart version |
+| `ISTIO_CHART_VERSION` | `1.30.2` | Istio chart version |
+| `KAGENT_CHART_VERSION` | `0.9.11` | kagent chart version |
+| `GITEA_CHART_VERSION` | `12.6.0` | Gitea chart version (ships Gitea `1.26.1`) |
 | `ARCTL_VERSION` | `latest` | `arctl` release to install (`latest` or a tag like `v0.3.3`) |
 | `INSTALL_ARCTL` | `0` | install `arctl` during `up` (opt-in; `--with-arctl` or `INSTALL_ARCTL=1`) |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
@@ -682,6 +768,35 @@ Defaults work for most people. Override via env vars:
 | `MLFLOW_CHART_VERSION` | `latest` | pin the `community-charts/mlflow` chart version |
 | `TYK_CHART_VERSION` | `latest` | pin the `tyk-helm/tyk-oss` chart version |
 | `PORTKEY_IMAGE` | `portkeyai/gateway:latest` | Portkey gateway container image |
+
+## Managing component versions
+
+`sandboxctl versions` is the doctor view of everything `up` installs:
+
+```
+COMPONENT      PINNED (chart→app)     LATEST (chart→app)     INSTALLED    STATUS
+argo-cd        10.1.3 → v3.4.5        10.1.3 → v3.4.5        v3.4.5       ok
+kargo          1.10.8                 1.10.8                 v1.10.8      ok
+cert-manager   v1.21.0                v1.21.0                v1.21.0      ok
+…
+```
+
+- **PINNED** is the tool's tested default (or your env override, marked
+  `(env)`); the chart→app mapping is spelled out because they differ
+  (argo-cd chart `10.1.3` ships Argo CD `v3.4.5`).
+- **LATEST** is resolved from the chart repos (`--offline` skips it);
+  **INSTALLED** is read from the running cluster when reachable.
+- Compatibility floors are enforced: pinning Kargo below `1.3.0` (where
+  the promotion vocabulary the scaffolding generates first appeared)
+  exits non-zero and `up` warns. `--json` for scripts.
+
+Want bleeding edge? `ARGOCD_CHART_VERSION=latest` /
+`KARGO_CHART_VERSION=latest` resolve to the newest stable at install
+time (logged, never silent) — pinned defaults stay the default for
+reproducibility. A weekly `bump-components` workflow keeps the pins
+fresh: it resolves upstream, render-checks the new version with the
+exact `--set` profile `up` uses, runs the test suite, and opens one PR
+per component.
 
 ## Secrets
 
