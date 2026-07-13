@@ -85,7 +85,7 @@ var Registry = []Component{
 	},
 	{
 		Name: "istio", EnvVar: "ISTIO_CHART_VERSION", Default: "1.30.2", App: "1.30.2",
-		RepoURL: "https://istio-release.storage.googleapis.com/charts", Chart: "istiod",
+		RepoURL: "https://istio-release.storage.googleapis.com/charts", Chart: "istiod", Release: "istiod",
 		RenderArgs: []string{
 			"profile=ambient",
 			"pilot.resources.requests.cpu=50m", "pilot.resources.requests.memory=128Mi",
@@ -258,6 +258,11 @@ func ociLatest(ref string) (string, string, error) {
 // Installed maps release name → app version from `helm ls` against the
 // sandbox cluster. Best-effort: any failure returns an empty map (the
 // cluster may simply not be running).
+//
+// The kubeconfig is pinned the same way sandbox.sh's kc/helmk pin it —
+// an ambient KUBECONFIG pointing at some other cluster's config (a GKE
+// file, say) must not blind this lookup, because the kind context only
+// lives in the user-level config.
 func Installed() map[string]string {
 	helm, err := exec.LookPath("helm")
 	if err != nil {
@@ -267,7 +272,14 @@ func Installed() map[string]string {
 	if cluster == "" {
 		cluster = "sandboxctl"
 	}
-	out, err := exec.Command(helm, "ls", "-A", "-o", "yaml", "--kube-context", "kind-"+cluster).Output()
+	kubeconfig := os.Getenv("SANDBOX_USER_KUBECONFIG")
+	if kubeconfig == "" {
+		home, _ := os.UserHomeDir()
+		kubeconfig = home + "/.kube/config"
+	}
+	cmd := exec.Command(helm, "ls", "-A", "-o", "yaml", "--kube-context", "kind-"+cluster)
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfig)
+	out, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
