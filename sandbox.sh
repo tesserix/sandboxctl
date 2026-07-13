@@ -4229,9 +4229,12 @@ EOF
     read -r _
   fi
 
-  # Validate: refuse to apply if any obvious placeholder is left.
-  if grep -qE '<base64-encoded-[a-z-]+>' "$secrets" 2>/dev/null; then
-    die "k8s/secrets.yaml still contains <base64-encoded-...> placeholders — fill them in and re-run"
+  # Validate: refuse to apply if any obvious placeholder is left. Two
+  # generations of template exist: hand-written examples used
+  # <base64-encoded-*>; scaffold-generated ones use <required — …>
+  # (stringData, filled in plain text).
+  if grep -qE '<(base64-encoded-[a-z-]+|required[^>]*)>' "$secrets" 2>/dev/null; then
+    die "k8s/secrets.yaml still contains unfilled placeholders (grep for '<required' or '<base64-encoded') — fill them in and re-run"
   fi
 
   log "applying k8s/secrets.yaml into namespace ${namespace}"

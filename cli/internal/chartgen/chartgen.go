@@ -12,6 +12,7 @@ import (
 
 	"github.com/tesserix/sandboxctl/cli/internal/genwrite"
 	"github.com/tesserix/sandboxctl/cli/internal/reposcan"
+	"github.com/tesserix/sandboxctl/cli/internal/secretsgen"
 )
 
 // Generator is recorded in every file's ownership marker.
@@ -86,6 +87,12 @@ type chartContext struct {
 	Description string
 	ImageRepo   string
 	Port        int
+	// SecretName wires envFrom to the app's generated Secret; empty when
+	// the env scan found no secret-like variables.
+	SecretName string
+	// ConfigVars lists detected non-secret variables ("NAME (file:line)")
+	// as values.yaml comments so the user knows what to configure.
+	ConfigVars []string
 }
 
 func chartOps(dir string, app reposcan.App, registry string) ([]genwrite.Op, error) {
@@ -94,6 +101,13 @@ func chartOps(dir string, app reposcan.App, registry string) ([]genwrite.Op, err
 		Description: description(app),
 		ImageRepo:   registry + "/" + app.Name,
 		Port:        app.Port,
+	}
+	for _, ref := range app.Env {
+		if ref.Secret {
+			ctx.SecretName = secretsgen.SecretName(app.Name)
+		} else {
+			ctx.ConfigVars = append(ctx.ConfigVars, fmt.Sprintf("%s (%s)", ref.Name, ref.Location))
+		}
 	}
 
 	files := []struct {

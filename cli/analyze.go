@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/tesserix/sandboxctl/cli/internal/envscan"
 	"github.com/tesserix/sandboxctl/cli/internal/reposcan"
 )
 
@@ -39,6 +40,9 @@ func runAnalyze(args []string) int {
 	for _, w := range model.Warnings {
 		fmt.Fprintf(os.Stderr, "_analyze: warning: %s\n", w)
 	}
+	for _, w := range envscan.Attach(model) {
+		fmt.Fprintf(os.Stderr, "_analyze: warning: %s\n", w)
+	}
 
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
@@ -63,8 +67,8 @@ func printAnalyzeSummary(m *reposcan.Model) {
 	if len(m.Apps) == 0 {
 		return
 	}
-	fmt.Printf("  %-16s %-14s %-24s %-6s %-9s %-11s %s\n",
-		"NAME", "RUNTIME", "PATH", "PORT", "KIND", "DOCKERFILE", "CHART")
+	fmt.Printf("  %-16s %-14s %-24s %-6s %-9s %-11s %-9s %s\n",
+		"NAME", "RUNTIME", "PATH", "PORT", "KIND", "DOCKERFILE", "ENV(SEC)", "CHART")
 	for _, a := range m.Apps {
 		runtime := a.Language
 		if a.Framework != "" {
@@ -81,12 +85,22 @@ func printAnalyzeSummary(m *reposcan.Model) {
 		if a.Dockerfile != "" {
 			df = "yes"
 		}
+		env := "-"
+		if n := len(a.Env); n > 0 {
+			sec := 0
+			for _, r := range a.Env {
+				if r.Secret {
+					sec++
+				}
+			}
+			env = fmt.Sprintf("%d(%d)", n, sec)
+		}
 		chart := "-"
 		if a.Existing.Chart != "" {
 			chart = a.Existing.Chart
 		}
-		fmt.Printf("  %-16s %-14s %-24s %-6s %-9s %-11s %s\n",
-			a.Name, runtime, a.Path, port, a.Kind, df, chart)
+		fmt.Printf("  %-16s %-14s %-24s %-6s %-9s %-11s %-9s %s\n",
+			a.Name, runtime, a.Path, port, a.Kind, df, env, chart)
 	}
 	fmt.Println("\n  run with --json for the full model including per-fact reasons")
 }

@@ -11,8 +11,10 @@ import (
 	"strings"
 
 	"github.com/tesserix/sandboxctl/cli/internal/chartgen"
+	"github.com/tesserix/sandboxctl/cli/internal/envscan"
 	"github.com/tesserix/sandboxctl/cli/internal/genwrite"
 	"github.com/tesserix/sandboxctl/cli/internal/reposcan"
+	"github.com/tesserix/sandboxctl/cli/internal/secretsgen"
 )
 
 // runScaffold implements `sandboxctl scaffold [dir]` — analyze the repo,
@@ -50,6 +52,16 @@ Flags:
   --force     overwrite files you edited after generation (still never
               touches files scaffold didn't create)
 
+Environment variables referenced in the code are scanned too: secret-
+like ones produce k8s/secrets.example.yaml (stringData — fill values in
+plain text) wired to each chart via envFrom, .gitignore learns to
+ignore k8s/secrets.yaml and .env, and plain configuration is listed in
+the chart's values.yaml. Pin classifications in sandboxctl.yaml:
+
+  secrets:
+    include: [MY_OPAQUE_VAR]
+    exclude: [NATS_URL]
+
 Every chart written is 'helm lint'-ed immediately afterwards; a lint
 failure rolls that chart's files back so a broken chart never lands in
 your repo (exit 1, lint output shown).
@@ -75,6 +87,9 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 	for _, w := range model.Warnings {
 		fmt.Fprintf(os.Stderr, "scaffold: warning: %s\n", w)
 	}
+	for _, w := range envscan.Attach(model) {
+		fmt.Fprintf(os.Stderr, "scaffold: warning: %s\n", w)
+	}
 	printAnalyzeSummary(model)
 	if len(model.Apps) == 0 {
 		fmt.Println("\nnothing to scaffold — no apps detected")
@@ -82,18 +97,28 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 	}
 
 	gen := chartgen.Ops(model, registryHostPort())
-	if len(gen.Skips) > 0 {
+	ops := gen.Ops
+	secOps, secSkip := secretsgen.Ops(model.Root, model.Apps)
+	ops = append(ops, secOps...)
+
+	if len(gen.Skips) > 0 || secSkip != nil {
 		fmt.Println()
 		for _, s := range gen.Skips {
 			fmt.Printf("  skip  %-16s %s\n", s.App, s.Reason)
 		}
+		if secSkip != nil {
+			fmt.Printf("  skip  %-16s %s\n", "secrets", secSkip.Reason)
+		}
 	}
-	if len(gen.Ops) == 0 {
+	if len(ops) == 0 {
 		fmt.Println("\nnothing to scaffold — every app is already covered")
 		return 0
 	}
+	if len(secOps) > 0 {
+		warnTrackedSecrets(model.Root)
+	}
 
-	plan, err := genwrite.BuildPlan(model.Root, gen.Ops)
+	plan, err := genwrite.BuildPlan(model.Root, ops)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scaffold: %v\n", err)
 		return 1
@@ -211,6 +236,23 @@ func indent(s, prefix string) string {
 		lines[i] = prefix + l
 	}
 	return strings.Join(lines, "\n")
+}
+
+// warnTrackedSecrets checks whether files that must never be committed
+// are already tracked by git — sandboxctl never rewrites history, so
+// the most it can responsibly do is say it loudly.
+func warnTrackedSecrets(root string) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		return
+	}
+	out, err := exec.Command(git, "-C", root, "ls-files", "--", "k8s/secrets.yaml", ".env").Output()
+	if err != nil {
+		return // not a git repo, or git unhappy — nothing to warn about
+	}
+	for _, f := range strings.Fields(string(out)) {
+		fmt.Fprintf(os.Stderr, "scaffold: warning: %s is TRACKED by git — rotate any values it holds, then 'git rm --cached %s' (the .gitignore entry only affects untracked files)\n", f, f)
+	}
 }
 
 // registryHostPort mirrors sandbox.sh's SANDBOX_REGISTRY_PORT handling

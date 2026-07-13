@@ -42,6 +42,7 @@ type App struct {
 	Kind       string   `json:"kind"` // http | frontend | worker
 	Reasons    []string `json:"reasons,omitempty"`
 	Existing   Existing `json:"existing"`
+	Env        []EnvRef `json:"env,omitempty"` // populated by envscan.Attach
 }
 
 // Existing records artefacts the generators must treat as owned by the
@@ -49,6 +50,16 @@ type App struct {
 type Existing struct {
 	Chart  string `json:"chart,omitempty"`  // repo-relative chart dir
 	GitOps string `json:"gitops,omitempty"` // repo-relative manifest dir
+}
+
+// EnvRef is one environment variable an app references. The scan lives
+// in the envscan package; the type lives here so the RepoModel JSON is
+// self-contained for consumers.
+type EnvRef struct {
+	Name     string `json:"name"`
+	Location string `json:"location"` // file:line of the first reference
+	Source   string `json:"source"`   // go | js | python | dotenv | compose | dockerfile
+	Secret   bool   `json:"secret"`
 }
 
 // Scan analyzes the repository rooted at dir.
