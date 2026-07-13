@@ -36,9 +36,14 @@ jobs:
       - name: go vet
         working-directory: cli
         run: go vet ./...
+      - name: go test
+        working-directory: cli
+        run: go test ./...
       - name: go build
         working-directory: cli
-        run: go build -trimpath -ldflags "-s -w -X main.assetDir=/tmp -X main.version=ci" -o /tmp/sandboxctl ./...
+        # Build the root main package only — `-o <file> ./...` breaks as
+        # soon as the module contains more than one package (internal/…).
+        run: go build -trimpath -ldflags "-s -w -X main.assetDir=/tmp -X main.version=ci" -o /tmp/sandboxctl .
       - name: smoke (version)
         run: |
           /tmp/sandboxctl version | grep -q "sandboxctl ci"
