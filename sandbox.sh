@@ -3214,8 +3214,18 @@ cmd_down() {
 
   if cluster_registered; then
     log "deleting kind cluster '$CLUSTER_NAME'"
-    with_spinner "kind delete cluster (typically 30–60s)" \
-      kind_pinned delete cluster --name "$CLUSTER_NAME"
+    if ! with_spinner "kind delete cluster (typically 30–60s)" \
+        kind_pinned delete cluster --name "$CLUSTER_NAME"; then
+      # kind subcommands can break on runtime/CLI drift (the podman 6
+      # template change) while the containers are perfectly deletable.
+      # Tear the nodes down at the runtime level so `down` never
+      # strands a cluster.
+      warn "kind delete failed — removing the node containers directly"
+      local _containers
+      _containers="$(cluster_node_containers)"
+      [[ -n "$_containers" ]] && echo "$_containers" | xargs "$SANDBOX_RUNTIME" rm -f >/dev/null 2>&1 || true
+      "$SANDBOX_RUNTIME" network rm kind >/dev/null 2>&1 || true
+    fi
   else
     ok "no kind cluster named '$CLUSTER_NAME' to delete"
   fi
