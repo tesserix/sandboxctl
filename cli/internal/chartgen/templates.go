@@ -78,7 +78,7 @@ const valuesSandboxTmpl = `# Sandbox-flavoured values — picked up automaticall
 # Stage writes image.digest here on promotion.
 image:
   repository: [[.ImageRepo]]
-  tag: latest
+  tag: [[.ImageTag]]
   digest: ""
 [[if .Port]]
 sandbox:
@@ -283,8 +283,8 @@ const umbrellaValuesSandboxTmpl = `# Sandbox flavour for umbrella installs — u
 [[- range .Apps]]
 [[.Name]]:
   image:
-    repository: [[$.Registry]]/[[.Name]]
-    tag: latest
+    repository: [[.ImageRepo]]
+    tag: [[.ImageTag]]
     digest: ""
 [[- if .Port]]
   sandbox:

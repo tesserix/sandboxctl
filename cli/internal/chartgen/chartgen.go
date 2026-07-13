@@ -7,7 +7,9 @@ package chartgen
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/template"
@@ -22,16 +24,41 @@ const Generator = "scaffold"
 
 // Config carries the sandbox coordinates baked into generated charts.
 // Zero values resolve to the stock sandbox layout.
+// ImageRef is the registry-relative image coordinate `sandboxctl
+// build` pushes for an app. Resolved by the caller from the build
+// manifest (or the autogen derivation) so generated values reference
+// what actually lands in the registry — assuming image name == app
+// name is how deploys end in ImagePullBackOff.
+type ImageRef struct {
+	Name string // registry-relative repo, e.g. "agent-sim"
+	Tag  string // defaults to "latest"
+}
+
 type Config struct {
 	// Registry is the image push/pull coordinate as seen from both the
 	// Mac and the kind node (containerd mirror), e.g. "localhost:5050".
 	Registry string
+	// Images maps app name → the image build pushes for it. Apps
+	// absent here fall back to <app>:latest.
+	Images map[string]ImageRef
 	// Domain is the sandbox DNS suffix; the app's URL host becomes
 	// "<app>.<Domain>".
 	Domain string
 	// GatewayRef is the Istio gateway the VirtualService binds to,
 	// "<namespace>/<name>".
 	GatewayRef string
+}
+
+// imageFor resolves the image an app's values must reference.
+func (c *Config) imageFor(app string) ImageRef {
+	ref, ok := c.Images[app]
+	if !ok || ref.Name == "" {
+		ref = ImageRef{Name: app}
+	}
+	if ref.Tag == "" {
+		ref.Tag = "latest"
+	}
+	return ref
 }
 
 func (c *Config) defaults() {
@@ -80,6 +107,13 @@ func Ops(m *reposcan.Model, cfg Config) *Result {
 		case app.Existing.Chart != "":
 			res.Skips = append(res.Skips, Skip{App: app.Name,
 				Reason: "chart already exists at " + app.Existing.Chart})
+			// The chart stays the user's, but its sandbox image wiring
+			// must keep tracking what build pushes — refresh
+			// values-sandbox.yaml when we generated it earlier.
+			// genwrite keeps edited copies; only ours-clean files
+			// regenerate, and we never inject the file into a chart
+			// that doesn't have one.
+			res.Ops = append(res.Ops, refreshValuesOps(m.Root, app, cfg)...)
 			continue
 		case app.Dockerfile == "":
 			res.Skips = append(res.Skips, Skip{App: app.Name,
@@ -117,8 +151,10 @@ func Ops(m *reposcan.Model, cfg Config) *Result {
 // recommended single-app location would change what deploy runs.
 func addUmbrella(m *reposcan.Model, cfg Config, res *Result) {
 	type dep struct {
-		Name string
-		Port int
+		Name      string
+		Port      int
+		ImageRepo string
+		ImageTag  string
 	}
 	var apps []dep
 	for _, app := range m.Apps {
@@ -127,7 +163,12 @@ func addUmbrella(m *reposcan.Model, cfg Config, res *Result) {
 			dir = app.Existing.Chart
 		}
 		if strings.HasPrefix(dir, "k8s/charts/") {
-			apps = append(apps, dep{Name: app.Name, Port: app.Port})
+			img := cfg.imageFor(app.Name)
+			apps = append(apps, dep{
+				Name: app.Name, Port: app.Port,
+				ImageRepo: cfg.Registry + "/" + img.Name,
+				ImageTag:  img.Tag,
+			})
 		}
 	}
 	if len(apps) < 2 {
@@ -206,6 +247,7 @@ type chartContext struct {
 	Name        string
 	Description string
 	ImageRepo   string
+	ImageTag    string
 	Port        int
 	// Host + Gateway wire the chart's own VirtualService in
 	// values-sandbox.yaml, so GitOps owns the app's URL end to end and
@@ -220,11 +262,13 @@ type chartContext struct {
 	ConfigVars []string
 }
 
-func chartOps(dir string, app reposcan.App, cfg Config) ([]genwrite.Op, error) {
+func chartCtx(app reposcan.App, cfg Config) chartContext {
+	img := cfg.imageFor(app.Name)
 	ctx := chartContext{
 		Name:        app.Name,
 		Description: description(app),
-		ImageRepo:   cfg.Registry + "/" + app.Name,
+		ImageRepo:   cfg.Registry + "/" + img.Name,
+		ImageTag:    img.Tag,
 		Port:        app.Port,
 		Host:        app.Name + "." + cfg.Domain,
 		Gateway:     cfg.GatewayRef,
@@ -236,6 +280,30 @@ func chartOps(dir string, app reposcan.App, cfg Config) ([]genwrite.Op, error) {
 			ctx.ConfigVars = append(ctx.ConfigVars, fmt.Sprintf("%s (%s)", ref.Name, ref.Location))
 		}
 	}
+	return ctx
+}
+
+// refreshValuesOps re-emits values-sandbox.yaml for an app whose chart
+// already exists, so the image coordinates keep following the build
+// manifest. Only when the file is already there — a chart without one
+// is not ours to extend (deploy's values mimic handles those).
+func refreshValuesOps(root string, app reposcan.App, cfg Config) []genwrite.Op {
+	rel := path.Join(app.Existing.Chart, "values-sandbox.yaml")
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+		return nil
+	}
+	body, err := render("values-sandbox.yaml", valuesSandboxTmpl, chartCtx(app, cfg))
+	if err != nil {
+		return nil
+	}
+	return []genwrite.Op{{
+		Path: rel, Body: body, Generator: Generator, Refresh: true,
+		Reason: fmt.Sprintf("image wiring for %s (follows the build manifest)", app.Name),
+	}}
+}
+
+func chartOps(dir string, app reposcan.App, cfg Config) ([]genwrite.Op, error) {
+	ctx := chartCtx(app, cfg)
 
 	files := []struct {
 		rel  string

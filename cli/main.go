@@ -106,6 +106,7 @@ func known(sub string) bool {
 		"_onboard-check",
 		"_resolve-secrets",
 		"_deploy-entries",
+		"_verify-images",
 		"_resolve-latest",
 		"_semver-lt",
 		"_render-args",

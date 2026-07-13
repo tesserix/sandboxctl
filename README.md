@@ -209,7 +209,17 @@ secrets:
 **What it generates.** One chart per app that has a Dockerfile and no
 chart yet — `k8s/chart/` for single-app repos, `k8s/charts/<name>/` for
 monorepos. The values use the same `{ image: { repository, tag } }`
-shape the deploy-time pin resolver understands, image coordinates point
+shape the deploy-time pin resolver understands, and **image names are
+resolved from the build manifest** — scaffold reads `sandboxctl.yaml`'s
+`images:` list (or derives the same names `build` would) and maps each
+app to the image that will actually be pushed, by name, `<repo>-<app>`
+prefix, Dockerfile, or build context. A manifest that names images
+`myrepo-api` gets chart values, umbrella values, Kargo Warehouses, and
+promotion steps that all reference `myrepo-api` — no ImagePullBackOff
+from a name mismatch. Re-running scaffold refreshes this wiring in
+place on files you haven't edited (edited copies always win, no
+prompts), so renaming an image in the manifest plus one `scaffold` run
+re-wires everything. Image coordinates point
 at the in-cluster registry, chart-level Ingress ships disabled, and
 each http app's chart carries its **own Istio VirtualService** —
 enabled by `values-sandbox.yaml` with the right host + gateway, so
@@ -254,6 +264,10 @@ conflicts were kept (useful in CI to detect drift).
 After scaffolding: `sandboxctl deploy` (or `bootstrap`) builds the
 images, pushes the charts to Gitea, and wires the URLs — or
 `sandboxctl install` for the same stack via plain helm, no GitOps.
+Both verify, right after the build step, that every sandbox-registry
+image the charts reference actually exists in the registry — a
+mismatch prints the registry's real contents and a did-you-mean
+instead of leaving you to find ImagePullBackOff in the Argo UI.
 
 ### The promotion pipeline (Argo CD + Kargo)
 
