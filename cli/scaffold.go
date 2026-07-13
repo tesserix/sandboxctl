@@ -148,12 +148,27 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 		}
 	}
 
+	domain := envOr("SANDBOX_DOMAIN", "sandbox.app")
 	gen := chartgen.Ops(model, chartgen.Config{
 		Registry:   registryHostPort(),
-		Domain:     envOr("SANDBOX_DOMAIN", "sandbox.app"),
+		Domain:     domain,
 		GatewayRef: envOr("ISTIO_INGRESS_NS", "istio-ingress") + "/sandbox-gateway",
 		Images:     chartImages,
 	})
+
+	// URL plan — which apps get a VirtualService URL and which don't.
+	// A portless app silently getting no URL is exactly the kind of
+	// surprise that only surfaces post-deploy; name it here instead.
+	for _, app := range model.Apps {
+		if app.Existing.Chart == "" && gen.ChartDirs[app.Name] == "" {
+			continue // not charted (skipped) — its URL is not our story
+		}
+		if app.Port > 0 {
+			fmt.Printf("  url   %-16s https://%s.%s (chart-managed VirtualService)\n", app.Name, app.Name, domain)
+		} else {
+			fmt.Printf("  url   %-16s none — no port detected, so no VirtualService; if it serves HTTP, set  apps: [{path: %s, port: <n>}]  in sandboxctl.yaml and re-run scaffold\n", app.Name, app.Path)
+		}
+	}
 	ops := gen.Ops
 	secOps, secSkip := secretsgen.Ops(model.Root, model.Apps)
 	ops = append(ops, secOps...)

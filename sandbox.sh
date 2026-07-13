@@ -5119,8 +5119,7 @@ EOF
     if [[ "$kind" == "umbrella" ]]; then
       # The umbrella routes one host per subchart app — read them from
       # its values-sandbox (they only exist in the cluster post-sync).
-      _hosts="$(sed -nE 's/^[[:space:]]+host:[[:space:]]*"?([^" ]+).*/\1/p' \
-        "${_src}/chart/values-sandbox.yaml" 2>/dev/null)"
+      _hosts="$(_expected_hosts_from_values "${_src}/chart/values-sandbox.yaml")"
     else
       _hosts="$(deploy_hostname_for "$cname" "$env")"
     fi
@@ -5252,7 +5251,7 @@ EOF
       # The subcharts carry their own per-app VirtualServices (enabled
       # by the umbrella's values-sandbox) — wire a Mac-side hosts entry
       # + probe for each host they claim instead of inventing a route.
-      _route_umbrella_hosts "$cname" "$namespace"
+      _route_umbrella_hosts "$cname" "$namespace" "${src_dir}/chart/${values_file:-values-sandbox.yaml}"
     else
       _route_app_service "$cname" "$namespace" "$hostname" "$deploy_manifest"
     fi
@@ -5306,13 +5305,22 @@ _print_deploy_summary() {
     [[ -n "$cname" ]] || continue
     cname="$(slugify "$cname")"
     if [[ "$_kind" == "umbrella" ]]; then
-      local _ns _h
+      local _ns _h _live _exp
       _ns="$(deploy_namespace_for "$cname" "$env")"
+      _live="$(kc -n "$_ns" get virtualservices \
+        -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u)"
+      _exp="$(_expected_hosts_from_values "${_src}/chart/${_vals:-values-sandbox.yaml}")"
       while IFS= read -r _h; do
         [[ -n "$_h" ]] || continue
         printf '  open https://%s:%s\n' "$_h" "${SANDBOX_HTTPS_PORT}"
-      done < <(kc -n "$_ns" get virtualservices \
-        -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u)
+      done <<<"$_live"
+      while IFS= read -r _h; do
+        [[ -n "$_h" ]] || continue
+        grep -qxF "$_h" <<<"$_live" || printf '  # pending: https://%s:%s (VirtualService not created — see warnings above)\n' "$_h" "${SANDBOX_HTTPS_PORT}"
+      done <<<"$_exp"
+      if [[ -z "$_live" && -z "$_exp" ]]; then
+        printf '  # no app URLs configured — set ports in sandboxctl.yaml apps: and re-run scaffold\n'
+      fi
     else
       printf '  open https://%s:%s\n' "$(deploy_hostname_for "$cname" "$env")" "${SANDBOX_HTTPS_PORT}"
     fi
@@ -5499,7 +5507,7 @@ EOF
     || die "helm install failed — inspect with: KUBECONFIG=${SANDBOX_KUBECONFIG} helm status ${release} -n ${namespace}"
   ok "release ${release} installed into namespace ${namespace}"
 
-  _route_umbrella_hosts "$release" "$namespace"
+  _route_umbrella_hosts "$release" "$namespace" "${chart_dir}/${values_file:-values-sandbox.yaml}"
 
   echo
   echo "next:"
@@ -6225,21 +6233,63 @@ _probe_route() {
   : "$svc_addr"
 }
 
-# _route_umbrella_hosts <name> <namespace> — the umbrella's subcharts
-# create their own VirtualServices; give each claimed host a Mac-side
-# /etc/hosts entry and probe it, exactly like per-app deploys get.
+# _expected_hosts_from_values <values-file> — the hosts the chart
+# values promise to route (virtualService blocks, incl. the umbrella's
+# per-app nesting). This is what Argo will render, so it is the
+# authority for "which URLs should exist".
+_expected_hosts_from_values() {
+  local vf="$1"
+  [[ -f "$vf" ]] || return 0
+  sed -nE 's/^[[:space:]]+host:[[:space:]]*"?([^" ]+).*/\1/p' "$vf" | sort -u
+}
+
+# _route_umbrella_hosts <name> <namespace> <values-file> — wire a
+# Mac-side /etc/hosts entry + probe for every VirtualService host the
+# charts claim. Convergence-aware: reads the EXPECTED hosts from the
+# values file, polls live VirtualServices until they cover it (Argo can
+# lag the health wait), and explains every promised-but-missing URL by
+# name instead of silently showing none.
 _route_umbrella_hosts() {
-  local cname="$1" namespace="$2" tag="[${1}/${2}]"
-  local hosts host
-  hosts="$(kc -n "$namespace" get virtualservices \
-    -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u)"
-  if [[ -z "$hosts" ]]; then
-    warn "${tag} no VirtualServices found yet — the charts may still be coming up; re-run this command to wire hosts"
+  local cname="$1" namespace="$2" values_file="${3:-}" tag="[${1}/${2}]"
+  local expected live host attempt
+  expected="$(_expected_hosts_from_values "$values_file")"
+
+  _live_vs_hosts() {
+    kc -n "$namespace" get virtualservices \
+      -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u
+  }
+  _covers_expected() {
+    local e
+    while IFS= read -r e; do
+      [[ -n "$e" ]] || continue
+      grep -qxF "$e" <<<"$live" || return 1
+    done <<<"$expected"
+  }
+
+  live="$(_live_vs_hosts)"
+  if [[ -n "$expected" ]] && ! _covers_expected; then
+    # Argo applies VirtualServices during sync — give it a bounded
+    # window to catch up before judging anything missing.
+    log "${tag} waiting for the charts' VirtualServices to appear (up to 60s)"
+    for attempt in $(seq 1 "${SANDBOXCTL_VS_WAIT_ATTEMPTS:-12}"); do
+      sleep 5
+      live="$(_live_vs_hosts)"
+      _covers_expected && break
+    done
+    : "$attempt"
+  fi
+
+  if [[ -z "$live" && -z "$expected" ]]; then
+    warn "${tag} no URLs are configured: the chart values enable no VirtualService (apps without a detected port get none)"
+    warn "${tag} fix: declare the port in sandboxctl.yaml —  apps: [{path: <app dir>, port: <n>}]  — then 'sandboxctl scaffold' and redeploy"
     return 0
   fi
+
   while IFS= read -r host; do
     [[ -n "$host" ]] || continue
-    add_app_host "$host"
+    if [[ "${SANDBOXCTL_SKIP_HOSTS_WRITE:-}" != "1" ]]; then
+      add_app_host "$host"
+    fi
     if [[ "${SANDBOXCTL_SKIP_ROUTE_PROBE:-}" != "1" ]]; then
       local code; code="$(_probe_route "$host")"
       case "$code" in
@@ -6247,7 +6297,15 @@ _route_umbrella_hosts() {
         *)       warn "${tag} ${host} answered '${code:-unreachable}' — the app may still be starting" ;;
       esac
     fi
-  done <<<"$hosts"
+  done <<<"$live"
+
+  # Anything promised by the values but absent live gets named — a URL
+  # that never appears must never be a silent nothing.
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    grep -qxF "$host" <<<"$live" && continue
+    warn "${tag} expected URL https://${host}:${SANDBOX_HTTPS_PORT} was not created — its chart rendered no VirtualService (check 'virtualService.enabled' + the app's port in the values, then redeploy)"
+  done <<<"$expected"
 }
 
 # _heal_broken_umbrella_app <target> — remove the Application an older

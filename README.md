@@ -1020,7 +1020,28 @@ Common issues:
 - **`ERR_CONNECTION_REFUSED`.** LaunchAgent isn't bound to `:8443`.
   `sandboxctl status` will say so. `sandboxctl restart` reinstalls it.
 - **`ImagePullBackOff` after deploy.** Run `sandboxctl images` — if the
-  tag isn't there, run `sandboxctl build` from the product dir.
+  tag isn't there, run `sandboxctl build` from the product dir. If the
+  tag exists under a *different name*, your chart values and build
+  manifest disagree — deploy prints a did-you-mean for exactly this;
+  re-run `sandboxctl scaffold` to re-resolve image names from the
+  manifest.
+- **Deploy succeeded but the app URL never came up.** URLs are owned by
+  the charts' own VirtualServices (enabled in `values-sandbox.yaml`
+  with the host + gateway). deploy waits for them, writes `/etc/hosts`,
+  probes each, and names any URL the values promised that never
+  appeared. If it says *no URLs are configured*, the app had no
+  detected port at scaffold time, so no VirtualService was generated —
+  declare it and regenerate:
+
+  ```yaml
+  # sandboxctl.yaml
+  apps:
+    - path: services/ui     # the app's directory
+      port: 3000
+  ```
+
+  then `sandboxctl scaffold && sandboxctl deploy` (scaffold prints a
+  per-app `url` plan, so you can see who gets a URL before deploying).
 
 ## Uninstall
 
