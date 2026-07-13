@@ -8,7 +8,9 @@ package gitopsgen
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"text/template"
 
 	"github.com/tesserix/sandboxctl/cli/internal/genwrite"
@@ -20,10 +22,21 @@ const Generator = "scaffold"
 
 // Config carries the sandbox coordinates baked into the manifests.
 // Zero values resolve to the stock sandbox layout.
+// ImageRef is the registry-relative image coordinate build pushes for
+// an app — resolved by the caller from the build manifest so the
+// Warehouse watches what actually lands in the registry.
+type ImageRef struct {
+	Name string
+	Tag  string
+}
+
 type Config struct {
 	// RegistryHost is the registry as the cluster (and Kargo) sees it,
 	// e.g. "registry.sandboxctl-registry.svc.cluster.local:5000".
 	RegistryHost string
+	// Images maps app name → the image build pushes for it. Apps
+	// absent here fall back to <app>:latest.
+	Images map[string]ImageRef
 	// GiteaHost is the in-cluster Gitea HTTP endpoint,
 	// e.g. "gitea-http.gitea.svc.cluster.local:3000".
 	GiteaHost string
@@ -41,6 +54,18 @@ func (c *Config) defaults() {
 	if c.Org == "" {
 		c.Org = "apps"
 	}
+}
+
+// imageFor resolves the image an app's Warehouse must subscribe to.
+func (c *Config) imageFor(app string) ImageRef {
+	ref, ok := c.Images[app]
+	if !ok || ref.Name == "" {
+		ref = ImageRef{Name: app}
+	}
+	if ref.Tag == "" {
+		ref.Tag = "latest"
+	}
+	return ref
 }
 
 // ProjectName is the Kargo Project (and its namespace) for an app —
@@ -73,6 +98,14 @@ func Ops(m *reposcan.Model, cfg Config, chartDirs map[string]string) *Result {
 		case app.Existing.GitOps != "":
 			res.Skips = append(res.Skips, Skip{App: app.Name,
 				Reason: "GitOps manifests already exist at " + app.Existing.GitOps})
+			// The pipeline stays as-is, but files WE generated earlier
+			// must keep tracking the build manifest's image names — a
+			// Warehouse watching a repo nothing pushes to never
+			// discovers Freight. Refresh only files that already exist
+			// in OUR layout; genwrite keeps user-edited copies.
+			if app.Existing.GitOps == "k8s/gitops/"+app.Name {
+				res.Ops = append(res.Ops, refreshPipelineOps(m.Root, app.Name, cfg, chartDirs[app.Name])...)
+			}
 			continue
 		case app.Dockerfile == "":
 			res.Skips = append(res.Skips, Skip{App: app.Name,
@@ -84,10 +117,12 @@ func Ops(m *reposcan.Model, cfg Config, chartDirs map[string]string) *Result {
 			continue
 		}
 
+		img := cfg.imageFor(app.Name)
 		ctx := pipelineContext{
 			App:           app.Name,
 			Project:       ProjectName(app.Name),
-			ImageRepo:     cfg.RegistryHost + "/" + app.Name,
+			ImageRepo:     cfg.RegistryHost + "/" + img.Name,
+			ImageTag:      img.Tag,
 			GitRepo:       "http://" + cfg.GiteaHost + "/" + cfg.Org + "/" + app.Name + "-chart.git",
 			DevValuesFile: "values-sandbox.yaml",
 		}
@@ -122,10 +157,51 @@ func Ops(m *reposcan.Model, cfg Config, chartDirs map[string]string) *Result {
 	return res
 }
 
+// refreshPipelineOps re-emits the image-carrying pipeline files for an
+// app whose pipeline already exists, restricted to files present on
+// disk — never completing a layout the user may have pruned on
+// purpose.
+func refreshPipelineOps(root, app string, cfg Config, chartDir string) []genwrite.Op {
+	img := cfg.imageFor(app)
+	ctx := pipelineContext{
+		App:           app,
+		Project:       ProjectName(app),
+		ImageRepo:     cfg.RegistryHost + "/" + img.Name,
+		ImageTag:      img.Tag,
+		GitRepo:       "http://" + cfg.GiteaHost + "/" + cfg.Org + "/" + app + "-chart.git",
+		DevValuesFile: "values-sandbox.yaml",
+	}
+	dir := "k8s/gitops/" + app
+	candidates := []struct{ path, tmpl string }{
+		{path.Join(dir, "warehouse.yaml"), warehouseTmpl},
+		{path.Join(dir, "stages.yaml"), stagesTmpl},
+	}
+	if chartDir != "" {
+		candidates = append(candidates,
+			struct{ path, tmpl string }{path.Join(chartDir, "values-staging.yaml"), valuesStagingTmpl})
+	}
+	var ops []genwrite.Op
+	for _, f := range candidates {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(f.path))); err != nil {
+			continue
+		}
+		body, err := render(f.path, f.tmpl, ctx)
+		if err != nil {
+			continue
+		}
+		ops = append(ops, genwrite.Op{
+			Path: f.path, Body: body, Generator: Generator, Refresh: true,
+			Reason: fmt.Sprintf("image wiring for %s (follows the build manifest)", app),
+		})
+	}
+	return ops
+}
+
 type pipelineContext struct {
 	App           string
 	Project       string
 	ImageRepo     string
+	ImageTag      string
 	GitRepo       string
 	DevValuesFile string
 }

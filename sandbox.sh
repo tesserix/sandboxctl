@@ -5169,6 +5169,10 @@ EOF
     fi
   fi
 
+  # Catch chart-values ↔ registry name mismatches now, not at
+  # ImagePullBackOff time.
+  _verify_registry_images "$entries"
+
   # Resolve the build manifest once (same precedence as cmd_build) so the
   # per-chart loop can pin each chart's image to the registry coordinates
   # cmd_build just pushed. chart_count gates the "sole image" fallback in
@@ -5468,6 +5472,11 @@ EOF
 
   ensure_secrets_for_namespace "$target" "$namespace"
 
+  # Same mismatch guard deploy has: verify the values-referenced images
+  # actually exist in the registry before waiting 5 minutes on pods
+  # that can never pull.
+  _verify_registry_images "$(printf 'helm\t%s\t%s\t%s\n' "$release" "$chart_dir" "${values_file:-values.yaml}")"
+
   # A first install that never reached deployed blocks every future
   # `upgrade --install` with "has no deployed releases" — detect the
   # stuck shape and clear it so re-running install always works.
@@ -5541,6 +5550,74 @@ _install_build_chart_deps() {
   _dep_build && return 0
   sed 's/^/  /' "$err" >&2
   die "helm dependency build failed for ${chart_dir} (output above)"
+}
+
+# _verify_registry_images <entries> — after the build step, check that
+# every sandbox-registry image the charts reference actually exists in
+# the registry. A name mismatch between the build manifest and the
+# chart values is invisible until the pod reports ImagePullBackOff;
+# this surfaces it at deploy time with the registry's actual contents
+# and a did-you-mean. Warn-only: external images and intentionally
+# pre-pushed tags must never block a deploy.
+_verify_registry_images() {
+  local entries="$1"
+  local reg="localhost:${SANDBOX_REGISTRY_PORT}"
+  curl -fsS --max-time 3 "http://${reg}/v2/" >/dev/null 2>&1 || return 0
+
+  local kind cname src_dir values_file vf repo tag missing=""
+  while IFS=$'\t' read -r kind cname src_dir values_file; do
+    [[ -n "$cname" ]] || continue
+    case "$kind" in
+      helm)     vf="${src_dir}/${values_file:-values.yaml}" ;;
+      umbrella) vf="${src_dir}/chart/${values_file:-values-sandbox.yaml}" ;;
+      *)        continue ;;
+    esac
+    [[ -f "$vf" ]] || continue
+    while IFS=$'\t' read -r repo tag; do
+      [[ -n "$repo" ]] || continue
+      if ! curl -fsI --max-time 5 \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+            "http://${reg}/v2/${repo}/manifests/${tag}" >/dev/null 2>&1; then
+        missing="${missing}${repo}:${tag}\t${cname}\n"
+      fi
+    done < <(awk -v pfx="${reg}/" '
+      function flush() { if (r != "") { print r "\t" (t == "" ? "latest" : t); r = ""; t = "" } }
+      $1 == "repository:" {
+        flush()
+        v = $2; gsub(/["'"'"']/, "", v)
+        if (index(v, pfx) == 1) r = substr(v, length(pfx) + 1)
+        next
+      }
+      r != "" && $1 == "tag:" { t = $2; gsub(/["'"'"']/, "", t); flush(); next }
+      END { flush() }
+    ' "$vf")
+  done <<<"$entries"
+
+  [[ -n "$missing" ]] || return 0
+
+  local catalog
+  catalog="$(curl -fsS --max-time 5 "http://${reg}/v2/_catalog?n=200" 2>/dev/null \
+    | sed -E 's/.*\[//; s/\].*//' | tr -d '" ' | tr ',' '\n' | grep -v '^$' || true)"
+
+  warn "these chart-referenced images are NOT in the sandbox registry — their pods will ImagePullBackOff:"
+  local line ref app name hint centry
+  while IFS=$'\t' read -r ref app; do
+    [[ -n "$ref" ]] || continue
+    name="${ref%%:*}"
+    hint=""
+    while IFS= read -r centry; do
+      [[ -n "$centry" ]] || continue
+      if [[ "$centry" == *"-${name}" || "$centry" == "${name}-"* || "$centry" == *"${name}"* ]]; then
+        hint="   ← did you mean '${centry}'?"
+        break
+      fi
+    done <<<"$catalog"
+    printf '  %s/%s   (chart: %s)%s\n' "$reg" "$ref" "$app" "$hint" >&2
+  done < <(printf '%b' "$missing")
+  if [[ -n "$catalog" ]]; then
+    warn "registry currently has: $(echo "$catalog" | tr '\n' ' ')"
+  fi
+  warn "fix: name the image to match in sandboxctl.yaml's images: list (then 'sandboxctl build'), or re-run 'sandboxctl scaffold' — it resolves chart image names from the build manifest — or edit the chart's values image.repository"
 }
 
 # Echo "<repository>\t<tag>" for the registry image that backs chart
@@ -6865,6 +6942,7 @@ main() {
     up)                 shift; cmd_up "$@" ;;
     _onboard-check)     shift; _up_onboarding_check "${1:-$PWD}" ;;
     _deploy-entries)    shift; _resolve_repo_entries "${1:-$PWD}" ;;
+    _verify-images)     shift; _verify_registry_images "$(_resolve_repo_entries "${1:-$PWD}")" ;;
     kubeconfig)         shift; cmd_kubeconfig "$@" ;;
     doctor)             cmd_doctor ;;
     _ensure-tools)      ensure_tools ;;

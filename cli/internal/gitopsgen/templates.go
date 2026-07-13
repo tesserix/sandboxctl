@@ -31,7 +31,7 @@ spec:
     - image:
         repoURL: [[.ImageRepo]]
         imageSelectionStrategy: Digest
-        constraint: latest
+        constraint: [[.ImageTag]]
         insecureSkipTLSVerify: true
         discoveryLimit: 5
 `
@@ -196,6 +196,6 @@ const valuesStagingTmpl = `# Staging values — the staging Stage's promotions w
 # here; everything else inherits the chart's values.yaml defaults.
 image:
   repository: [[.ImageRepo]]
-  tag: latest
+  tag: [[.ImageTag]]
   digest: ""
 `

@@ -125,10 +125,34 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 		return 0
 	}
 
+	// Resolve each app's image coordinates from the same truth
+	// 'sandboxctl build' pushes from (the manifest, or the autogen
+	// derivation) — generated values and Warehouses must reference what
+	// actually lands in the registry, or pods die in ImagePullBackOff.
+	images := resolveAppImages(model.Root, model.Apps)
+	chartImages := map[string]chartgen.ImageRef{}
+	gitopsImages := map[string]gitopsgen.ImageRef{}
+	for app, ref := range images {
+		chartImages[app] = chartgen.ImageRef{Name: ref.Name, Tag: ref.Tag}
+		gitopsImages[app] = gitopsgen.ImageRef{Name: ref.Name, Tag: ref.Tag}
+		if ref.Name != app || ref.Tag != "latest" {
+			fmt.Printf("  image %-16s → %s:%s (resolved from the build manifest)\n", app, ref.Name, ref.Tag)
+		}
+	}
+	if hasBuildManifest(model.Root) {
+		for _, app := range model.Apps {
+			if _, ok := images[app.Name]; !ok {
+				fmt.Fprintf(os.Stderr, "scaffold: warning: no image in the build manifest maps to app %q — its chart will reference %s:latest, which build won't push; add an images: entry named %q (or with context %q)\n",
+					app.Name, app.Name, app.Name, app.Path)
+			}
+		}
+	}
+
 	gen := chartgen.Ops(model, chartgen.Config{
 		Registry:   registryHostPort(),
 		Domain:     envOr("SANDBOX_DOMAIN", "sandbox.app"),
 		GatewayRef: envOr("ISTIO_INGRESS_NS", "istio-ingress") + "/sandbox-gateway",
+		Images:     chartImages,
 	})
 	ops := gen.Ops
 	secOps, secSkip := secretsgen.Ops(model.Root, model.Apps)
@@ -154,7 +178,9 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 				chartDirs[app.Name] = app.Existing.Chart
 			}
 		}
-		gitops = gitopsgen.Ops(model, gitopsConfig(), chartDirs)
+		gcfg := gitopsConfig()
+		gcfg.Images = gitopsImages
+		gitops = gitopsgen.Ops(model, gcfg, chartDirs)
 		ops = append(ops, gitops.Ops...)
 	}
 
