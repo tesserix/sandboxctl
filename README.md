@@ -75,7 +75,7 @@ secrets template) from what it detects in your repo — see
 | `sandboxctl up` | create the kind cluster + install the platform (Argo CD, Kargo, Gitea, Istio, registry, PKI, …) |
 | `sandboxctl scaffold` | analyze the repo (monorepo-aware) and generate Helm chart(s), sandbox values, and the secrets template — skips what exists, asks before overwriting your edits |
 | `sandboxctl build` | build + push the repo's images to the in-cluster registry |
-| `sandboxctl deploy` | apply secrets, push chart(s) to Gitea, create Argo CD Applications, wire `https://<app>.sandbox.app` URLs |
+| `sandboxctl deploy` | apply secrets, push chart(s) to Gitea, create Argo CD Applications, wire `https://<app>.sandbox.app` URLs (`--umbrella`: whole monorepo stack as one app) |
 | `sandboxctl bootstrap` | `up` (if needed) + `deploy` in one shot |
 | `sandboxctl status` / `tui` | cluster + workload status, URLs |
 | `sandboxctl versions` | component doctor: pinned (chart→app) vs latest vs installed, with compatibility floors |
@@ -218,12 +218,21 @@ and still handles `/etc/hosts` + the URL probe). Workers get no
 Service, and apps that reference secret-like variables are wired to
 their Secret via `envFrom`. Monorepos also get an **umbrella chart** at `k8s/chart`
 connecting every app chart as a `file://` dependency with per-app
-`enabled` toggles — `helm dependency build --skip-refresh k8s/chart &&
-helm install stack k8s/chart` brings the whole repo up anywhere, while
-sandboxctl's own deploy recognizes it by annotation and keeps deploying
-per-app (pipelines and URLs stay per-app). A `values-sandbox.yaml` is
-emitted so `deploy` picks the chart up with zero flags, and `k8s/secrets.example.yaml` +
-`.gitignore` handling is automatic (see [Secrets](#secrets)).
+`enabled` toggles. It deploys two ways: `sandboxctl deploy --umbrella`
+runs the whole stack as **one Argo CD Application** (the entire `k8s/`
+tree is pushed to Gitea so the `file://../charts/<app>` dependencies
+resolve inside Argo's checkout, the Application points at its `chart/`
+subdirectory, every app lands in one namespace, and each still gets its
+own `https://<app>.…` URL via the chart-carried VirtualServices); or
+standalone anywhere with `helm dependency build --skip-refresh
+k8s/chart && helm install stack k8s/chart`. The default `deploy` (no
+flag) recognizes the umbrella by annotation, skips it, and keeps
+deploying per-app — pipelines and URLs stay per-app. A
+`values-sandbox.yaml` is emitted so `deploy` picks the chart up with
+zero flags, and `k8s/secrets.example.yaml` + `.gitignore` handling is
+automatic (see [Secrets](#secrets)). Tree pushes never include
+`k8s/secrets.yaml` (your filled, gitignored secrets stay on your
+machine) nor local `Chart.lock`/`charts/` build leftovers.
 
 **What it will never do.** Files you authored are never touched — not
 even with `--force`. Files scaffold generated earlier regenerate only

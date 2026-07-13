@@ -52,7 +52,7 @@ var commandGroups = []commandGroup{
 	{"your app", []command{
 		{"scaffold", "repo → charts + secrets template + Kargo pipeline"},
 		{"build", "build + push the repo's images to the sandbox registry"},
-		{"deploy", "push charts to Gitea, create Argo apps, wire https URLs"},
+		{"deploy", "push charts to Gitea, create Argo apps, wire https URLs (--umbrella: whole stack as one app)"},
 		{"bootstrap", "up (if needed) + deploy, in one command"},
 		{"undeploy", "remove an app's Argo apps, pipeline, and route (--name)"},
 	}},
@@ -104,6 +104,7 @@ func known(sub string) bool {
 		"_onboard-status",
 		"_onboard-check",
 		"_resolve-secrets",
+		"_deploy-entries",
 		"_resolve-latest",
 		"_semver-lt",
 		"_render-args",

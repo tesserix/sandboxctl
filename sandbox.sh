@@ -1809,6 +1809,16 @@ _gitea_git_push() {
   (
     set -e
     cp -R "${src_dir}/." "$tmp/"
+    # Never let the filled, gitignored secrets ride along in a tree
+    # push (the umbrella pushes all of k8s/, which contains it).
+    rm -f "$tmp/secrets.yaml"
+    # Local `helm dependency build` leftovers must not ship either:
+    # a stale Chart.lock hard-fails Argo's dependency build the moment
+    # an app is added ("lock file is out of sync"), and vendored
+    # charts/*.tgz can shadow the live file:// subcharts. Without a
+    # lock, Argo's build behaves like `helm dependency update` and
+    # re-vendors straight from charts/<app> in the same checkout.
+    rm -rf "$tmp/chart/charts" "$tmp/chart/Chart.lock"
     cd "$tmp"
     git init -q -b main
     git config user.email "sandbox@local"
@@ -4715,6 +4725,35 @@ ensure_gitignore_entry() {
   fi
 }
 
+# _repo_has_umbrella <target> — true when k8s/chart is the scaffold-
+# generated umbrella (annotation), i.e. an install-the-stack artifact
+# rather than a single app's chart.
+_repo_has_umbrella() {
+  [[ -f "${1}/k8s/chart/Chart.yaml" ]] \
+    && grep -q 'sandboxctl.io/umbrella' "${1}/k8s/chart/Chart.yaml" 2>/dev/null
+}
+
+# _resolve_repo_entries <target> — the ONE umbrella-aware resolution of
+# "what does deploy run for this repo": the k8s/chart convention when it
+# is a real single-app chart, otherwise the per-app charts (with the
+# umbrella excluded so it can never be pushed alone — its file://
+# dependencies only resolve next to their siblings). Used by the main
+# deploy path and the post-scaffold re-discovery; testable standalone
+# via `sandboxctl _deploy-entries <dir>`.
+_resolve_repo_entries() {
+  local target="$1"
+  if [[ -f "${target}/k8s/chart/Chart.yaml" ]] && ! _repo_has_umbrella "$target"; then
+    log "found chart at ${target}/k8s/chart (the recommended layout)" >&2
+    _emit_explicit_chart_entry "$target" "k8s/chart" "" ""
+    return
+  fi
+  if _repo_has_umbrella "$target"; then
+    log "k8s/chart is the umbrella chart — deploying the per-app charts it connects ('deploy --umbrella' deploys the whole stack as one app)" >&2
+  fi
+  discover_app_charts "$target" 2>/dev/null \
+    | awk -F'\t' -v skip="${target}/k8s/chart" 'NF>=2 && $1=="helm" && $3!=skip'
+}
+
 # Compute the namespace + hostname for an app/env pair.
 deploy_namespace_for() {
   local app="$1" env="$2"
@@ -4863,7 +4902,8 @@ remove_app_host() {
 cmd_deploy() {
   # Usage: sandboxctl deploy [path] [--repo <dir>] [--env <name>] [--chart <dir>]
   #                          [--values <file>] [--name <name>] [--no-build] [--redeploy]
-  local positional="" repo_flag="" env="dev" do_build=1
+  #                          [--umbrella]
+  local positional="" repo_flag="" env="dev" do_build=1 umbrella_mode=0
   local chart_override="" values_override="" name_override=""
   local purge_old_tags="${SANDBOX_BUILD_PURGE_OLD_TAGS:-0}"
   local redeploy=0
@@ -4879,6 +4919,7 @@ cmd_deploy() {
       --name)     name_override="$2"; shift 2 ;;
       --no-build) do_build=0; shift ;;
       --redeploy) redeploy=1; do_build=0; shift ;;
+      --umbrella) umbrella_mode=1; shift ;;
       --purge-old-tags)    purge_old_tags=1; shift ;;
       --no-purge-old-tags) purge_old_tags=0; shift ;;
       --build-cpus)    opt_build_cpus="${2:-}"; shift 2 ;;
@@ -4890,7 +4931,7 @@ cmd_deploy() {
         cat <<EOF
 sandboxctl deploy [path] [--repo <dir>] [--env <name>]
                   [--chart <dir>] [--values <file>] [--name <name>]
-                  [--no-build] [--redeploy] [--purge-old-tags]
+                  [--no-build] [--redeploy] [--umbrella] [--purge-old-tags]
 
 Builds + pushes images, applies secrets, pushes the chart to the
 in-cluster Gitea, creates one Argo CD Application per chart, and
@@ -4943,6 +4984,16 @@ Mode flags:
                     built image is reused, the helm overrides are
                     re-pushed to Gitea, Argo syncs, and the workloads
                     are restarted.
+  --umbrella        Deploy the whole monorepo stack as ONE Argo CD
+                    Application via the scaffold-generated umbrella
+                    chart (k8s/chart). The entire k8s/ tree is pushed
+                    to Gitea so the umbrella's file://../charts/<app>
+                    dependencies resolve inside Argo's checkout, and
+                    the Application points at its chart/ subdirectory.
+                    All apps land in one namespace; each still gets its
+                    own https://<app>.${SANDBOX_DOMAIN} URL via the
+                    chart-carried VirtualServices. Default (no flag)
+                    deploys per-app charts with per-app Kargo pipelines.
 
 Defaults:
   --env  dev   (namespace = <chart>; URL = <chart>.${SANDBOX_DOMAIN})
@@ -4965,7 +5016,28 @@ EOF
   target="$(_resolve_product_repo "$repo_flag" "$positional" deploy)" || return 1
 
   local entries
-  if [[ -n "$chart_override" ]]; then
+  if (( umbrella_mode )); then
+    _repo_has_umbrella "$target" \
+      || die "--umbrella needs the scaffold-generated umbrella at ${target}/k8s/chart — run 'sandboxctl scaffold' first"
+    local umbrella_name
+    umbrella_name="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "${target}/k8s/chart/Chart.yaml" | head -n1)"
+    [[ -n "$umbrella_name" ]] || die "umbrella Chart.yaml has no readable name"
+    # kind=umbrella: the WHOLE k8s/ tree is pushed so the umbrella's
+    # file://../charts/<app> dependencies resolve inside Argo's checkout
+    # — pushing the chart dir alone is exactly the bug this mode fixes.
+    entries="$(printf 'umbrella\t%s\t%s\tvalues-sandbox.yaml\n' "$umbrella_name" "${target}/k8s")"
+    # Per-app Applications claim the same <app>.domain hostnames the
+    # umbrella's subcharts do — running both splits routing between two
+    # namespaces. Deploying anyway is a legitimate choice; warn loudly.
+    local _dep _overlap=""
+    while IFS= read -r _dep; do
+      [[ -n "$_dep" ]] || continue
+      kc -n "$ARGOCD_NS" get application "$_dep" >/dev/null 2>&1 \
+        && _overlap="${_overlap:+${_overlap}, }${_dep}"
+    done < <(sed -nE 's/^[[:space:]]+- name:[[:space:]]*"?([^" ]+).*/\1/p' "${target}/k8s/chart/Chart.yaml")
+    [[ -z "$_overlap" ]] \
+      || warn "per-app Application(s) also deployed: ${_overlap} — they claim the same hostnames as the umbrella's subcharts; 'sandboxctl undeploy --name <app>' them to avoid split routing"
+  elif [[ -n "$chart_override" ]]; then
     entries="$(_emit_explicit_chart_entry "$target" "$chart_override" "$values_override" "$name_override")" || return 1
   else
     [[ -z "$values_override" && -z "$name_override" ]] \
@@ -4983,21 +5055,9 @@ EOF
     # deploy/ holding misc infra (operator CRDs, ad-hoc YAML), and Argo
     # would happily try to apply all of it as the app's manifests.
     if [[ -f "${target}/k8s/chart/Chart.yaml" ]]; then
-      if grep -q 'sandboxctl.io/umbrella' "${target}/k8s/chart/Chart.yaml" 2>/dev/null; then
-        # The umbrella is the standalone 'helm install everything'
-        # artifact — the sandbox keeps per-app charts, pipelines, and
-        # URLs, so deploy skips it and uses the app charts it connects.
-        log "k8s/chart is the umbrella chart — deploying the per-app charts it connects"
-        local umbrella_discovered=""
-        umbrella_discovered="$(discover_app_charts "$target" 2>/dev/null || true)"
-        entries="$(printf '%s\n' "$umbrella_discovered" \
-          | awk -F'\t' -v skip="${target}/k8s/chart" 'NF>=2 && $1=="helm" && $3!=skip')"
-        [[ -n "$entries" ]] \
-          || die "umbrella chart found but no per-app charts under ${target}/k8s/charts — run 'sandboxctl scaffold'"
-      else
-        log "found chart at ${target}/k8s/chart (the recommended layout)"
-        entries="$(_emit_explicit_chart_entry "$target" "k8s/chart" "" "")" || return 1
-      fi
+      entries="$(_resolve_repo_entries "$target")" || return 1
+      [[ -n "$entries" ]] \
+        || die "umbrella chart found but no per-app charts under ${target}/k8s/charts — run 'sandboxctl scaffold'"
     else
       local discovered=""
       discovered="$(discover_app_charts "$target" 2>/dev/null || true)"
@@ -5031,18 +5091,22 @@ EOF
         sandboxctl scaffold "$target" \
           || die "scaffold did not complete — fix the reported issue and re-run deploy"
 
-        # Re-discover with the freshly generated charts.
-        if [[ -f "${target}/k8s/chart/Chart.yaml" ]]; then
-          entries="$(_emit_explicit_chart_entry "$target" "k8s/chart" "" "")" || return 1
-        else
-          entries="$(discover_app_charts "$target" 2>/dev/null | awk -F'\t' 'NF>=2 && $1=="helm"')"
-          [[ -n "$entries" ]] || die "scaffold ran but no chart was generated (see its skip reasons above)"
-        fi
+        # Re-discover with the freshly generated charts — through the
+        # SAME umbrella-aware resolution as the main path. The original
+        # version blindly picked k8s/chart, which on a monorepo is the
+        # umbrella: it got pushed to Gitea alone and Argo's dependency
+        # build died on `file://../charts/<app> not found`.
+        entries="$(_resolve_repo_entries "$target")" \
+          || die "scaffold ran but no chart was generated (see its skip reasons above)"
       fi
     fi
   fi
 
   log "discovered $(echo "$entries" | wc -l | tr -d ' ') app(s) under ${target}"
+
+  # If an earlier sandboxctl pushed the umbrella alone and left a
+  # broken Application behind, clean it up before deploying properly.
+  (( umbrella_mode )) || _heal_broken_umbrella_app "$target"
 
   # Prime sudo once up-front (only if /etc/hosts will need new lines).
   # add_app_host runs once per chart at the end and needs sudo to write
@@ -5051,10 +5115,21 @@ EOF
   local needs_sudo=0
   while IFS=$'\t' read -r kind cname _src _vals; do
     [[ -n "$cname" ]] || continue
-    local _h; _h="$(deploy_hostname_for "$cname" "$env")"
-    if ! grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${_h}\b" /etc/hosts; then
-      needs_sudo=1
+    local _hosts _h
+    if [[ "$kind" == "umbrella" ]]; then
+      # The umbrella routes one host per subchart app — read them from
+      # its values-sandbox (they only exist in the cluster post-sync).
+      _hosts="$(sed -nE 's/^[[:space:]]+host:[[:space:]]*"?([^" ]+).*/\1/p' \
+        "${_src}/chart/values-sandbox.yaml" 2>/dev/null)"
+    else
+      _hosts="$(deploy_hostname_for "$cname" "$env")"
     fi
+    while IFS= read -r _h; do
+      [[ -n "$_h" ]] || continue
+      if ! grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]].*\b${_h}\b" /etc/hosts; then
+        needs_sudo=1
+      fi
+    done <<<"$_hosts"
   done <<<"$entries"
 
   # When at least one /etc/hosts entry needs writing, prime sudo now
@@ -5132,7 +5207,7 @@ EOF
       values_file="$(_ensure_sandbox_values_file "$cname" "$src_dir" "$deploy_manifest")"
     fi
 
-    [[ "$kind" == "helm" && -n "$values_file" ]] && \
+    [[ ( "$kind" == "helm" || "$kind" == "umbrella" ) && -n "$values_file" ]] && \
       log "[${cname}] using values file: ${values_file}"
 
     local repo_name="${cname}-chart"
@@ -5149,7 +5224,9 @@ EOF
     # single-app heredoc. Everything downstream (health wait, restart,
     # route) keys off the dev app, which keeps the plain <app> name.
     local gitops_dir="${target}/k8s/gitops/${cname}"
-    if [[ "$kind" == "helm" && -f "${gitops_dir}/application.yaml" ]]; then
+    if [[ "$kind" == "umbrella" ]]; then
+      _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$src_dir" "$deploy_manifest" "$chart_count" "chart"
+    elif [[ "$kind" == "helm" && -f "${gitops_dir}/application.yaml" ]]; then
       apply_gitops_pipeline "$cname" "$gitops_dir"
     else
       _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$src_dir" "$deploy_manifest" "$chart_count"
@@ -5167,7 +5244,14 @@ EOF
 
     _restart_app_workloads "$cname" "$namespace"
 
-    _route_app_service "$cname" "$namespace" "$hostname" "$deploy_manifest"
+    if [[ "$kind" == "umbrella" ]]; then
+      # The subcharts carry their own per-app VirtualServices (enabled
+      # by the umbrella's values-sandbox) — wire a Mac-side hosts entry
+      # + probe for each host they claim instead of inventing a route.
+      _route_umbrella_hosts "$cname" "$namespace"
+    else
+      _route_app_service "$cname" "$namespace" "$hostname" "$deploy_manifest"
+    fi
   done <<<"$entries"
 
   _print_deploy_summary "$entries" "$env"
@@ -5193,6 +5277,9 @@ _print_deploy_summary() {
     ns="$(deploy_namespace_for "$cname" "$env")"
     hostname="$(deploy_hostname_for "$cname" "$env")"
     url="https://${hostname}:${SANDBOX_HTTPS_PORT}"
+    # The umbrella app has no URL of its own — its subcharts each route
+    # <app>.domain (listed under "next:" below).
+    [[ "$_kind" == "umbrella" ]] && url="(per-app URLs below)"
 
     sync="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
     health="$(kc -n "$ARGOCD_NS" get application "$cname" -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
@@ -5214,7 +5301,17 @@ _print_deploy_summary() {
   while IFS=$'\t' read -r _kind cname _src _vals; do
     [[ -n "$cname" ]] || continue
     cname="$(slugify "$cname")"
-    printf '  open https://%s:%s\n' "$(deploy_hostname_for "$cname" "$env")" "${SANDBOX_HTTPS_PORT}"
+    if [[ "$_kind" == "umbrella" ]]; then
+      local _ns _h
+      _ns="$(deploy_namespace_for "$cname" "$env")"
+      while IFS= read -r _h; do
+        [[ -n "$_h" ]] || continue
+        printf '  open https://%s:%s\n' "$_h" "${SANDBOX_HTTPS_PORT}"
+      done < <(kc -n "$_ns" get virtualservices \
+        -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u)
+    else
+      printf '  open https://%s:%s\n' "$(deploy_hostname_for "$cname" "$env")" "${SANDBOX_HTTPS_PORT}"
+    fi
   done <<<"$entries"
   echo "  open https://${ARGO_HOST}:${SANDBOX_HTTPS_PORT}    # Argo CD UI"
   echo "  sandboxctl undeploy --name <app> --env ${env}    # tear one down"
@@ -5452,8 +5549,40 @@ EOF
 _apply_argo_app() {
   local cname="$1" kind="$2" gitea_url="$3" values_file="$4" namespace="$5"
   local src_dir="${6:-}" deploy_manifest="${7:-}" chart_count="${8:-1}"
+  # Optional source path inside the pushed repo (the umbrella pushes the
+  # whole k8s/ tree and points Argo at its chart/ subdirectory so the
+  # file://../charts dependencies resolve in the checkout).
+  local source_path="${9:-.}"
 
-  log "[${cname}] creating Argo CD Application (source: ${gitea_url}@main)"
+  log "[${cname}] creating Argo CD Application (source: ${gitea_url}@main, path: ${source_path})"
+  if [[ "$kind" == "umbrella" ]]; then
+    # Image/ingress adaptation lives in the subcharts' own sandbox
+    # values (nested through the umbrella's values-sandbox.yaml) — no
+    # parameter injection needed or wanted here.
+    kc apply -f - <<EOF >/dev/null
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${cname}
+  namespace: ${ARGOCD_NS}
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: ${gitea_url}
+    targetRevision: main
+    path: ${source_path}
+    helm:
+      valueFiles: ["${values_file}"]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ${namespace}
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+EOF
+    return 0
+  fi
   if [[ "$kind" == "helm" ]]; then
     # Collect helm parameters (image pins + ingress overrides + …) into an
     # array; render the helm block from whatever survived the walks.
@@ -5791,6 +5920,53 @@ _probe_route() {
   # Suppress the unused-var warning shellcheck would otherwise emit
   # for svc_addr (we keep it for readability of the hostname split).
   : "$svc_addr"
+}
+
+# _route_umbrella_hosts <name> <namespace> — the umbrella's subcharts
+# create their own VirtualServices; give each claimed host a Mac-side
+# /etc/hosts entry and probe it, exactly like per-app deploys get.
+_route_umbrella_hosts() {
+  local cname="$1" namespace="$2" tag="[${1}/${2}]"
+  local hosts host
+  hosts="$(kc -n "$namespace" get virtualservices \
+    -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u)"
+  if [[ -z "$hosts" ]]; then
+    warn "${tag} no VirtualServices found yet — Argo may still be syncing; re-run deploy to wire hosts"
+    return 0
+  fi
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    add_app_host "$host"
+    if [[ "${SANDBOXCTL_SKIP_ROUTE_PROBE:-}" != "1" ]]; then
+      local code; code="$(_probe_route "$host")"
+      case "$code" in
+        2??|3??) ok "${tag} probe ${host} → HTTP ${code}" ;;
+        *)       warn "${tag} ${host} answered '${code:-unreachable}' — the app may still be starting" ;;
+      esac
+    fi
+  done <<<"$hosts"
+}
+
+# _heal_broken_umbrella_app <target> — remove the Application an older
+# sandboxctl created by pushing the umbrella chart alone (its source
+# path '.' on a <umbrella>-chart repo can never build: the file://
+# dependencies point outside the pushed tree). Narrowly scoped: only
+# deletes when the app matches that exact broken shape.
+_heal_broken_umbrella_app() {
+  local target="$1"
+  _repo_has_umbrella "$target" || return 0
+  local slug
+  slug="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "${target}/k8s/chart/Chart.yaml" | head -n1)"
+  slug="$(slugify "${slug:-}")"
+  [[ -n "$slug" ]] || return 0
+  local src path
+  src="$(kc -n "$ARGOCD_NS" get application "$slug" -o jsonpath='{.spec.source.repoURL}' 2>/dev/null || true)"
+  path="$(kc -n "$ARGOCD_NS" get application "$slug" -o jsonpath='{.spec.source.path}' 2>/dev/null || true)"
+  if [[ "$src" == *"/${slug}-chart.git" && "$path" == "." ]]; then
+    warn "removing broken Application '${slug}' left by an earlier umbrella push (its dependencies could never resolve)"
+    kc -n "$ARGOCD_NS" patch application "$slug" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    kc -n "$ARGOCD_NS" delete application "$slug" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
 }
 
 # Wire one Istio VirtualService + /etc/hosts entry for the app's primary
@@ -6462,6 +6638,7 @@ main() {
     untrust-ca)         untrust_root_ca ;;
     up)                 shift; cmd_up "$@" ;;
     _onboard-check)     shift; _up_onboarding_check "${1:-$PWD}" ;;
+    _deploy-entries)    shift; _resolve_repo_entries "${1:-$PWD}" ;;
     kubeconfig)         shift; cmd_kubeconfig "$@" ;;
     doctor)             cmd_doctor ;;
     _ensure-tools)      ensure_tools ;;
