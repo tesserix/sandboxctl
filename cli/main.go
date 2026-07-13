@@ -45,6 +45,7 @@ var commands = []command{
 	{"creds", "print login details (URLs + admin creds) for Argo CD + Kargo"},
 	{"argocd-ui", "print Argo CD URL + admin creds"},
 	{"kargo-ui", "print Kargo  URL + admin creds"},
+	{"scaffold", "analyze the repo (monorepo-aware) + generate Helm chart(s) with sandbox values — skips existing files, asks before overwriting edits (--dry-run/--yes/--force)"},
 	{"build", "build + push Dockerfiles in the product repo (--repo <dir> | [path] | cwd)"},
 	{"images", "list / rm <ref> / prune / purge / gc — manage images in the cluster registry"},
 	{"deploy", "discover charts in the product repo (--repo <dir> | [path] | cwd) + push to Gitea + create Argo Apps (--redeploy: chart-only sync, reuse existing image, force Argo refresh)"},
@@ -121,6 +122,9 @@ func main() {
 	}
 	if sub == "_analyze" {
 		os.Exit(runAnalyze(os.Args[2:]))
+	}
+	if sub == "scaffold" {
+		os.Exit(runScaffold(os.Args[2:]))
 	}
 	if sub == "_parse-build-manifest" {
 		os.Exit(runParseBuildManifest(os.Args[2:]))
