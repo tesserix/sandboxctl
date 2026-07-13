@@ -272,9 +272,19 @@ func Installed() map[string]string {
 	if cluster == "" {
 		cluster = "sandboxctl"
 	}
-	kubeconfig := os.Getenv("SANDBOX_USER_KUBECONFIG")
+	// Prefer the sandbox-owned kubeconfig (the only one guaranteed to
+	// carry the kind context post-isolation); the user-level config is
+	// only a fallback for clusters created by pre-isolation versions.
+	home, _ := os.UserHomeDir()
+	stateDir := os.Getenv("SANDBOX_STATE_DIR")
+	if stateDir == "" {
+		stateDir = home + "/.sandboxctl"
+	}
+	kubeconfig := os.Getenv("SANDBOX_KUBECONFIG")
 	if kubeconfig == "" {
-		home, _ := os.UserHomeDir()
+		kubeconfig = stateDir + "/kubeconfig"
+	}
+	if _, err := os.Stat(kubeconfig); err != nil {
 		kubeconfig = home + "/.kube/config"
 	}
 	cmd := exec.Command(helm, "ls", "-A", "-o", "yaml", "--kube-context", "kind-"+cluster)

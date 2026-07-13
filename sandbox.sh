@@ -180,7 +180,7 @@ SANDBOX_PF_LOG="${SANDBOX_STATE_DIR}/portfwd.log"
 # user's KUBECONFIG, so we can't rely on `kind` having written the
 # context to ~/.kube/config — kind writes to whatever the first entry
 # in $KUBECONFIG points to. Materialize a dedicated file we own.
-SANDBOX_KUBECONFIG="${SANDBOX_STATE_DIR}/kubeconfig"
+SANDBOX_KUBECONFIG="${SANDBOX_KUBECONFIG:-${SANDBOX_STATE_DIR}/kubeconfig}"
 
 # socat container on kind network — bypass kubectl port-forward, which
 # stalls on Docker's 16-way parallel layer uploads.
@@ -566,13 +566,21 @@ helm_adopt_conflict() {
 # `kubectl` "just works" in any new terminal without the user having
 # to know where kind dropped the context. kind merges into this file
 # rather than replacing it, so existing entries are preserved.
-SANDBOX_USER_KUBECONFIG="${HOME}/.kube/config"
+# The user's default kubeconfig. sandboxctl NEVER reads or writes it for
+# its own operations any more — on corp laptops it belongs to other
+# clusters (GKE/EKS contexts), and both depending on it and polluting it
+# (kind's context merge + current-context flip) broke users. Every
+# internal operation runs against $SANDBOX_KUBECONFIG (the sandbox-owned
+# file kind writes via kind_pinned). This variable remains only for the
+# explicit, opt-in `sandboxctl kubeconfig --merge` and for cleaning up
+# contexts that pre-isolation versions merged in.
+SANDBOX_USER_KUBECONFIG="${SANDBOX_USER_KUBECONFIG:-$HOME/.kube/config}"
 
 kctx() { echo "kind-$CLUSTER_NAME"; }
 # Internal kubectl helper. Pins KUBECONFIG to the canonical user file
 # we just wrote into, so sandbox.sh keeps working even if the caller
 # has a custom $KUBECONFIG that doesn't include ~/.kube/config.
-kc()   { KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl --context "$(kctx)" "$@"; }
+kc()   { KUBECONFIG="$SANDBOX_KUBECONFIG" kubectl --context "$(kctx)" "$@"; }
 
 # Internal helm helper — the helm analogue of kc(). This is not a
 # convenience: bare `helm` reads the caller's ambient $KUBECONFIG and
@@ -584,14 +592,14 @@ kc()   { KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl --context "$(kctx)" "$@";
 # set. All cluster-touching helm calls (upgrade/install/list/status/
 # uninstall) MUST go through this; only context-free calls (`helm repo
 # add/update`, which write ~/.config/helm) may use bare helm.
-helmk() { KUBECONFIG="$SANDBOX_USER_KUBECONFIG" helm --kube-context "$(kctx)" "$@"; }
+helmk() { KUBECONFIG="$SANDBOX_KUBECONFIG" helm --kube-context "$(kctx)" "$@"; }
 
 # kind_pinned runs `kind` with KUBECONFIG forced to the canonical
 # user kubeconfig, so create/delete operations always touch the same
 # file regardless of what the surrounding shell exported.
 kind_pinned() {
-  mkdir -p "$(dirname "$SANDBOX_USER_KUBECONFIG")"
-  KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kind "$@"
+  mkdir -p "$(dirname "$SANDBOX_KUBECONFIG")"
+  KUBECONFIG="$SANDBOX_KUBECONFIG" kind "$@"
 }
 
 # Truth source for "is kagent installed in this cluster?" — checked
@@ -2983,9 +2991,71 @@ EOF
   if declare -F mlflow_present       >/dev/null && mlflow_present;       then printf '  open https://%s:%s          # MLflow UI\n' "$MLFLOW_HOST" "$SANDBOX_HTTPS_PORT"; fi
   if declare -F tyk_present          >/dev/null && tyk_present;          then printf '  open https://%s:%s/hello    # Tyk gateway health\n' "$TYK_HOST" "$SANDBOX_HTTPS_PORT"; fi
   echo "  sandboxctl creds   # full login details"
+  # shellcheck disable=SC2016 # the $( ) is meant literally for the user to eval.
+  echo '  eval "$(sandboxctl kubeconfig --export)"   # point YOUR kubectl at the sandbox'
   celebrate "sandbox is up"
 
   [[ "${SANDBOXCTL_SKIP_ONBOARD_CHECK:-0}" == "1" ]] || _up_onboarding_check "$PWD"
+}
+
+# cmd_kubeconfig — how users point their OWN kubectl/helm/k9s at the
+# sandbox, now that sandboxctl never touches ~/.kube/config:
+#
+#   sandboxctl kubeconfig            print the sandbox kubeconfig path
+#   sandboxctl kubeconfig --export   print an eval-able export line
+#   sandboxctl kubeconfig --merge    opt-in: merge the sandbox context
+#                                    into ~/.kube/config WITHOUT changing
+#                                    your current-context (backs the file
+#                                    up first)
+cmd_kubeconfig() {
+  local mode="path"
+  case "${1:-}" in
+    --export) mode="export" ;;
+    --merge)  mode="merge" ;;
+    -h|--help)
+      cat <<EOF
+sandboxctl kubeconfig [--export|--merge]
+
+  (no flag)   print the path of the sandbox-owned kubeconfig
+  --export    print 'export KUBECONFIG=…' for eval:
+                eval "\$(sandboxctl kubeconfig --export)"
+  --merge     merge the sandbox context into ${SANDBOX_USER_KUBECONFIG}
+              (your current-context is preserved; a .bak-sandboxctl
+              backup is written first)
+EOF
+      return 0 ;;
+    "") ;;
+    *) die "unknown flag: $1 (see 'sandboxctl kubeconfig --help')" ;;
+  esac
+
+  [[ -s "$SANDBOX_KUBECONFIG" ]] \
+    || die "no sandbox kubeconfig at ${SANDBOX_KUBECONFIG} — run 'sandboxctl up' first"
+
+  case "$mode" in
+    path)   echo "$SANDBOX_KUBECONFIG" ;;
+    export) echo "export KUBECONFIG=\"$SANDBOX_KUBECONFIG\"" ;;
+    merge)
+      local current="" backup_note="no prior file, nothing backed up"
+      if [[ -s "$SANDBOX_USER_KUBECONFIG" ]]; then
+        current="$(KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config current-context 2>/dev/null || true)"
+        cp "$SANDBOX_USER_KUBECONFIG" "${SANDBOX_USER_KUBECONFIG}.bak-sandboxctl"
+        backup_note="backup: ${SANDBOX_USER_KUBECONFIG}.bak-sandboxctl"
+      fi
+      mkdir -p "$(dirname "$SANDBOX_USER_KUBECONFIG")"
+      local tmp
+      tmp="$(mktemp -t sandboxctl-kubeconfig.XXXXXX)"
+      KUBECONFIG="${SANDBOX_USER_KUBECONFIG}:${SANDBOX_KUBECONFIG}" \
+        kubectl config view --flatten > "$tmp" \
+        || { rm -f "$tmp"; die "kubectl config view --flatten failed"; }
+      # Merging must never hijack what the user's kubectl points at.
+      if [[ -n "$current" ]]; then
+        KUBECONFIG="$tmp" kubectl config use-context "$current" >/dev/null 2>&1 || true
+      fi
+      chmod 600 "$tmp"
+      mv "$tmp" "$SANDBOX_USER_KUBECONFIG"
+      ok "merged context $(kctx) into ${SANDBOX_USER_KUBECONFIG} (current-context: ${current:-unchanged}; ${backup_note})"
+      ;;
+  esac
 }
 
 # End-of-up onboarding check: is the directory the user launched from
@@ -3236,6 +3306,15 @@ cmd_down() {
     ok "no kind cluster named '$CLUSTER_NAME' to delete"
   fi
   rm -f "$SANDBOX_KUBECONFIG"
+  # Pre-isolation versions merged the kind context into the user's
+  # default kubeconfig; clean those leftovers up (best-effort, never
+  # touches anything but our own entries). Post-isolation installs have
+  # nothing there.
+  if [[ -s "$SANDBOX_USER_KUBECONFIG" ]]; then
+    KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config delete-context "$(kctx)" >/dev/null 2>&1 || true
+    KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config delete-cluster "$(kctx)" >/dev/null 2>&1 || true
+    KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config delete-user "$(kctx)" >/dev/null 2>&1 || true
+  fi
 
   uninstall_hosts
   uninstall_dnsmasq
@@ -6202,6 +6281,7 @@ main() {
     untrust-ca)         untrust_root_ca ;;
     up)                 shift; cmd_up "$@" ;;
     _onboard-check)     shift; _up_onboarding_check "${1:-$PWD}" ;;
+    kubeconfig)         shift; cmd_kubeconfig "$@" ;;
     _ensure-tools)      ensure_tools ;;
     down)               cmd_down ;;
     purge)              cmd_purge ;;
