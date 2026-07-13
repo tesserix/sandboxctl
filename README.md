@@ -221,6 +221,45 @@ conflicts were kept (useful in CI to detect drift).
 After scaffolding: `sandboxctl deploy` (or `bootstrap`) builds the
 images, pushes the charts to Gitea, and wires the URLs.
 
+### The promotion pipeline (Argo CD + Kargo)
+
+Alongside each chart, scaffold generates a per-app GitOps pipeline
+under `k8s/gitops/<app>/` that finally puts the bundled Kargo to work:
+
+```
+sandboxctl build ──▶ sandbox registry (localhost:5050/<app>)
+                          │  Warehouse watches :latest by digest —
+                          ▼  every push becomes promotable Freight
+                    Stage dev ── promote ──▶ Stage staging
+                          │                        │
+              commits image.digest into    commits image.digest into
+              values-sandbox.yaml          values-staging.yaml
+                          │                        │
+                          ▼  (chart repo in the sandbox Gitea)
+                    Argo CD syncs ns <app>   Argo CD syncs ns <app>-staging
+```
+
+- `project.yaml` — Kargo Project `<app>-kargo` (its own namespace, so it
+  never collides with the app's deployment namespaces)
+- `warehouse.yaml` — watches the app's image in the in-cluster registry
+  (`Digest` strategy on `latest`, so mutable-tag pushes still promote)
+- `stages.yaml` — `dev` takes Freight straight from the Warehouse;
+  `staging` only takes what dev has; each promotion clones the chart
+  repo from Gitea, `yaml-update`s `image.digest`, commits, pushes, and
+  points the stage's Argo app at the new revision
+- `application.yaml` — the two stage-annotated Argo CD Applications
+  (dev keeps the plain `<app>` name, so URLs/status/undeploy behave
+  exactly as before; staging lands in `<app>-staging`)
+
+`sandboxctl deploy` applies the pipeline (creating the Gitea
+credentials Secret Kargo needs) instead of its classic single
+Application. Promote from the Kargo UI (`sandboxctl kargo-ui`) or CLI.
+`sandboxctl undeploy --name <app>` tears down both Applications and the
+Kargo project. Repos that already have GitOps manifests are left
+untouched, and `--no-gitops` opts out entirely. The manifests are plain
+YAML — point them at a real Argo CD + Kargo by swapping the commented
+in-cluster endpoints.
+
 ## Deploying your own app
 
 Run `sandboxctl deploy` from your product directory — the same dir you'd

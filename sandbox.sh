@@ -4563,25 +4563,34 @@ EOF
       if [[ -n "$helm_only" ]]; then
         entries="$helm_only"
       else
-        # Nothing chart-shaped under <target>. Prompt for a path —
-        # absolute, or relative to <target>.
+        # Nothing chart-shaped under <target> — offer to scaffold one
+        # (chart + sandbox values + secrets template + Kargo pipeline)
+        # instead of dead-ending. --chart still bypasses everything.
         if [[ ! -t 0 ]]; then
-          die "no chart found under ${target} — pass --chart <dir> or place a chart at ${target}/k8s/chart (no TTY available for interactive prompt)"
+          die "no chart found under ${target} — run 'sandboxctl scaffold ${target}', or pass --chart <dir> (no TTY available for the interactive offer)"
         fi
         echo
         echo "  No chart found at ${target}/k8s/chart (the recommended layout)"
         echo "  and no other Helm chart was discovered under ${target}."
         echo
-        echo "  If your chart lives elsewhere, enter its path now (absolute"
-        echo "  or relative to ${target}). Press Enter on an empty line to"
-        echo "  abort."
-        echo
-        local prompt_path=""
-        printf '  Chart path: '
-        read -r prompt_path
-        [[ -n "$prompt_path" ]] || \
-          die "deploy aborted — no chart path provided"
-        entries="$(_emit_explicit_chart_entry "$target" "$prompt_path" "" "")" || return 1
+        printf '  Generate chart(s) + GitOps pipeline now with '\''sandboxctl scaffold'\''? [Y/n] '
+        local scaffold_answer=""
+        read -r scaffold_answer
+        case "$scaffold_answer" in
+          n|N|no|NO) die "deploy aborted — add a chart or pass --chart <dir>" ;;
+        esac
+        command -v sandboxctl >/dev/null 2>&1 \
+          || die "the sandboxctl binary is not on PATH — cannot scaffold"
+        sandboxctl scaffold "$target" \
+          || die "scaffold did not complete — fix the reported issue and re-run deploy"
+
+        # Re-discover with the freshly generated charts.
+        if [[ -f "${target}/k8s/chart/Chart.yaml" ]]; then
+          entries="$(_emit_explicit_chart_entry "$target" "k8s/chart" "" "")" || return 1
+        else
+          entries="$(discover_app_charts "$target" 2>/dev/null | awk -F'\t' 'NF>=2 && $1=="helm"')"
+          [[ -n "$entries" ]] || die "scaffold ran but no chart was generated (see its skip reasons above)"
+        fi
       fi
     fi
   fi
@@ -4688,7 +4697,16 @@ EOF
     # happens inside _apply_argo_app via _chart_helm_overrides — it reads
     # the chart's values.yaml + the repo's sandboxctl.yaml directly, so
     # there's nothing to precompute here.
-    _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$src_dir" "$deploy_manifest" "$chart_count"
+    # Scaffold-generated pipelines carry their own Applications (dev +
+    # staging, Kargo-annotated) — apply those instead of the inline
+    # single-app heredoc. Everything downstream (health wait, restart,
+    # route) keys off the dev app, which keeps the plain <app> name.
+    local gitops_dir="${target}/k8s/gitops/${cname}"
+    if [[ "$kind" == "helm" && -f "${gitops_dir}/application.yaml" ]]; then
+      apply_gitops_pipeline "$cname" "$gitops_dir"
+    else
+      _apply_argo_app "$cname" "$kind" "$gitea_url" "$values_file" "$namespace" "$src_dir" "$deploy_manifest" "$chart_count"
+    fi
 
     # --redeploy short-circuits Argo's reconcile poll so the chart push
     # we just made hits the cluster within seconds. The annotation is a
@@ -4940,6 +4958,50 @@ _chart_helm_overrides() {
 # the deployed image always matches the freshly-built one regardless of
 # what the chart's values.yaml hardcodes — and chart-shipped Ingress
 # resources stay dormant when sandboxctl owns external routing.
+# Apply a scaffold-generated Kargo pipeline (k8s/gitops/<app>/): the
+# Project first (its controller creates the project namespace), then
+# the git-credentials Secret the promotion steps need to push to the
+# in-cluster Gitea, then Warehouse + Stages + the stage-annotated Argo
+# Applications. Idempotent — plain applies, controllers reconcile.
+apply_gitops_pipeline() {
+  local cname="$1" gitops_dir="$2"
+  local project="${cname}-kargo"
+
+  log "[${cname}] applying Kargo pipeline from ${gitops_dir}"
+  kc apply -f "${gitops_dir}/project.yaml" >/dev/null
+
+  local i
+  for ((i=0; i<30; i++)); do
+    kc get namespace "$project" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  kc get namespace "$project" >/dev/null 2>&1 \
+    || die "[${cname}] Kargo project namespace ${project} did not appear — is Kargo running? ('sandboxctl status')"
+
+  local pass_file="${SANDBOX_STATE_DIR}/gitea-admin-pass"
+  [[ -s "$pass_file" ]] || die "gitea password file missing — run 'sandboxctl up' first"
+  local admin_pass; admin_pass="$(cat "$pass_file")"
+  kc apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitea-creds
+  namespace: ${project}
+  labels:
+    kargo.akuity.io/cred-type: git
+type: Opaque
+stringData:
+  repoURL: http://gitea-http.${GITEA_NS}.svc.cluster.local:3000/${GITEA_ORG}/${cname}-chart.git
+  username: ${GITEA_ADMIN_USER}
+  password: ${admin_pass}
+EOF
+
+  kc apply -f "${gitops_dir}/warehouse.yaml" >/dev/null
+  kc apply -f "${gitops_dir}/stages.yaml"    >/dev/null
+  kc apply -f "${gitops_dir}/application.yaml" >/dev/null
+  ok "[${cname}] pipeline applied — registry → dev → staging (promote via 'sandboxctl kargo-ui')"
+}
+
 _apply_argo_app() {
   local cname="$1" kind="$2" gitea_url="$3" values_file="$4" namespace="$5"
   local src_dir="${6:-}" deploy_manifest="${7:-}" chart_count="${8:-1}"
@@ -5450,6 +5512,16 @@ cmd_undeploy() {
   fi
   remove_app_route "$hostname" "$namespace"
   remove_app_host  "$hostname"
+
+  # Scaffold-generated pipeline resources, when present: the staging
+  # Application and the Kargo Project (whose deletion cascades to the
+  # project namespace, Warehouse, Stages, and credentials Secret).
+  if kc -n "$ARGOCD_NS" get application "${name}-staging" >/dev/null 2>&1; then
+    kc -n "$ARGOCD_NS" patch application "${name}-staging" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    kc -n "$ARGOCD_NS" delete application "${name}-staging" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+  kc delete project.kargo.akuity.io "${name}-kargo" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
   ok "undeployed ${name} (namespace ${namespace} preserved — delete manually if desired)"
 }
 
