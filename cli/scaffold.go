@@ -11,8 +11,10 @@ import (
 	"strings"
 
 	"github.com/tesserix/sandboxctl/cli/internal/chartgen"
+	"github.com/tesserix/sandboxctl/cli/internal/components"
 	"github.com/tesserix/sandboxctl/cli/internal/envscan"
 	"github.com/tesserix/sandboxctl/cli/internal/genwrite"
+	"github.com/tesserix/sandboxctl/cli/internal/gitopsgen"
 	"github.com/tesserix/sandboxctl/cli/internal/reposcan"
 	"github.com/tesserix/sandboxctl/cli/internal/secretsgen"
 )
@@ -24,7 +26,7 @@ func runScaffold(args []string) int {
 	var (
 		dir           = "."
 		dryRun, force bool
-		yes           bool
+		yes, noGitops bool
 	)
 	for _, a := range args {
 		switch a {
@@ -34,6 +36,8 @@ func runScaffold(args []string) int {
 			force = true
 		case "--yes", "-y":
 			yes = true
+		case "--no-gitops":
+			noGitops = true
 		case "-h", "--help":
 			fmt.Print(`sandboxctl scaffold [dir] [--dry-run] [--force] [--yes]
 
@@ -46,11 +50,19 @@ safe-write engine:
     edited them; edited ones prompt with a diff (default: keep yours)
   - the full plan is shown and confirmed before anything is written
 
+Alongside the charts, a GitOps promotion pipeline is generated per app
+under k8s/gitops/<app>/: a Kargo Project + Warehouse watching the app's
+image in the sandbox registry (every 'sandboxctl build' push becomes
+promotable Freight), dev + staging Stages whose promotions commit the
+image digest into the chart's Gitea repo, and the stage-annotated Argo
+CD Applications they drive. 'sandboxctl deploy' applies it all.
+
 Flags:
   --dry-run   print the analysis + plan, write nothing
   --yes       accept the plan without the interactive prompt
   --force     overwrite files you edited after generation (still never
               touches files scaffold didn't create)
+  --no-gitops generate charts + secrets only, skip the Kargo pipeline
 
 Environment variables referenced in the code are scanned too: secret-
 like ones produce k8s/secrets.example.yaml (stringData — fill values in
@@ -101,13 +113,42 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 	secOps, secSkip := secretsgen.Ops(model.Root, model.Apps)
 	ops = append(ops, secOps...)
 
-	if len(gen.Skips) > 0 || secSkip != nil {
+	// GitOps pipeline (Kargo watching the sandbox registry → dev →
+	// staging via the sandbox Gitea). Charts must exist or be planned;
+	// a Kargo pinned below the promotion-vocabulary floor skips the
+	// whole section rather than generating manifests it can't run.
+	var gitops *gitopsgen.Result
+	switch kargo, _ := components.Lookup("kargo"); {
+	case noGitops:
+	case func() bool { v, _ := kargo.Pinned(); return kargo.FloorViolated(v) }():
+		v, _ := kargo.Pinned()
+		fmt.Fprintf(os.Stderr, "scaffold: warning: KARGO_CHART_VERSION=%s is below %s — skipping GitOps pipeline generation (%s)\n", v, kargo.Floor, kargo.FloorReason)
+	default:
+		chartDirs := map[string]string{}
+		for app, d := range gen.ChartDirs {
+			chartDirs[app] = d
+		}
+		for _, app := range model.Apps {
+			if app.Existing.Chart != "" {
+				chartDirs[app.Name] = app.Existing.Chart
+			}
+		}
+		gitops = gitopsgen.Ops(model, gitopsConfig(), chartDirs)
+		ops = append(ops, gitops.Ops...)
+	}
+
+	if len(gen.Skips) > 0 || secSkip != nil || (gitops != nil && len(gitops.Skips) > 0) {
 		fmt.Println()
 		for _, s := range gen.Skips {
 			fmt.Printf("  skip  %-16s %s\n", s.App, s.Reason)
 		}
 		if secSkip != nil {
 			fmt.Printf("  skip  %-16s %s\n", "secrets", secSkip.Reason)
+		}
+		if gitops != nil {
+			for _, s := range gitops.Skips {
+				fmt.Printf("  skip  %-16s pipeline: %s\n", s.App, s.Reason)
+			}
 		}
 	}
 	if len(ops) == 0 {
@@ -253,6 +294,27 @@ func warnTrackedSecrets(root string) {
 	for _, f := range strings.Fields(string(out)) {
 		fmt.Fprintf(os.Stderr, "scaffold: warning: %s is TRACKED by git — rotate any values it holds, then 'git rm --cached %s' (the .gitignore entry only affects untracked files)\n", f, f)
 	}
+}
+
+// gitopsConfig mirrors sandbox.sh's namespace/org defaults so the
+// generated pipeline points at the same in-cluster Gitea + registry the
+// rest of the tool uses. Env overrides carry through for operators who
+// renamed namespaces.
+func gitopsConfig() gitopsgen.Config {
+	registryNS := envOr("REGISTRY_NS", "sandboxctl-registry")
+	giteaNS := envOr("GITEA_NS", "gitea")
+	return gitopsgen.Config{
+		RegistryHost: "registry." + registryNS + ".svc.cluster.local:5000",
+		GiteaHost:    "gitea-http." + giteaNS + ".svc.cluster.local:3000",
+		Org:          envOr("GITEA_ORG", "apps"),
+	}
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // registryHostPort mirrors sandbox.sh's SANDBOX_REGISTRY_PORT handling

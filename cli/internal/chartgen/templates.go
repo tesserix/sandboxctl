@@ -23,6 +23,9 @@ const valuesYamlTmpl = `replicaCount: 1
 image:
   repository: [[.ImageRepo]]
   tag: latest
+  # Kargo promotions pin the exact build by digest; empty means "just
+  # the tag". A digest always wins over the tag when both are set.
+  digest: ""
   pullPolicy: IfNotPresent
 
 nameOverride: ""
@@ -62,10 +65,12 @@ affinity: {}
 
 const valuesSandboxTmpl = `# Sandbox-flavoured values — picked up automatically by 'sandboxctl deploy'.
 # The image repository points at the in-cluster registry; deploy re-pins
-# the tag to whatever 'sandboxctl build' just pushed.
+# the tag to whatever 'sandboxctl build' just pushed, and Kargo's dev
+# Stage writes image.digest here on promotion.
 image:
   repository: [[.ImageRepo]]
   tag: latest
+  digest: ""
 `
 
 const helpersTmpl = `{{- define "[[.Name]].name" -}}
@@ -130,7 +135,7 @@ spec:
       serviceAccountName: {{ include "[[.Name]].serviceAccountName" . }}
       containers:
         - name: [[.Name]]
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}{{- with .Values.image.digest }}@{{ . }}{{- end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if .Values.envFromSecret }}
           envFrom:
