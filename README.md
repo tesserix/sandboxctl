@@ -47,6 +47,13 @@ the cluster is already up) then `sandboxctl deploy` in the current dir,
 so re-running it later is also fine as your "redeploy this app"
 shortcut.
 
+A plain `sandboxctl up` ends with an onboarding check of the directory
+you ran it from: if the repo isn't onboarded to the sandbox structure
+yet, it shows exactly what `sandboxctl scaffold` would generate
+(dry-run) and offers to run it on the spot — answer `y` and the repo is
+ready for `deploy`. Already-onboarded repos just get the next-step
+commands. Re-run the check any time with `sandboxctl _onboard-check`.
+
 If you'd rather run the steps separately:
 
 ```sh

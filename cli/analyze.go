@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/tesserix/sandboxctl/cli/internal/envscan"
 	"github.com/tesserix/sandboxctl/cli/internal/reposcan"
@@ -55,6 +56,47 @@ func runAnalyze(args []string) int {
 	}
 
 	printAnalyzeSummary(model)
+	return 0
+}
+
+// runOnboardStatus implements the hidden `_onboard-status [dir]` used
+// by `up`'s end-of-run onboarding check. One parseable line on stdout:
+//
+//	<onboarded|needs-onboarding|not-a-repo> apps=N charts=N pipelines=N
+//
+// "Onboarded" means every buildable app (has a Dockerfile) already has
+// a chart; pipelines are reported but optional.
+func runOnboardStatus(args []string) int {
+	dir := "."
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		dir = args[0]
+	}
+	model, err := reposcan.Scan(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "_onboard-status: %v\n", err)
+		return 1
+	}
+	buildable, charts, pipelines := 0, 0, 0
+	for _, a := range model.Apps {
+		if a.Dockerfile == "" {
+			continue
+		}
+		buildable++
+		if a.Existing.Chart != "" {
+			charts++
+		}
+		if a.Existing.GitOps != "" {
+			pipelines++
+		}
+	}
+	status := "needs-onboarding"
+	switch {
+	case buildable == 0:
+		status = "not-a-repo"
+	case charts == buildable:
+		status = "onboarded"
+	}
+	fmt.Printf("%s apps=%d charts=%d pipelines=%d\n", status, buildable, charts, pipelines)
 	return 0
 }
 

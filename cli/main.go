@@ -75,6 +75,8 @@ func known(sub string) bool {
 	switch sub {
 	case "secret",
 		"_analyze",
+		"_onboard-status",
+		"_onboard-check",
 		"_resolve-latest",
 		"_semver-lt",
 		"_render-args",
@@ -126,6 +128,9 @@ func main() {
 	}
 	if sub == "_analyze" {
 		os.Exit(runAnalyze(os.Args[2:]))
+	}
+	if sub == "_onboard-status" {
+		os.Exit(runOnboardStatus(os.Args[2:]))
 	}
 	if sub == "scaffold" {
 		os.Exit(runScaffold(os.Args[2:]))
