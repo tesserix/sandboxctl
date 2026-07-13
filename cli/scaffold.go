@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/tesserix/sandboxctl/cli/internal/chartgen"
@@ -45,6 +49,10 @@ Flags:
   --yes       accept the plan without the interactive prompt
   --force     overwrite files you edited after generation (still never
               touches files scaffold didn't create)
+
+Every chart written is 'helm lint'-ed immediately afterwards; a lint
+failure rolls that chart's files back so a broken chart never lands in
+your repo (exit 1, lint output shown).
 
 After scaffolding: 'sandboxctl deploy' builds the images, pushes the
 chart(s) to the in-cluster Gitea, and wires URLs.
@@ -126,10 +134,83 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 
 	fmt.Println()
 	genwrite.RenderResult(os.Stdout, res)
-	if len(res.Created) > 0 || len(res.Regenerated) > 0 || len(res.Overwritten) > 0 {
+
+	wrote := len(res.Created)+len(res.Regenerated)+len(res.Overwritten) > 0
+	var lintFailed []string
+	if wrote {
+		if helmPath, lerr := exec.LookPath("helm"); lerr != nil {
+			fmt.Fprintln(os.Stderr, "scaffold: warning: helm not found — skipping the post-scaffold lint gate (install helm to enable it)")
+		} else {
+			fmt.Println()
+			lintFailed = lintWrittenCharts(gen.ChartDirs, res, os.Stdout, helmLintRunner(helmPath, model.Root))
+		}
+	}
+
+	if len(lintFailed) > 0 {
+		fmt.Fprintf(os.Stderr, "\nscaffold: helm lint failed for %s — those changes were rolled back, nothing broken was left behind\n", strings.Join(lintFailed, ", "))
+		fmt.Fprintln(os.Stderr, "scaffold: if the failure points at a file you edited and kept, fix it (or re-run with --force); otherwise please report this as a chart-template bug")
+		return 1
+	}
+	if wrote {
 		fmt.Println("\nnext: 'sandboxctl deploy' to build the image(s), push the chart(s) to Gitea, and wire URLs")
 	}
 	return res.ExitCode()
+}
+
+// lintWrittenCharts runs the lint gate over every chart dir that
+// received a write this run, rolling back any dir that fails so a
+// broken chart never survives a scaffold. Returns the failed dirs.
+// The runner is injected so tests can simulate failures without helm.
+func lintWrittenCharts(chartDirs map[string]string, res *genwrite.Result, out io.Writer, run func(dir string) (string, error)) []string {
+	var written []string
+	written = append(written, res.Created...)
+	written = append(written, res.Regenerated...)
+	written = append(written, res.Overwritten...)
+
+	dirs := make([]string, 0, len(chartDirs))
+	for _, dir := range chartDirs {
+		for _, p := range written {
+			if p == dir || strings.HasPrefix(p, dir+"/") {
+				dirs = append(dirs, dir)
+				break
+			}
+		}
+	}
+	sort.Strings(dirs)
+
+	var failed []string
+	for _, dir := range dirs {
+		output, err := run(dir)
+		if err == nil {
+			fmt.Fprintf(out, "  helm lint ok  %s\n", dir)
+			continue
+		}
+		fmt.Fprintf(out, "  helm lint FAILED  %s\n%s\n", dir, indent(output, "    "))
+		reverted, rbErr := res.Rollback(dir)
+		if rbErr != nil {
+			fmt.Fprintf(out, "  rollback of %s incomplete: %v — inspect the directory before committing\n", dir, rbErr)
+		} else {
+			fmt.Fprintf(out, "  rolled back %d file(s) under %s\n", len(reverted), dir)
+		}
+		failed = append(failed, dir)
+	}
+	return failed
+}
+
+func helmLintRunner(helmPath, root string) func(dir string) (string, error) {
+	return func(dir string) (string, error) {
+		cmd := exec.Command(helmPath, "lint", filepath.Join(root, filepath.FromSlash(dir)))
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+}
+
+func indent(s, prefix string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = prefix + l
+	}
+	return strings.Join(lines, "\n")
 }
 
 // registryHostPort mirrors sandbox.sh's SANDBOX_REGISTRY_PORT handling
