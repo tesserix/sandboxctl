@@ -892,6 +892,27 @@ splits them by name heuristics:
   comments in the chart's `values.yaml` `env:` block instead — config
   belongs in values, not in Secrets.
 
+**When the sandbox is running, scaffold fills `k8s/secrets.yaml` for
+you**: platform credentials resolve straight from the cluster —
+`CLICKHOUSE_PASSWORD` from the unique clickhouse Secret,
+`DATABASE_URL` from a CNPG-style `uri` key, `REDIS_HOST` from the
+Service DNS, and so on — leaving placeholders only for truly external
+values (Stripe keys, …). Ambiguous matches resolve to *nothing* (a
+wrong credential is worse than a placeholder), every fill logs its
+source (never the value), and the pass is strictly additive: it only
+ever replaces `<required — …>` placeholders — values anyone set and
+keys anyone hand-added are never overwritten or removed. `deploy` runs
+the same resolution when it first creates `k8s/secrets.yaml`, so the
+edit-prompt only appears if anything is actually left. Pin a
+resolution explicitly when the heuristics can't:
+
+```yaml
+secrets:
+  resolve:
+    DATABASE_URL: secret://cnpg/app-db/uri
+    CLICKHOUSE_HOST: service://clickhouse/clickhouse:8123
+```
+
 `.gitignore` learns `k8s/secrets.yaml` and `.env` before the template
 is written, scaffold warns loudly if either is already **tracked** by
 git, real `.env` values are never read (only `*.example/sample/template`

@@ -24,9 +24,10 @@ import (
 // safe-write engine. Runs entirely in Go: no cluster, no sandbox.sh.
 func runScaffold(args []string) int {
 	var (
-		dir           = "."
-		dryRun, force bool
-		yes, noGitops bool
+		dir              = "."
+		dryRun, force    bool
+		yes, noGitops    bool
+		noResolveSecrets bool
 	)
 	for _, a := range args {
 		switch a {
@@ -38,6 +39,8 @@ func runScaffold(args []string) int {
 			yes = true
 		case "--no-gitops":
 			noGitops = true
+		case "--no-resolve-secrets":
+			noResolveSecrets = true
 		case "-h", "--help":
 			fmt.Print(`sandboxctl scaffold [dir] [--dry-run] [--force] [--yes]
 
@@ -63,10 +66,24 @@ Flags:
   --force     overwrite files you edited after generation (still never
               touches files scaffold didn't create)
   --no-gitops generate charts + secrets only, skip the Kargo pipeline
+  --no-resolve-secrets
+              don't fill k8s/secrets.yaml from the running sandbox
 
 Environment variables referenced in the code are scanned too: secret-
 like ones produce k8s/secrets.example.yaml (stringData — fill values in
-plain text) wired to each chart via envFrom, .gitignore learns to
+plain text) wired to each chart via envFrom. When the sandbox cluster
+is running, scaffold also FILLS k8s/secrets.yaml for you: platform
+credentials (Postgres, ClickHouse, Redis, NATS, …) are resolved from
+the cluster's Secrets and Services — only truly external values stay
+as placeholders, and a value someone set is never overwritten. Pin a
+resolution explicitly in sandboxctl.yaml:
+
+  secrets:
+    resolve:
+      DATABASE_URL: secret://cnpg/app-db/uri
+      CLICKHOUSE_HOST: service://clickhouse/clickhouse:8123
+
+Meanwhile .gitignore learns to
 ignore k8s/secrets.yaml and .env, and plain configuration is listed in
 the chart's values.yaml. Pin classifications in sandboxctl.yaml:
 
@@ -223,6 +240,10 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 		}
 	}
 
+	if !noResolveSecrets && len(lintFailed) == 0 {
+		resolveSecretsIntoFile(model, os.Stdout)
+	}
+
 	if len(lintFailed) > 0 {
 		fmt.Fprintf(os.Stderr, "\nscaffold: helm lint failed for %s — those changes were rolled back, nothing broken was left behind\n", strings.Join(lintFailed, ", "))
 		fmt.Fprintln(os.Stderr, "scaffold: if the failure points at a file you edited and kept, fix it (or re-run with --force); otherwise please report this as a chart-template bug")
@@ -345,6 +366,33 @@ func indent(s, prefix string) string {
 		lines[i] = prefix + l
 	}
 	return strings.Join(lines, "\n")
+}
+
+// resolveSecretsIntoFile fills k8s/secrets.yaml from the running
+// sandbox cluster: platform credentials resolve from in-cluster
+// Secrets/Services (plus sandboxctl.yaml secrets.resolve mappings);
+// external ones stay placeholders. Values are never printed — sources
+// are.
+func resolveSecretsIntoFile(model *reposcan.Model, out io.Writer) {
+	vars := secretsgen.SecretVarNames(model.Apps)
+	if len(vars) == 0 {
+		return
+	}
+	overrides := secretsgen.LoadResolveOverrides(model.Root)
+	state := secretsgen.FetchClusterState()
+	if state == nil && len(overrides) == 0 {
+		fmt.Fprintln(out, "\n  secrets: sandbox cluster not reachable — placeholders left for hand-filling (re-run scaffold with the sandbox up to auto-fill)")
+		return
+	}
+	res := secretsgen.Resolve(vars, state, overrides)
+	rep := secretsgen.SyncSecretsFile(model.Root, model.Apps, res)
+	fmt.Fprintf(out, "\n  secrets (%s): k8s/secrets.yaml\n", rep.Action)
+	for _, f := range rep.Filled {
+		fmt.Fprintf(out, "    filled  %s\n", f)
+	}
+	for _, l := range rep.Left {
+		fmt.Fprintf(out, "    left    %-24s fill by hand (or map it in sandboxctl.yaml secrets.resolve)\n", l)
+	}
 }
 
 // warnTrackedSecrets checks whether files that must never be committed

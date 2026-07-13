@@ -100,6 +100,25 @@ func runOnboardStatus(args []string) int {
 	return 0
 }
 
+// runResolveSecrets implements the hidden `_resolve-secrets [dir]` used
+// by deploy's secrets step: same resolution scaffold performs, exit 0
+// always (best-effort; the placeholder gate downstream stays the
+// enforcement).
+func runResolveSecrets(args []string) int {
+	dir := "."
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		dir = args[0]
+	}
+	model, err := reposcan.Scan(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "_resolve-secrets: %v\n", err)
+		return 0
+	}
+	envscan.Attach(model)
+	resolveSecretsIntoFile(model, os.Stdout)
+	return 0
+}
+
 func printAnalyzeSummary(m *reposcan.Model) {
 	layout := m.Layout
 	if m.Workspace != "" {

@@ -4665,16 +4665,27 @@ ensure_secrets_for_namespace() {
     log "creating k8s/secrets.yaml from k8s/secrets.example.yaml"
     cp "$example" "$secrets"
     ensure_gitignore_entry "$target" "k8s/secrets.yaml"
-    cat <<EOF
+    # Fill what the sandbox cluster can answer for (platform creds:
+    # Postgres, ClickHouse, Redis, …) before bothering the human — the
+    # resolver only ever replaces `<required — …>` placeholders, never a
+    # value someone set, and never removes hand-added keys.
+    if command -v sandboxctl >/dev/null 2>&1; then
+      sandboxctl _resolve-secrets "$target" || true
+    fi
+    if grep -qE '<(base64-encoded-[a-z-]+|required[^>]*)>' "$secrets" 2>/dev/null; then
+      cat <<EOF
 
-  k8s/secrets.yaml has been created from the example. Edit it now and
-  set base64-encoded values for each key. To encode a value:
-
-      echo -n 'your-secret' | base64
+  k8s/secrets.yaml has been created from the example and every value
+  the sandbox cluster could answer for has been filled in. Edit the
+  remaining placeholder values now (plain text — stringData handles
+  the encoding).
 
   Press Enter when you have finished editing the file (Ctrl+C to abort)…
 EOF
-    read -r _
+      read -r _
+    else
+      ok "k8s/secrets.yaml fully resolved — nothing left to fill by hand"
+    fi
   fi
 
   # Validate: refuse to apply if any obvious placeholder is left. Two
