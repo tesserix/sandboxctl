@@ -1,0 +1,107 @@
+name: bump-components
+
+# Weekly upstream-version sweep: for every component whose chart has a
+# newer stable release, render-check the new version with the exact
+# --set profile `up` installs, run the test suite (which includes the
+# sandbox.sh↔registry lockstep check), and open one PR per component.
+# Merging stays human.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [argo-cd, kargo, cert-manager, istio, gitea, reflector, reloader, kagent]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache-dependency-path: cli/go.sum
+      - uses: azure/setup-helm@v4
+
+      - name: build cli
+        working-directory: cli
+        run: go build -o /tmp/sandboxctl .
+
+      - name: resolve versions
+        id: v
+        run: |
+          set -euo pipefail
+          comp='${{ matrix.component }}'
+          current=$(/tmp/sandboxctl versions --offline --json | jq -r ".[] | select(.component==\"$comp\") | .pinned")
+          latest=$(/tmp/sandboxctl _resolve-latest "$comp")
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest"   >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ]; then
+            echo "up to date ($current)"; echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump: $current -> $latest"; echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: apply bump
+        if: steps.v.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          cur='${{ steps.v.outputs.current }}'; new='${{ steps.v.outputs.latest }}'
+          # sandbox.sh default + registry default + README mention move together.
+          sed -i "s/:-${cur}}/:-${new}}/" sandbox.sh
+          sed -i "s/Default: \"${cur}\"/Default: \"${new}\"/" cli/internal/components/components.go
+          sed -i "s/\`${cur}\`/\`${new}\`/g" README.md || true
+
+      - name: render check with the exact install profile
+        if: steps.v.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          new='${{ steps.v.outputs.latest }}'
+          mapfile -t lines < <(/tmp/sandboxctl _render-args '${{ matrix.component }}')
+          args=(); src=""
+          for l in "${lines[@]}"; do
+            case "$l" in
+              @source=*) src="${l#@source=}" ;;
+              *) args+=(--set "$l") ;;
+            esac
+          done
+          echo '{}' > /tmp/reg.json
+          if [[ "$src" == oci://* ]]; then
+            HELM_REGISTRY_CONFIG=/tmp/reg.json helm template x "$src" --version "$new" "${args[@]}" > /dev/null
+          else
+            repo="${src%|*}"; chart="${src#*|}"
+            helm repo add up "$repo" && helm repo update up
+            helm template x "up/$chart" --version "$new" "${args[@]}" > /dev/null
+          fi
+          echo "render check passed for ${new}"
+
+      - name: tests (includes sandbox.sh lockstep)
+        if: steps.v.outputs.bump == 'true'
+        working-directory: cli
+        run: go vet ./... && go test ./...
+
+      - name: open PR
+        if: steps.v.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          comp='${{ matrix.component }}'; cur='${{ steps.v.outputs.current }}'; new='${{ steps.v.outputs.latest }}'
+          branch="bump/${comp}-${new}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add sandbox.sh cli/internal/components/components.go README.md
+          git commit -m "chore(deps): bump ${comp} chart ${cur} -> ${new}"
+          git push -u origin "$branch" --force
+          gh label create dependencies --color 0366d6 --description "Component version bumps" --force
+          gh pr create --title "chore(deps): bump ${comp} chart ${cur} -> ${new}" \
+            --body "Automated weekly bump. The new version rendered cleanly with the exact --set profile \`up\` installs, and the test suite (including the sandbox.sh↔registry lockstep check) passed. Upstream: see the component's release notes before merging." \
+            --label dependencies || echo "PR already exists"
