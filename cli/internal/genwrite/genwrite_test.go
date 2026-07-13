@@ -424,6 +424,79 @@ func TestAppendCreatesAndAmends(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// rollback
+// ----------------------------------------------------------------------------
+
+func TestRollbackRevertsCreateRegenerateAppend(t *testing.T) {
+	root := t.TempDir()
+	generate(t, root, "regen.yaml", "a: 1\n")
+	oldRegen := readFile(t, root, "regen.yaml")
+	writeFile(t, root, ".gitignore", "node_modules\n")
+
+	plan, err := BuildPlan(root, []Op{
+		{Path: "charts/api/new.yaml", Body: []byte("n: 1\n"), Generator: "scaffold"},
+		{Path: "regen.yaml", Body: []byte("a: 2\n"), Generator: "scaffold"},
+		{Path: ".gitignore", Append: []string{"k8s/secrets.yaml"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Apply(plan, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reverted, err := res.Rollback()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverted) != 3 {
+		t.Fatalf("reverted = %v, want all three writes", reverted)
+	}
+	if _, err := os.Stat(filepath.Join(root, "charts/api/new.yaml")); !os.IsNotExist(err) {
+		t.Fatal("created file survived rollback")
+	}
+	if _, err := os.Stat(filepath.Join(root, "charts")); !os.IsNotExist(err) {
+		t.Fatal("empty created dirs not pruned")
+	}
+	if got := readFile(t, root, "regen.yaml"); got != oldRegen {
+		t.Fatalf("regenerated file not restored:\n%s", got)
+	}
+	if got := readFile(t, root, ".gitignore"); got != "node_modules\n" {
+		t.Fatalf("appended file not restored:\n%q", got)
+	}
+}
+
+func TestRollbackHonoursPrefix(t *testing.T) {
+	root := t.TempDir()
+	plan, err := BuildPlan(root, []Op{
+		{Path: "charts/a/f.yaml", Body: []byte("a\n"), Generator: "scaffold"},
+		{Path: "charts/b/f.yaml", Body: []byte("b\n"), Generator: "scaffold"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Apply(plan, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reverted, err := res.Rollback("charts/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverted) != 1 || reverted[0] != "charts/a/f.yaml" {
+		t.Fatalf("reverted = %v", reverted)
+	}
+	if _, err := os.Stat(filepath.Join(root, "charts/a")); !os.IsNotExist(err) {
+		t.Fatal("charts/a not fully removed")
+	}
+	if got := readFile(t, root, "charts/b/f.yaml"); !strings.Contains(got, "b") {
+		t.Fatal("unrelated chart b was rolled back")
+	}
+}
+
+// ----------------------------------------------------------------------------
 // validation, rendering, diff
 // ----------------------------------------------------------------------------
 

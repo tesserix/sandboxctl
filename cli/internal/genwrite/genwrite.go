@@ -184,6 +184,75 @@ type Result struct {
 	// CI uses to detect drift between generator and repo.
 	SkippedConflicts []string
 	Aborted          bool
+
+	// undo journals every executed write so post-write validation (e.g.
+	// a helm lint gate) can revert cleanly instead of leaving a broken
+	// artefact behind.
+	root string
+	undo []undoEntry
+}
+
+type undoEntry struct {
+	path    string // repo-relative
+	existed bool
+	prev    []byte
+}
+
+// Rollback reverts writes recorded in this Result, newest first. With
+// prefixes, only paths equal to or under one of them are reverted (so a
+// caller can undo a single chart dir); with none, everything is.
+// Created files are removed and their now-empty parent directories
+// pruned up to (never including) the plan root. Returns the reverted
+// paths.
+func (r *Result) Rollback(prefixes ...string) ([]string, error) {
+	var reverted []string
+	for i := len(r.undo) - 1; i >= 0; i-- {
+		e := r.undo[i]
+		if !pathUnderAny(e.path, prefixes) {
+			continue
+		}
+		target := filepath.Join(r.root, filepath.FromSlash(e.path))
+		if e.existed {
+			if err := os.WriteFile(target, e.prev, 0o644); err != nil {
+				return reverted, fmt.Errorf("rollback %s: %w", e.path, err)
+			}
+		} else {
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return reverted, fmt.Errorf("rollback %s: %w", e.path, err)
+			}
+			pruneEmptyDirs(r.root, filepath.Dir(target))
+		}
+		reverted = append(reverted, e.path)
+	}
+	return reverted, nil
+}
+
+func pathUnderAny(path string, prefixes []string) bool {
+	if len(prefixes) == 0 {
+		return true
+	}
+	for _, p := range prefixes {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneEmptyDirs removes now-empty directories from dir upward, stopping
+// at the plan root or the first non-empty directory. Best-effort.
+func pruneEmptyDirs(root, dir string) {
+	root = filepath.Clean(root)
+	for {
+		dir = filepath.Clean(dir)
+		if dir == root || len(dir) <= len(root) {
+			return
+		}
+		if err := os.Remove(dir); err != nil {
+			return // non-empty or gone — either way, stop
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // Exit codes for callers that surface Result as a process status.
@@ -369,9 +438,10 @@ func planAppend(root string, op Op) PlannedOp {
 
 // Apply executes the plan. Conflicts are resolved by opts.Force, then
 // opts.Resolve, then default-skip. Aborting leaves remaining ops
-// untouched and marks the result aborted.
+// untouched and marks the result aborted. Every executed write is
+// journalled so Result.Rollback can revert it.
 func Apply(plan *Plan, opts Options) (*Result, error) {
-	res := &Result{}
+	res := &Result{root: plan.Root}
 	skipAll := false
 
 	for i := range plan.Ops {
@@ -397,12 +467,38 @@ func Apply(plan *Plan, opts Options) (*Result, error) {
 			continue
 		}
 
+		undo, snapErr := snapshotForUndo(plan.Root, op)
+		if snapErr != nil {
+			return res, snapErr
+		}
 		if err := execute(plan.Root, op); err != nil {
 			return res, err
+		}
+		if undo != nil {
+			res.undo = append(res.undo, *undo)
 		}
 		record(res, op)
 	}
 	return res, nil
+}
+
+// snapshotForUndo captures a file's pre-write state for decisions that
+// mutate disk. Skip/unchanged decisions journal nothing.
+func snapshotForUndo(root string, op *PlannedOp) (*undoEntry, error) {
+	switch op.Decision {
+	case DecisionCreate, DecisionRegenerate, DecisionOverwrite, DecisionAppend:
+	default:
+		return nil, nil
+	}
+	target := filepath.Join(root, filepath.FromSlash(op.Path))
+	prev, err := os.ReadFile(target)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("snapshot %s before write: %w", op.Path, err)
+		}
+		return &undoEntry{path: op.Path, existed: false}, nil
+	}
+	return &undoEntry{path: op.Path, existed: true, prev: prev}, nil
 }
 
 func resolveConflict(root string, op *PlannedOp, opts Options, skipAll *bool, res *Result) {
