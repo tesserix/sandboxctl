@@ -957,8 +957,14 @@ start_stopped_cluster() {
 }
 
 require_running_cluster() {
+  # The API answering is the strongest possible proof the cluster is up.
+  # Check it FIRST so a container-listing hiccup (runtime API blip,
+  # kind/runtime CLI drift — seen in the wild when podman 6 broke kind's
+  # cluster listing mid-`up`) can never fail a command against a
+  # demonstrably healthy cluster.
+  cluster_api_reachable && return 0
   cluster_registered    || die "no cluster named '$CLUSTER_NAME' — run 'sandboxctl up' first"
-  cluster_api_reachable || die "cluster '$CLUSTER_NAME' is stopped — run 'sandboxctl up' to start it"
+  die "cluster '$CLUSTER_NAME' is stopped — run 'sandboxctl up' to start it"
 }
 
 # ============================================================================
