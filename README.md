@@ -79,6 +79,7 @@ secrets template) from what it detects in your repo — see
 | `sandboxctl bootstrap` | `up` (if needed) + `deploy` in one shot |
 | `sandboxctl status` / `tui` | cluster + workload status, URLs |
 | `sandboxctl versions` | component doctor: pinned (chart→app) vs latest vs installed, with compatibility floors |
+| `sandboxctl doctor` | validate everything — host tools, runtime, ports, env hazards, cluster + component health, Mac plumbing — with the exact fix per failure |
 | `sandboxctl creds` | Argo CD + Kargo URLs and admin credentials |
 | `sandboxctl kubeconfig` | path of the sandbox-owned kubeconfig; `--export` for `eval`, `--merge` to opt-in merge into `~/.kube/config` |
 | `sandboxctl undeploy` / `down` / `purge` | remove an app / the cluster / everything |
@@ -898,6 +899,7 @@ secrets:
 ## Troubleshooting
 
 ```sh
+sandboxctl doctor                         # validate EVERYTHING, with fixes
 sandboxctl status                         # is everything running?
 sandboxctl validate                       # do the URLs answer?
 tail -f ~/.sandboxctl/portfwd.log         # port-forward output

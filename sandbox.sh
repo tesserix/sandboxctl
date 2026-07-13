@@ -420,8 +420,8 @@ with_spinner() {
 # where every Certificate write gets connection-refused. A server-side
 # dry-run Certificate exercises the exact call path consumers fail on.
 wait_for_cert_manager_webhook() {
-  local i
-  for ((i=1; i<=40; i++)); do
+  local max="${1:-40}" i
+  for ((i=1; i<=max; i++)); do
     if kc apply --dry-run=server -f - >/dev/null 2>&1 <<EOF
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -3544,6 +3544,149 @@ workload_summary() {
   printf '  %-10s %s/%s pods ready\n' "$label:" "$ready" "$total"
 }
 
+# cmd_doctor — validate the whole stack, wherever it's run: host tools,
+# runtime, ports, ambient-environment hazards (reported as detected &
+# neutralized, since the sandbox isolates itself from them), the
+# sandbox kubeconfig, cluster/API, every core component's rollout, the
+# cert-manager webhook, and the Mac-side plumbing (port-forward, hosts,
+# CA trust). One ✓/!/✗ line per check with the exact fix. Exit 1 when
+# anything fails, so it's scriptable.
+DOCTOR_PASS=0; DOCTOR_WARN=0; DOCTOR_FAIL=0
+_doc() { # ok|warn|fail  <name>  <detail>
+  local kind="$1" name="$2" detail="${3:-}"
+  case "$kind" in
+    ok)   printf '  \033[1;32m✓\033[0m %-34s %s\n' "$name" "$detail"; DOCTOR_PASS=$((DOCTOR_PASS+1)) ;;
+    warn) printf '  \033[1;33m!\033[0m %-34s %s\n' "$name" "$detail"; DOCTOR_WARN=$((DOCTOR_WARN+1)) ;;
+    fail) printf '  \033[1;31m✗\033[0m %-34s %s\n' "$name" "$detail"; DOCTOR_FAIL=$((DOCTOR_FAIL+1)) ;;
+  esac
+}
+
+cmd_doctor() {
+  echo
+  log "host"
+  local line name installed floor action
+  while IFS=' ' read -r name installed floor action; do
+    [[ -n "$name" ]] || continue
+    case "$action" in
+      ok)      _doc ok   "$name" "$installed (floor ≥ $floor)" ;;
+      install) _doc fail "$name" "missing — 'sandboxctl up' auto-installs it (or: brew install $name)" ;;
+      upgrade) _doc fail "$name" "$installed below floor $floor — 'sandboxctl up' auto-upgrades it" ;;
+      *)       _doc warn "$name" "version unparseable — left untouched" ;;
+    esac
+  done < <(command -v sandboxctl >/dev/null 2>&1 && sandboxctl _tool-check 2>/dev/null || true)
+  if [[ -n "${KUBECONFIG:-}" ]]; then
+    _doc ok "ambient KUBECONFIG" "set ($KUBECONFIG) — ignored by design; sandbox pins its own"
+  else
+    _doc ok "ambient KUBECONFIG" "not set"
+  fi
+  if grep -qs '"credsStore"' "$HOME/.docker/config.json" 2>/dev/null; then
+    _doc ok "docker credential store" "present — isolated by design (HELM_REGISTRY_CONFIG=${HELM_REGISTRY_CONFIG:-sandbox-owned})"
+  else
+    _doc ok "docker credential store" "none"
+  fi
+
+  echo
+  log "runtime + ports"
+  if "$SANDBOX_RUNTIME" info >/dev/null 2>&1; then
+    _doc ok "$SANDBOX_RUNTIME" "reachable"
+  else
+    _doc fail "$SANDBOX_RUNTIME" "not reachable — 'sandboxctl setup-podman' (or start Docker)"
+  fi
+  local port pid
+  for port in "$SANDBOX_HTTP_PORT" "$SANDBOX_HTTPS_PORT" "$SANDBOX_REGISTRY_PORT"; do
+    pid="$(port_listener_pid "$port")"
+    if [[ -z "$pid" ]]; then
+      _doc ok "port :$port" "free (bound by the sandbox while it runs)"
+    elif port_listener_is_ours "$pid" 2>/dev/null; then
+      _doc ok "port :$port" "owned by the sandbox port-forward (pid $pid)"
+    elif "$SANDBOX_RUNTIME" ps --format '{{.Names}}' 2>/dev/null | grep -q "sandboxctl-registry-proxy" && [[ "$port" == "$SANDBOX_REGISTRY_PORT" ]]; then
+      _doc ok "port :$port" "owned by the sandbox registry proxy"
+    else
+      _doc fail "port :$port" "held by pid $pid — free it or override SANDBOX_*_PORT"
+    fi
+  done
+
+  echo
+  log "cluster"
+  if ! cluster_registered && ! cluster_api_reachable; then
+    _doc fail "cluster '$CLUSTER_NAME'" "not found — run 'sandboxctl up'"
+    _doctor_summary; return $?
+  fi
+  if cluster_api_reachable; then
+    _doc ok "API server" "answering"
+  else
+    _doc fail "API server" "cluster exists but is not answering — run 'sandboxctl up' to start it"
+    _doctor_summary; return $?
+  fi
+  if [[ -s "$SANDBOX_KUBECONFIG" ]]; then
+    _doc ok "sandbox kubeconfig" "$SANDBOX_KUBECONFIG"
+  else
+    _doc fail "sandbox kubeconfig" "missing — run 'sandboxctl up' (writes it)"
+  fi
+  local notready
+  notready="$(kc get nodes --no-headers 2>/dev/null | awk '$2!="Ready"{print $1}' | tr '\n' ' ')"
+  if [[ -z "$notready" ]]; then
+    _doc ok "nodes" "$(kc get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ') Ready"
+  else
+    _doc fail "nodes" "not Ready: ${notready}"
+  fi
+
+  local ns dep ready want
+  for ns in "$ARGOCD_NS" "$KARGO_NS" "$CERT_MANAGER_NS" "$GITEA_NS" "$REFLECTOR_NS" "$RELOADER_NS" "$ISTIO_NS" "$ISTIO_INGRESS_NS" "$REGISTRY_NS"; do
+    [[ -n "$ns" ]] || continue
+    kc get namespace "$ns" >/dev/null 2>&1 || continue
+    while IFS='|' read -r dep ready want; do
+      [[ -n "$dep" ]] || continue
+      if [[ "$ready" == "$want" && "$want" != "0" ]]; then
+        _doc ok "$ns/$dep" "$ready/$want ready"
+      else
+        _doc fail "$ns/$dep" "$ready/$want ready — 'kc -n $ns describe deploy $dep' / 'sandboxctl restart'"
+      fi
+    done < <(kc -n "$ns" get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.readyReplicas}{"|"}{.spec.replicas}{"\n"}{end}' 2>/dev/null | sed 's/||/|0|/')
+  done
+
+  if wait_for_cert_manager_webhook 1 >/dev/null 2>&1; then
+    _doc ok "cert-manager webhook" "answering (server-side dry-run Certificate)"
+  else
+    _doc fail "cert-manager webhook" "not answering — installs that create Certificates will retry, but check 'kc -n $CERT_MANAGER_NS get pods'"
+  fi
+  if curl -sf --max-time 3 "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/" >/dev/null 2>&1; then
+    _doc ok "registry (Mac side)" "http://localhost:${SANDBOX_REGISTRY_PORT}/v2/ answering"
+  else
+    _doc warn "registry (Mac side)" "not answering — 'sandboxctl restart' reinstalls the proxy"
+  fi
+
+  echo
+  log "mac plumbing"
+  if portfwd_running; then
+    _doc ok "port-forward LaunchAgent" "running"
+  else
+    _doc fail "port-forward LaunchAgent" "not running — 'sandboxctl restart' reinstalls it"
+  fi
+  if grep -qsF "$SANDBOX_HOSTS_MARKER" /etc/hosts; then
+    _doc ok "/etc/hosts" "sandbox entries present"
+  else
+    _doc warn "/etc/hosts" "no sandbox entries — added on 'up'/'deploy' (sudo prompt)"
+  fi
+  if ca_already_trusted 2>/dev/null; then
+    _doc ok "root CA trust" "trusted in the System keychain"
+  else
+    _doc warn "root CA trust" "not trusted (browser warnings) — 'sandboxctl trust-ca'"
+  fi
+
+  _doctor_summary
+}
+
+_doctor_summary() {
+  echo
+  if (( DOCTOR_FAIL > 0 )); then
+    printf '  \033[1;31m%d failed\033[0m, %d warnings, %d passed\n' "$DOCTOR_FAIL" "$DOCTOR_WARN" "$DOCTOR_PASS"
+    return 1
+  fi
+  printf '  \033[1;32mall good\033[0m — %d passed, %d warnings\n' "$DOCTOR_PASS" "$DOCTOR_WARN"
+  return 0
+}
+
 cmd_status() {
   if ! cluster_registered; then echo "cluster:  not present"; return; fi
   if ! cluster_api_reachable; then
@@ -6282,6 +6425,7 @@ main() {
     up)                 shift; cmd_up "$@" ;;
     _onboard-check)     shift; _up_onboarding_check "${1:-$PWD}" ;;
     kubeconfig)         shift; cmd_kubeconfig "$@" ;;
+    doctor)             cmd_doctor ;;
     _ensure-tools)      ensure_tools ;;
     down)               cmd_down ;;
     purge)              cmd_purge ;;

@@ -42,6 +42,7 @@ var commands = []command{
 	{"status", "cluster + workload status + URLs"},
 	{"restart", "re-apply installers, keep cluster + state (--rebuild for full wipe)"},
 	{"validate", "curl each URL from the Mac and print HTTP codes"},
+	{"doctor", "validate everything: host tools + floors, runtime, ports, ambient-env hazards (neutralized by design), cluster + component health, webhook, Mac plumbing — with the exact fix per failure (exit 1 on failures)"},
 	{"creds", "print login details (URLs + admin creds) for Argo CD + Kargo"},
 	{"kubeconfig", "print the sandbox kubeconfig path (--export for an eval-able line; --merge to opt-in merge into ~/.kube/config without changing your current-context)"},
 	{"argocd-ui", "print Argo CD URL + admin creds"},
