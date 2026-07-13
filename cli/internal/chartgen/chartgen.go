@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"fmt"
 	"path"
+	"sort"
+	"strings"
 	"text/template"
 
 	"github.com/tesserix/sandboxctl/cli/internal/genwrite"
@@ -57,6 +59,11 @@ type Result struct {
 	// ChartDirs maps app name → repo-relative chart dir that was (or
 	// would be) generated. Consumed by callers wiring deploy hints.
 	ChartDirs map[string]string
+	// UmbrellaDir is the monorepo umbrella chart dir ("k8s/chart"),
+	// empty when none was generated. Its files are part of Ops; callers
+	// use this to give the umbrella its own lint treatment (it needs
+	// `helm dependency build` before it lints).
+	UmbrellaDir string
 }
 
 // Ops plans one chart per eligible app. Eligibility: the app must have
@@ -96,7 +103,102 @@ func Ops(m *reposcan.Model, cfg Config) *Result {
 		}
 		res.Ops = append(res.Ops, ops...)
 	}
+
+	addUmbrella(m, cfg, res)
 	return res
+}
+
+// addUmbrella emits the monorepo umbrella chart at k8s/chart: one chart
+// whose file:// dependencies pull in every per-app chart under
+// k8s/charts/, each behind an <app>.enabled condition. Only when 2+
+// apps are charted (there is nothing to "connect" otherwise), and never
+// when k8s/chart already exists as a real single-app chart — the
+// analyzer reports that as an app's Existing.Chart, and hijacking the
+// recommended single-app location would change what deploy runs.
+func addUmbrella(m *reposcan.Model, cfg Config, res *Result) {
+	type dep struct {
+		Name string
+		Port int
+	}
+	var apps []dep
+	for _, app := range m.Apps {
+		dir := res.ChartDirs[app.Name]
+		if dir == "" && strings.HasPrefix(app.Existing.Chart, "k8s/charts/") {
+			dir = app.Existing.Chart
+		}
+		if strings.HasPrefix(dir, "k8s/charts/") {
+			apps = append(apps, dep{Name: app.Name, Port: app.Port})
+		}
+	}
+	if len(apps) < 2 {
+		return
+	}
+	for _, app := range m.Apps {
+		if app.Existing.Chart == "k8s/chart" {
+			res.Skips = append(res.Skips, Skip{App: "umbrella",
+				Reason: "k8s/chart already holds a chart — not generating the umbrella there"})
+			return
+		}
+	}
+	sort.Slice(apps, func(i, j int) bool { return apps[i].Name < apps[j].Name })
+
+	name := slugify(path.Base(m.Root))
+	if name == "" {
+		name = "stack"
+	}
+	ctx := map[string]any{
+		"Name": name, "Dir": "k8s/chart", "Apps": apps,
+		"Registry": cfg.Registry, "Domain": cfg.Domain, "Gateway": cfg.GatewayRef,
+	}
+	reason := fmt.Sprintf("umbrella chart connecting %d app charts (one 'helm install' for the stack)", len(apps))
+	files := []struct{ rel, tmpl string }{
+		{"k8s/chart/Chart.yaml", umbrellaChartYamlTmpl},
+		{"k8s/chart/values.yaml", umbrellaValuesTmpl},
+		{"k8s/chart/values-sandbox.yaml", umbrellaValuesSandboxTmpl},
+	}
+	for _, f := range files {
+		body, err := renderAny(f.rel, f.tmpl, ctx)
+		if err != nil {
+			res.Skips = append(res.Skips, Skip{App: "umbrella", Reason: err.Error()})
+			return
+		}
+		res.Ops = append(res.Ops, genwrite.Op{Path: f.rel, Body: body, Generator: Generator, Reason: reason})
+	}
+	// `helm dependency build` vendors the subcharts as tgz files —
+	// derived artifacts that don't belong in git.
+	res.Ops = append(res.Ops, genwrite.Op{
+		Path: ".gitignore", Append: []string{"k8s/chart/charts/"},
+		Reason: "ignore the umbrella's vendored dependencies",
+	})
+	res.UmbrellaDir = "k8s/chart"
+}
+
+func renderAny(name, tmpl string, ctx any) ([]byte, error) {
+	t, err := template.New(name).Delims("[[", "]]").Parse(tmpl)
+	if err != nil {
+		return nil, fmt.Errorf("render %s: %w", name, err)
+	}
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, ctx); err != nil {
+		return nil, fmt.Errorf("render %s: %w", name, err)
+	}
+	return buf.Bytes(), nil
+}
+
+// slugify matches the analyzer's naming so the umbrella lines up with
+// app/image names.
+func slugify(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // chartContext is the data substituted into the chart templates.

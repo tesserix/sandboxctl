@@ -213,6 +213,13 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 		} else {
 			fmt.Println()
 			lintFailed = lintWrittenCharts(gen.ChartDirs, res, os.Stdout, helmLintRunner(helmPath, model.Root))
+			// The umbrella needs its dependencies vendored before it
+			// lints — done in a temp copy so the repo never sees the
+			// derived charts/ dir. Same contract as the per-app gate:
+			// a failure rolls the umbrella's files back.
+			if failed := lintUmbrella(helmPath, model.Root, gen.UmbrellaDir, res, os.Stdout); failed != "" {
+				lintFailed = append(lintFailed, failed)
+			}
 		}
 	}
 
@@ -265,6 +272,63 @@ func lintWrittenCharts(chartDirs map[string]string, res *genwrite.Result, out io
 		failed = append(failed, dir)
 	}
 	return failed
+}
+
+// lintUmbrella validates the umbrella chart when this run wrote it:
+// copy k8s/ to a temp dir (the file:// dependencies resolve inside the
+// copy), `helm dependency build`, then lint — so the gate proves the
+// whole-stack install works without ever writing derived artifacts
+// into the user's repo. Returns the dir on failure (rolled back).
+func lintUmbrella(helmPath, root, dir string, res *genwrite.Result, out io.Writer) string {
+	if dir == "" {
+		return ""
+	}
+	written := false
+	for _, p := range append(append([]string{}, res.Created...), res.Regenerated...) {
+		if strings.HasPrefix(p, dir+"/") {
+			written = true
+			break
+		}
+	}
+	if !written {
+		return ""
+	}
+
+	fail := func(step, output string) string {
+		fmt.Fprintf(out, "  helm %s FAILED  %s (umbrella)\n%s\n", step, dir, indent(output, "    "))
+		if reverted, err := res.Rollback(dir); err != nil {
+			fmt.Fprintf(out, "  rollback of %s incomplete: %v — inspect before committing\n", dir, err)
+		} else {
+			fmt.Fprintf(out, "  rolled back %d file(s) under %s\n", len(reverted), dir)
+		}
+		return dir
+	}
+
+	tmp, err := os.MkdirTemp("", "sandboxctl-umbrella-*")
+	if err != nil {
+		fmt.Fprintf(out, "  umbrella lint skipped: %v\n", err)
+		return ""
+	}
+	defer os.RemoveAll(tmp)
+	if outp, err := exec.Command("cp", "-R", filepath.Join(root, "k8s"), tmp).CombinedOutput(); err != nil {
+		return fail("copy", string(outp))
+	}
+	chartPath := filepath.Join(tmp, "k8s", "chart")
+	// Hermetic helm: file:// dependencies need neither the user's repo
+	// config nor their cache — and a stale entry in either (seen in the
+	// wild) would fail a build that has nothing to do with them.
+	depBuild := exec.Command(helmPath, "dependency", "build", "--skip-refresh", chartPath)
+	depBuild.Env = append(os.Environ(),
+		"HELM_REPOSITORY_CONFIG="+filepath.Join(tmp, "repositories.yaml"),
+		"HELM_REPOSITORY_CACHE="+filepath.Join(tmp, "repo-cache"))
+	if outp, err := depBuild.CombinedOutput(); err != nil {
+		return fail("dependency build", string(outp))
+	}
+	if outp, err := exec.Command(helmPath, "lint", chartPath).CombinedOutput(); err != nil {
+		return fail("lint", string(outp))
+	}
+	fmt.Fprintf(out, "  helm lint ok  %s (umbrella: dependency build + lint)\n", dir)
+	return ""
 }
 
 func helmLintRunner(helmPath, root string) func(dir string) (string, error) {

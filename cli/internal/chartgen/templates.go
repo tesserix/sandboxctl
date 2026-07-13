@@ -235,6 +235,61 @@ spec:
 {{- end }}
 `
 
+// Umbrella chart templates (monorepos with 2+ charted apps). The
+// umbrella is the "install the whole stack with one helm command"
+// artifact; the sandbox itself keeps deploying per-app charts with
+// per-app pipelines and URLs, and recognizes the umbrella by its
+// annotation so it is never double-deployed.
+const umbrellaChartYamlTmpl = `# Umbrella chart — installs every app in this repo together:
+#
+#   helm dependency build --skip-refresh [[.Dir]]
+#   helm install [[.Name]] [[.Dir]] -f [[.Dir]]/values-sandbox.yaml
+#
+# sandboxctl's own deploy uses the per-app charts + Kargo pipelines and
+# skips this chart (see the annotation below); the umbrella exists so
+# the whole stack is one 'helm install' anywhere else.
+apiVersion: v2
+name: [[.Name]]
+description: Umbrella chart installing every app in this repo
+type: application
+version: 0.1.0
+annotations:
+  sandboxctl.io/umbrella: "true"
+dependencies:
+[[- range .Apps]]
+  - name: [[.Name]]
+    version: "0.1.0"
+    repository: file://../charts/[[.Name]]
+    condition: [[.Name]].enabled
+[[- end]]
+`
+
+const umbrellaValuesTmpl = `# Umbrella values: toggle whole apps on/off; anything else nests under
+# the app's name and flows into that subchart (e.g. api.replicaCount).
+[[- range .Apps]]
+[[.Name]]:
+  enabled: true
+[[- end]]
+`
+
+const umbrellaValuesSandboxTmpl = `# Sandbox flavour for standalone umbrella installs. (sandboxctl's own
+# deploy uses the per-app charts + pipelines instead of this chart.)
+[[- range .Apps]]
+[[.Name]]:
+  image:
+    repository: [[$.Registry]]/[[.Name]]
+    tag: latest
+    digest: ""
+[[- if .Port]]
+  sandbox:
+    virtualService:
+      enabled: true
+      host: [[.Name]].[[$.Domain]]
+      gateway: [[$.Gateway]]
+[[- end]]
+[[- end]]
+`
+
 const serviceAccountTmpl = `{{- if .Values.serviceAccount.create }}
 apiVersion: v1
 kind: ServiceAccount

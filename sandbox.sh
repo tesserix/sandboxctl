@@ -4972,8 +4972,21 @@ EOF
     # deploy/ holding misc infra (operator CRDs, ad-hoc YAML), and Argo
     # would happily try to apply all of it as the app's manifests.
     if [[ -f "${target}/k8s/chart/Chart.yaml" ]]; then
-      log "found chart at ${target}/k8s/chart (the recommended layout)"
-      entries="$(_emit_explicit_chart_entry "$target" "k8s/chart" "" "")" || return 1
+      if grep -q 'sandboxctl.io/umbrella' "${target}/k8s/chart/Chart.yaml" 2>/dev/null; then
+        # The umbrella is the standalone 'helm install everything'
+        # artifact — the sandbox keeps per-app charts, pipelines, and
+        # URLs, so deploy skips it and uses the app charts it connects.
+        log "k8s/chart is the umbrella chart — deploying the per-app charts it connects"
+        local umbrella_discovered=""
+        umbrella_discovered="$(discover_app_charts "$target" 2>/dev/null || true)"
+        entries="$(printf '%s\n' "$umbrella_discovered" \
+          | awk -F'\t' -v skip="${target}/k8s/chart" 'NF>=2 && $1=="helm" && $3!=skip')"
+        [[ -n "$entries" ]] \
+          || die "umbrella chart found but no per-app charts under ${target}/k8s/charts — run 'sandboxctl scaffold'"
+      else
+        log "found chart at ${target}/k8s/chart (the recommended layout)"
+        entries="$(_emit_explicit_chart_entry "$target" "k8s/chart" "" "")" || return 1
+      fi
     else
       local discovered=""
       discovered="$(discover_app_charts "$target" 2>/dev/null || true)"
