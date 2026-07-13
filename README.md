@@ -76,6 +76,7 @@ secrets template) from what it detects in your repo — see
 | `sandboxctl scaffold` | analyze the repo (monorepo-aware) and generate Helm chart(s), sandbox values, and the secrets template — skips what exists, asks before overwriting your edits |
 | `sandboxctl build` | build + push the repo's images to the in-cluster registry |
 | `sandboxctl deploy` | apply secrets, push chart(s) to Gitea, create Argo CD Applications, wire `https://<app>.sandbox.app` URLs (`--umbrella`: whole monorepo stack as one app) |
+| `sandboxctl install` | helm-install the chart stack directly — umbrella-aware, hermetic dependency build, secrets + URLs handled, no Gitea/Argo in the path |
 | `sandboxctl bootstrap` | `up` (if needed) + `deploy` in one shot |
 | `sandboxctl status` / `tui` | cluster + workload status, URLs |
 | `sandboxctl versions` | component doctor: pinned (chart→app) vs latest vs installed, with compatibility floors |
@@ -223,9 +224,14 @@ runs the whole stack as **one Argo CD Application** (the entire `k8s/`
 tree is pushed to Gitea so the `file://../charts/<app>` dependencies
 resolve inside Argo's checkout, the Application points at its `chart/`
 subdirectory, every app lands in one namespace, and each still gets its
-own `https://<app>.…` URL via the chart-carried VirtualServices); or
-standalone anywhere with `helm dependency build --skip-refresh
-k8s/chart && helm install stack k8s/chart`. The default `deploy` (no
+own `https://<app>.…` URL via the chart-carried VirtualServices);
+`sandboxctl install` runs the same stack via plain helm with no GitOps
+in the path (hermetic dependency build so a stale helm repo index on
+your machine can't break the `file://` deps, secrets applied before the
+pods start, stuck first-installs auto-cleared, `/etc/hosts` + probe per
+URL, `--dry-run` to see the plan); or standalone anywhere with `helm
+dependency build --skip-refresh k8s/chart && helm install stack
+k8s/chart`. The default `deploy` (no
 flag) recognizes the umbrella by annotation, skips it, and keeps
 deploying per-app — pipelines and URLs stay per-app. A
 `values-sandbox.yaml` is emitted so `deploy` picks the chart up with
@@ -246,7 +252,8 @@ create). Exit codes: `0` clean, `1` lint-gate failure or abort, `3`
 conflicts were kept (useful in CI to detect drift).
 
 After scaffolding: `sandboxctl deploy` (or `bootstrap`) builds the
-images, pushes the charts to Gitea, and wires the URLs.
+images, pushes the charts to Gitea, and wires the URLs — or
+`sandboxctl install` for the same stack via plain helm, no GitOps.
 
 ### The promotion pipeline (Argo CD + Kargo)
 

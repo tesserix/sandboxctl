@@ -5317,6 +5317,232 @@ _print_deploy_summary() {
   echo "  sandboxctl undeploy --name <app> --env ${env}    # tear one down"
 }
 
+# cmd_install — helm-install the repo's chart stack straight into the
+# sandbox, no Gitea/Argo in the path. On monorepos the chart at
+# k8s/chart is the scaffold umbrella, so one install brings up every
+# dependent app chart together; on single-app repos it is the app
+# chart itself. Everything a raw `helm install` would make the user do
+# by hand is handled: hermetic dependency build (the user's helm repo
+# config is never consulted — a stale index there must not break
+# file:// deps), image builds, secrets into the namespace BEFORE pods
+# start (envFrom would otherwise CreateContainerConfigError), stuck
+# first-install recovery, and /etc/hosts + probe for every
+# VirtualService host the charts claim.
+cmd_install() {
+  local positional="" repo_flag="" values_override="" ns_override="" name_override=""
+  local do_build=1 dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)      repo_flag="$2"; shift 2 ;;
+      --values)    values_override="$2"; shift 2 ;;
+      --namespace|-n) ns_override="$2"; shift 2 ;;
+      --name)      name_override="$2"; shift 2 ;;
+      --no-build)  do_build=0; shift ;;
+      --dry-run)   dry_run=1; shift ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl install [path] [--repo <dir>] [--values <file>]
+                   [--namespace <ns>] [--name <release>]
+                   [--no-build] [--dry-run]
+
+Installs the repo's chart stack directly with helm — no Gitea push, no
+Argo CD Application. On a monorepo the chart at k8s/chart is the
+scaffold-generated umbrella, so ONE install brings up every dependent
+app chart (drop one with --set <app>.enabled=false via a values file);
+on a single-app repo it is the app chart itself.
+
+What it handles for you, in order:
+  1. helm dependency build, hermetically — your helm repo config and
+     cache are never consulted, so a stale repo index on your machine
+     cannot break the umbrella's file://../charts/<app> dependencies.
+     A stale Chart.lock ("out of sync") is removed and rebuilt.
+  2. Image builds for every Dockerfile in the repo (skip: --no-build).
+  3. k8s/secrets.yaml applied into the target namespace BEFORE the
+     charts install (fills from the cluster / prompts on first run) —
+     apps reference their Secret via envFrom and would crash-loop
+     without it.
+  4. helm upgrade --install --wait against the SANDBOX cluster (the
+     pinned kubeconfig — never your ambient kubectl context). A
+     previous install that never went healthy is uninstalled first so
+     re-runs always work.
+  5. /etc/hosts + in-cluster probe for every VirtualService host the
+     charts claim (https://<app>.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}).
+
+Defaults:
+  release    the chart's "name:" (override: --name)
+  namespace  the release name (override: --namespace)
+  values     first of sandbox-values.yaml / values-sandbox.yaml /
+             sandbox.yaml / values-local.yaml in the chart dir
+             (override: --values <file>, relative to the chart dir)
+
+Modes:
+  --dry-run   dependency build + render only; prints what would be
+              installed (resource counts + URLs). No cluster needed.
+  --no-build  skip the image-build step (registry already has images).
+
+install vs deploy: 'deploy' is the GitOps path (chart pushed to Gitea,
+Argo CD owns sync, Kargo pipeline per app; --umbrella for one app of
+the whole stack). 'install' is plain helm — fastest way to run the
+whole stack, nothing watching the chart afterwards. Both can coexist
+only if you keep them in different namespaces; prefer one.
+
+To remove an installed stack:
+  KUBECONFIG=${SANDBOX_KUBECONFIG} helm uninstall <release> -n <ns>
+
+This command targets the sandbox cluster only. To install the umbrella
+on any other cluster, use the helm commands in its Chart.yaml header.
+EOF
+        return 0
+        ;;
+      -*) die "unknown flag: $1" ;;
+      *)
+        if [[ -z "$positional" ]]; then positional="$1"; shift
+        else die "unexpected argument: $1"
+        fi ;;
+    esac
+  done
+
+  local target
+  target="$(_resolve_product_repo "$repo_flag" "$positional" install)" || return 1
+  local chart_dir="${target}/k8s/chart"
+  [[ -f "${chart_dir}/Chart.yaml" ]] \
+    || die "no chart at ${chart_dir} — run 'sandboxctl scaffold ${target}' first (monorepos get an umbrella chart there connecting every app; single-app repos get the app chart)"
+
+  local release
+  release="$(sed -nE 's/^name:[[:space:]]*"?([^" ]+).*/\1/p' "${chart_dir}/Chart.yaml" | head -n1)"
+  release="$(slugify "${name_override:-${release:-}}")"
+  [[ -n "$release" ]] || die "chart at ${chart_dir} has no readable name"
+  local namespace="${ns_override:-$release}"
+
+  local values_file="$values_override"
+  [[ -n "$values_file" ]] || values_file="$(_pick_sandbox_values_file "$chart_dir")"
+  if [[ -n "$values_file" && ! -f "${chart_dir}/${values_file}" ]]; then
+    die "values file not found: ${chart_dir}/${values_file}"
+  fi
+  local -a helm_values=()
+  [[ -n "$values_file" ]] && helm_values=(-f "${chart_dir}/${values_file}")
+
+  _repo_has_umbrella "$target" \
+    && log "k8s/chart is the umbrella — installing every dependent app chart as one release" \
+    || log "installing chart ${release} from ${chart_dir}"
+  [[ -n "$values_file" ]] && log "using values file: ${values_file}"
+
+  _install_build_chart_deps "$chart_dir"
+  # The vendored deps + lock land in the user's repo (standard helm
+  # behaviour) — make sure the tgz dir never gets committed.
+  grep -qE '^dependencies:' "${chart_dir}/Chart.yaml" \
+    && ensure_gitignore_entry "$target" "k8s/chart/charts/"
+
+  if (( dry_run )); then
+    local rendered
+    rendered="$(mktemp -t sandboxctl-install-render.XXXXXX)"
+    # shellcheck disable=SC2064  # intentional now-expansion
+    trap "rm -f '$rendered'" RETURN
+    helm template "$release" "$chart_dir" --namespace "$namespace" \
+      ${helm_values[@]+"${helm_values[@]}"} > "$rendered" \
+      || die "helm template failed — the chart does not render with these values"
+    log "dry-run: ${release} would install into namespace ${namespace}:"
+    awk '/^kind:/{c[$2]++} END{for (k in c) printf "  %-20s x%d\n", k, c[k]}' "$rendered" | sort
+    local h
+    while IFS= read -r h; do
+      [[ -n "$h" ]] || continue
+      printf '  url: https://%s:%s\n' "${h//\"/}" "${SANDBOX_HTTPS_PORT}"
+    done < <(awk '/kind: VirtualService/{vs=1} vs && /^  hosts:/{getline; print $2; vs=0}' "$rendered")
+    log "nothing installed (--dry-run) — re-run without it to install"
+    return 0
+  fi
+
+  require_running_cluster
+
+  if (( do_build )); then
+    if [[ -f "${target}/sandboxctl.yaml" || -f "${target}/sandboxctl.yml" ]] \
+        || find "$target" -type f -name Dockerfile -not -path '*/.git/*' \
+             -not -path '*/node_modules/*' -not -path '*/vendor/*' \
+             -not -path '*/dist/*' -print -quit 2>/dev/null | grep -q .; then
+      log "running 'sandboxctl build ${target}' first (use --no-build to skip)"
+      cmd_build "$target"
+    else
+      log "no Dockerfiles or sandboxctl.yaml under ${target} — skipping build step"
+    fi
+  fi
+
+  ensure_secrets_for_namespace "$target" "$namespace"
+
+  # A first install that never reached deployed blocks every future
+  # `upgrade --install` with "has no deployed releases" — detect the
+  # stuck shape and clear it so re-running install always works.
+  local rel_status
+  rel_status="$(helmk status "$release" -n "$namespace" -o json 2>/dev/null \
+    | sed -nE 's/.*"status":"([^"]+)".*/\1/p' | head -n1)"
+  if [[ "$rel_status" == "failed" || "$rel_status" == "pending-install" ]]; then
+    if ! helmk history "$release" -n "$namespace" -o json 2>/dev/null \
+        | grep -q '"status":"deployed"'; then
+      warn "previous install of ${release} never went healthy (${rel_status}) — removing the stuck release and installing fresh"
+      helmk uninstall "$release" -n "$namespace" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  with_spinner "[${release}] helm upgrade --install into ${namespace} (up to 5m)" \
+    helmk upgrade --install "$release" "$chart_dir" \
+      --namespace "$namespace" --create-namespace \
+      ${helm_values[@]+"${helm_values[@]}"} \
+      --wait --timeout 5m \
+    || die "helm install failed — inspect with: KUBECONFIG=${SANDBOX_KUBECONFIG} helm status ${release} -n ${namespace}"
+  ok "release ${release} installed into namespace ${namespace}"
+
+  _route_umbrella_hosts "$release" "$namespace"
+
+  echo
+  echo "next:"
+  local vh
+  while IFS= read -r vh; do
+    [[ -n "$vh" ]] || continue
+    printf '  open https://%s:%s\n' "$vh" "${SANDBOX_HTTPS_PORT}"
+  done < <(kc -n "$namespace" get virtualservices \
+    -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u)
+  echo "  KUBECONFIG=${SANDBOX_KUBECONFIG} helm status ${release} -n ${namespace}"
+  echo "  KUBECONFIG=${SANDBOX_KUBECONFIG} helm uninstall ${release} -n ${namespace}    # tear it down"
+}
+
+# _install_build_chart_deps <chart_dir> — hermetic `helm dependency
+# build`: an empty temp HELM_REPOSITORY_CONFIG + temp cache so the
+# user's repo config (which helm consults even for file:// deps, and
+# whose stale indexes have broken builds live) can never interfere.
+# Recovery ladder:
+#   1. --skip-refresh          fast path; file:// deps need no network
+#   2. stale Chart.lock        "out of sync" → remove lock, retry (the
+#                              lock is a build artifact; rebuilt fresh)
+#   3. without --skip-refresh  remote https deps need their index
+#                              fetched into the temp cache
+_install_build_chart_deps() {
+  local chart_dir="$1"
+  grep -qE '^dependencies:' "${chart_dir}/Chart.yaml" || return 0
+
+  local dep_tmp
+  dep_tmp="$(mktemp -d -t sandboxctl-deps.XXXXXX)"
+  # shellcheck disable=SC2064  # intentional now-expansion
+  trap "rm -rf '$dep_tmp'" RETURN
+  printf 'apiVersion: ""\nrepositories: []\n' > "${dep_tmp}/repositories.yaml"
+  local err="${dep_tmp}/err"
+
+  _dep_build() {
+    HELM_REPOSITORY_CONFIG="${dep_tmp}/repositories.yaml" \
+    HELM_REPOSITORY_CACHE="${dep_tmp}/cache" \
+      helm dependency build "$@" "$chart_dir" >/dev/null 2>"$err"
+  }
+
+  log "building chart dependencies (hermetic — your helm repo config is not consulted)"
+  _dep_build --skip-refresh && return 0
+  if grep -qi "out of sync" "$err" && [[ -f "${chart_dir}/Chart.lock" ]]; then
+    warn "Chart.lock is out of sync with Chart.yaml — removing the stale lock and rebuilding"
+    rm -f "${chart_dir}/Chart.lock"
+    _dep_build --skip-refresh && return 0
+  fi
+  _dep_build && return 0
+  sed 's/^/  /' "$err" >&2
+  die "helm dependency build failed for ${chart_dir} (output above)"
+}
+
 # Echo "<repository>\t<tag>" for the registry image that backs chart
 # <cname>, or nothing when no built image maps to it. <cname> is the
 # (already-slugified) chart name; <manifest> is the repo's sandboxctl.yaml.
@@ -5931,7 +6157,7 @@ _route_umbrella_hosts() {
   hosts="$(kc -n "$namespace" get virtualservices \
     -o jsonpath='{range .items[*]}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null | sort -u)"
   if [[ -z "$hosts" ]]; then
-    warn "${tag} no VirtualServices found yet — Argo may still be syncing; re-run deploy to wire hosts"
+    warn "${tag} no VirtualServices found yet — the charts may still be coming up; re-run this command to wire hosts"
     return 0
   fi
   while IFS= read -r host; do
@@ -6653,6 +6879,7 @@ main() {
     build)              shift; cmd_build "$@" ;;
     images)             shift; cmd_images "$@" ;;
     deploy)             shift; cmd_deploy "$@" ;;
+    install)            shift; cmd_install "$@" ;;
     undeploy)           shift; cmd_undeploy "$@" ;;
     bootstrap)          shift; cmd_bootstrap "$@" ;;
     prune|cleanup)      shift; cmd_prune "$@" ;;
