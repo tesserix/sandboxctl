@@ -81,6 +81,25 @@ func runVersions(args []string) int {
 		rows = append(rows, r)
 	}
 
+	// Local host tools ride along in the same report: their "pin" is
+	// the tested floor, and sitting below it counts as a violation.
+	for _, t := range components.CheckTools() {
+		r := row{Component: t.Name + " (local)", Pinned: "≥ " + t.Floor, Installed: t.Installed}
+		switch t.Action {
+		case "ok":
+			r.Status = "ok"
+		case "install":
+			r.Status = "MISSING — 'sandboxctl up' auto-installs it"
+			floorViolations++
+		case "upgrade":
+			r.Status = "BELOW FLOOR " + t.Floor + " — 'sandboxctl up' auto-upgrades it"
+			floorViolations++
+		default:
+			r.Status = "version unparseable — left untouched"
+		}
+		rows = append(rows, r)
+	}
+
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -114,6 +133,21 @@ func runVersions(args []string) int {
 
 	if floorViolations > 0 {
 		return 1
+	}
+	return 0
+}
+
+// runToolCheck implements the hidden `_tool-check` consumed by
+// sandbox.sh's toolchain auto-heal. One line per tool:
+//
+//	<name> <installed|-> <floor> <ok|install|upgrade|unknown>
+func runToolCheck(_ []string) int {
+	for _, t := range components.CheckTools() {
+		installed := t.Installed
+		if installed == "" {
+			installed = "-"
+		}
+		fmt.Printf("%s %s %s %s\n", t.Name, installed, t.Floor, t.Action)
 	}
 	return 0
 }

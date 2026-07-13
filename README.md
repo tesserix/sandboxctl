@@ -662,6 +662,14 @@ the local root CA in the System keychain. Subsequent runs are silent.
   (recommended) or `docker`
 - ≈6 GiB free RAM for the kind node + cluster workloads
 
+**The toolchain heals itself.** `up` checks `kind`/`kubectl`/`helm`
+against the versions sandboxctl is tested with: a missing tool is
+brew-installed, one below the tested floor is brew-upgraded, healthy
+tools are never touched, and every action is logged. Anything
+unexpected (no brew, unparseable version) degrades to a warning — the
+run continues. Floors show up in `sandboxctl versions` as
+`<tool> (local)` rows; opt out with `SANDBOX_NO_TOOL_AUTOFIX=1`.
+
 `sandboxctl setup-podman` installs and configures podman for you (rootful,
 6 GiB memory, 60 GiB disk) if it isn't ready yet. To pick a different
 size on first run:
