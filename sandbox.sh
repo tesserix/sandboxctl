@@ -814,7 +814,15 @@ ensure_runtime() {
   die "could not select a working container runtime"
 }
 
-cluster_registered()    { kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; }
+# Do NOT use `kind get clusters` here: kind's ListClusters template
+# (`{{index .Labels "…"}}`) hard-errors on podman >= 6, where the ps
+# template's .Labels changed from map to slice (same class as
+# kubernetes-sigs/kind#3813). The runtime label query below is what the
+# rest of this script already uses and works on docker + podman 5/6 —
+# node containers count whether running or stopped. Without this, `up`
+# on podman 6 believed no cluster existed and collided with its own
+# nodes at create time.
+cluster_registered()    { cluster_node_containers 2>/dev/null | grep -q .; }
 cluster_api_reachable() { kc --request-timeout=3s cluster-info >/dev/null 2>&1; }
 cluster_node_containers() {
   "$SANDBOX_RUNTIME" ps -a --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME" --format '{{.Names}}'
@@ -1142,6 +1150,14 @@ write_pinned_kubeconfig() {
   mkdir -p "$SANDBOX_STATE_DIR"
   if ! kind_pinned get kubeconfig --name "$CLUSTER_NAME" > "${SANDBOX_KUBECONFIG}.tmp" 2>/dev/null; then
     rm -f "${SANDBOX_KUBECONFIG}.tmp"
+    # kind subcommands can fail on runtime/CLI mismatches (e.g. the
+    # podman 6 template break) even while the cluster itself is fine.
+    # A pinned kubeconfig from an earlier run still points at the same
+    # cluster endpoint + certs — reuse it rather than dying.
+    if [[ -s "$SANDBOX_KUBECONFIG" ]] && kc --request-timeout=5s cluster-info >/dev/null 2>&1; then
+      warn "kind get kubeconfig failed — reusing the existing pinned kubeconfig (cluster answers)"
+      return 0
+    fi
     die "kind get kubeconfig --name $CLUSTER_NAME failed — cluster may not be ready"
   fi
   chmod 600 "${SANDBOX_KUBECONFIG}.tmp"
