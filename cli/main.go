@@ -53,6 +53,7 @@ var commandGroups = []commandGroup{
 		{"scaffold", "repo → charts + secrets template + Kargo pipeline"},
 		{"build", "build + push the repo's images to the sandbox registry"},
 		{"deploy", "push charts to Gitea, create Argo apps, wire https URLs (--umbrella: whole stack as one app)"},
+		{"install", "helm-install the chart stack directly — umbrella-aware, no Gitea/Argo"},
 		{"bootstrap", "up (if needed) + deploy, in one command"},
 		{"undeploy", "remove an app's Argo apps, pipeline, and route (--name)"},
 	}},

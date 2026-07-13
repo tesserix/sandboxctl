@@ -243,6 +243,7 @@ spec:
 const umbrellaChartYamlTmpl = `# Umbrella chart — installs every app in this repo together:
 #
 #   sandboxctl deploy --umbrella          # whole stack as one Argo app
+#   sandboxctl install                    # same stack via plain helm (no GitOps)
 #
 # or standalone, anywhere helm runs:
 #
