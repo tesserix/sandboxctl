@@ -242,12 +242,16 @@ spec:
 // annotation so it is never double-deployed.
 const umbrellaChartYamlTmpl = `# Umbrella chart — installs every app in this repo together:
 #
+#   sandboxctl deploy --umbrella          # whole stack as one Argo app
+#
+# or standalone, anywhere helm runs:
+#
 #   helm dependency build --skip-refresh [[.Dir]]
 #   helm install [[.Name]] [[.Dir]] -f [[.Dir]]/values-sandbox.yaml
 #
-# sandboxctl's own deploy uses the per-app charts + Kargo pipelines and
-# skips this chart (see the annotation below); the umbrella exists so
-# the whole stack is one 'helm install' anywhere else.
+# sandboxctl's default deploy uses the per-app charts + Kargo pipelines
+# and recognizes this chart by the annotation below, so it is never
+# double-deployed.
 apiVersion: v2
 name: [[.Name]]
 description: Umbrella chart installing every app in this repo
@@ -272,8 +276,9 @@ const umbrellaValuesTmpl = `# Umbrella values: toggle whole apps on/off; anythin
 [[- end]]
 `
 
-const umbrellaValuesSandboxTmpl = `# Sandbox flavour for standalone umbrella installs. (sandboxctl's own
-# deploy uses the per-app charts + pipelines instead of this chart.)
+const umbrellaValuesSandboxTmpl = `# Sandbox flavour for umbrella installs — used by both
+# 'sandboxctl deploy --umbrella' and standalone 'helm install -f'.
+# (The default per-app deploy uses each chart's own values-sandbox.)
 [[- range .Apps]]
 [[.Name]]:
   image:
