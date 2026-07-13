@@ -244,7 +244,11 @@ app to the image that will actually be pushed, by name, `<repo>-<app>`
 prefix, Dockerfile, or build context. A manifest that names images
 `myrepo-api` gets chart values, umbrella values, Kargo Warehouses, and
 promotion steps that all reference `myrepo-api` — no ImagePullBackOff
-from a name mismatch. Re-running scaffold refreshes this wiring in
+from a name mismatch. Every generated values surface pins
+`image.pullPolicy: Always`: the sandbox registry serves *mutable* tags
+(each `build` re-pushes the same tag), and Kubernetes only defaults to
+`Always` for the literal `:latest` — without it, a node's cached image
+silently shadows the build you just pushed across rollout restarts. Re-running scaffold refreshes this wiring in
 place on files you haven't edited (edited copies always win, no
 prompts), so renaming an image in the manifest plus one `scaffold` run
 re-wires everything. Image coordinates point

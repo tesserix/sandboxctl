@@ -26,7 +26,10 @@ image:
   # Kargo promotions pin the exact build by digest; empty means "just
   # the tag". A digest always wins over the tag when both are set.
   digest: ""
-  pullPolicy: IfNotPresent
+  # The sandbox registry serves MUTABLE tags — every 'sandboxctl build'
+  # re-pushes the same tag. Always keeps rollout restarts honest: a
+  # node's cached image never shadows the build you just pushed.
+  pullPolicy: Always
 
 nameOverride: ""
 fullnameOverride: ""
@@ -80,6 +83,7 @@ image:
   repository: [[.ImageRepo]]
   tag: [[.ImageTag]]
   digest: ""
+  pullPolicy: Always
 [[if .Port]]
 sandbox:
   virtualService:
@@ -151,7 +155,7 @@ spec:
       containers:
         - name: [[.Name]]
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}{{- with .Values.image.digest }}@{{ . }}{{- end }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "Always" }}
           {{- if .Values.envFromSecret }}
           envFrom:
             - secretRef:
@@ -286,6 +290,7 @@ const umbrellaValuesSandboxTmpl = `# Sandbox flavour for umbrella installs — u
     repository: [[.ImageRepo]]
     tag: [[.ImageTag]]
     digest: ""
+    pullPolicy: Always
 [[- if .Port]]
   sandbox:
     virtualService:

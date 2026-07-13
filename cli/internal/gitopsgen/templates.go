@@ -198,4 +198,5 @@ image:
   repository: [[.ImageRepo]]
   tag: [[.ImageTag]]
   digest: ""
+  pullPolicy: Always
 `
