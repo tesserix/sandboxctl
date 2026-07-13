@@ -152,6 +152,20 @@ SANDBOX_REGISTRY_PORT="${SANDBOX_REGISTRY_PORT:-5050}"
 SANDBOX_REGISTRY_STORAGE="${SANDBOX_REGISTRY_STORAGE:-12Gi}"
 SANDBOX_STATE_DIR="${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}"
 SANDBOX_STATE_FILE="${SANDBOX_STATE_DIR}/setup.yaml"
+
+# helm consults the Docker credential store even for anonymous public
+# OCI pulls. A leftover credsStore (classically `osxkeychain` from an
+# uninstalled Docker Desktop, with podman now in its place) makes every
+# `helm … oci://` chart install fail with
+#   exec: "docker-credential-osxkeychain": executable file not found
+# Everything sandboxctl pulls is public, so pin helm to a
+# sandboxctl-owned empty registry config — unless the user set their
+# own HELM_REGISTRY_CONFIG, which always wins.
+if [[ -z "${HELM_REGISTRY_CONFIG:-}" ]]; then
+  mkdir -p "$SANDBOX_STATE_DIR"
+  [[ -s "${SANDBOX_STATE_DIR}/helm-registry.json" ]] || printf '{}\n' > "${SANDBOX_STATE_DIR}/helm-registry.json"
+  export HELM_REGISTRY_CONFIG="${SANDBOX_STATE_DIR}/helm-registry.json"
+fi
 # Persisted Podman VM sizing — written by `sandboxctl up`/`restart` when
 # the user passes --podman-cpus/--podman-memory/--podman-disk, and read
 # at script start so subsequent invocations remember the chosen size
