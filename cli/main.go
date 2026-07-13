@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // assetDir is injected at build time via:
@@ -32,45 +33,68 @@ func resolveAssetDir() string {
 
 type command struct{ name, desc string }
 
-var commands = []command{
-	{"setup-podman", "install/configure rootful podman machine (one-time; --disk-size/--memory/--cpus, --recreate to resize disk)"},
-	{"trust-ca", "trust the sandbox root CA in macOS System keychain (sudo)"},
-	{"untrust-ca", "remove the sandbox root CA from System keychain (sudo)"},
-	{"up", "create cluster + install argocd/kargo/demo + gitea + ingress + PKI + arctl CLI (kagent opt-in via --with-kagent or --install all; skip arctl via --no-arctl)"},
-	{"down", "remove cluster + LaunchAgent + /etc/hosts + keychain CA + arctl CLI (keeps ~/.sandbox)"},
-	{"purge", "down + remove ~/.sandbox (prompts for confirmation)"},
-	{"status", "cluster + workload status + URLs"},
-	{"restart", "re-apply installers, keep cluster + state (--rebuild for full wipe)"},
-	{"validate", "curl each URL from the Mac and print HTTP codes"},
-	{"doctor", "validate everything: host tools + floors, runtime, ports, ambient-env hazards (neutralized by design), cluster + component health, webhook, Mac plumbing — with the exact fix per failure (exit 1 on failures)"},
-	{"creds", "print login details (URLs + admin creds) for Argo CD + Kargo"},
-	{"kubeconfig", "print the sandbox kubeconfig path (--export for an eval-able line; --merge to opt-in merge into ~/.kube/config without changing your current-context)"},
-	{"argocd-ui", "print Argo CD URL + admin creds"},
-	{"kargo-ui", "print Kargo  URL + admin creds"},
-	{"scaffold", "analyze the repo (monorepo-aware) + generate Helm chart(s) with sandbox values — skips existing files, asks before overwriting edits (--dry-run/--yes/--force)"},
-	{"build", "build + push Dockerfiles in the product repo (--repo <dir> | [path] | cwd)"},
-	{"images", "list / rm <ref> / prune / purge / gc — manage images in the cluster registry"},
-	{"deploy", "discover charts in the product repo (--repo <dir> | [path] | cwd) + push to Gitea + create Argo Apps (--redeploy: chart-only sync, reuse existing image, force Argo refresh)"},
-	{"undeploy", "remove the Argo Application + route created by 'deploy'"},
-	{"bootstrap", "'up' (if needed) + 'deploy' in one command (--repo <dir> | [path] | cwd)"},
-	{"versions", "component version doctor: pinned (chart→app) vs latest vs installed, with compatibility floors (--offline/--json; exits 1 on a floor violation)"},
-	{"prune", "diagnose + clean disk: host / mounted DMGs / runtime VM / cluster registry (prompts before each step; alias: cleanup)"},
-	{"tui", "live status dashboard (Bubble Tea)"},
-	{"version", "print sandboxctl version, commit, and build date"},
+type commandGroup struct {
+	title string
+	cmds  []command
+}
+
+// commandGroups drives the usage screen: grouped, short, aligned. Deep
+// detail (flags, behaviours) lives in each command's --help, not here —
+// a usage line that wraps is a usage line nobody reads.
+var commandGroups = []commandGroup{
+	{"platform", []command{
+		{"up", "create the cluster + install the platform (--with-* add-ons)"},
+		{"down", "remove the cluster + Mac plumbing (keeps ~/.sandboxctl)"},
+		{"restart", "re-apply installers (--rebuild recreates the cluster)"},
+		{"purge", "down + delete ~/.sandboxctl (asks first)"},
+		{"setup-podman", "one-time podman machine setup (--cpus/--memory/--disk-size)"},
+	}},
+	{"your app", []command{
+		{"scaffold", "repo → charts + secrets template + Kargo pipeline"},
+		{"build", "build + push the repo's images to the sandbox registry"},
+		{"deploy", "push charts to Gitea, create Argo apps, wire https URLs"},
+		{"bootstrap", "up (if needed) + deploy, in one command"},
+		{"undeploy", "remove an app's Argo apps, pipeline, and route (--name)"},
+	}},
+	{"inspect", []command{
+		{"status", "cluster + workload status + URLs"},
+		{"doctor", "validate everything; exact fix printed per failure"},
+		{"validate", "curl each URL and print the HTTP codes"},
+		{"versions", "component pins vs latest vs installed (+ tool floors)"},
+		{"creds", "Argo CD + Kargo URLs and admin credentials"},
+		{"argocd-ui", "Argo CD URL + creds"},
+		{"kargo-ui", "Kargo URL + creds"},
+		{"kubeconfig", "sandbox kubeconfig path (--export | --merge)"},
+		{"images", "registry images: list / rm / prune / purge / gc"},
+		{"tui", "live status dashboard"},
+	}},
+	{"maintenance", []command{
+		{"trust-ca", "trust the sandbox root CA (System keychain, sudo)"},
+		{"untrust-ca", "remove the sandbox root CA from the keychain"},
+		{"prune", "diagnose + reclaim disk (asks before each step)"},
+		{"version", "print sandboxctl version, commit, and build date"},
+	}},
 }
 
 func usage() string {
-	s := "sandboxctl — local kind sandbox with Argo CD + Kargo\n\nusage:\n"
-	for _, c := range commands {
-		s += fmt.Sprintf("  sandboxctl %-13s %s\n", c.name, c.desc)
+	var b strings.Builder
+	b.WriteString("sandboxctl — local kind sandbox with Argo CD + Kargo\n")
+	for _, g := range commandGroups {
+		fmt.Fprintf(&b, "\n%s\n", g.title)
+		for _, c := range g.cmds {
+			fmt.Fprintf(&b, "  %-14s %s\n", c.name, c.desc)
+		}
 	}
-	return s
+	b.WriteString("\nrun 'sandboxctl <command> --help' for flags and details\n")
+	return b.String()
 }
 
 func known(sub string) bool {
-	for _, c := range commands {
-		if c.name == sub {
-			return true
+	for _, g := range commandGroups {
+		for _, c := range g.cmds {
+			if c.name == sub {
+				return true
+			}
 		}
 	}
 	// Hidden subcommands consumed by sandbox.sh itself, not listed in usage.

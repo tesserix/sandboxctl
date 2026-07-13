@@ -18,11 +18,31 @@ import (
 // Generator is recorded in every file's ownership marker.
 const Generator = "scaffold"
 
-// registryHost is the push/pull coordinate of the in-cluster registry
-// as seen from both the Mac and the kind node (containerd mirror).
-// Kept overridable for tests and for a future SANDBOX_REGISTRY_PORT
-// passthrough.
-const defaultRegistry = "localhost:5050"
+// Config carries the sandbox coordinates baked into generated charts.
+// Zero values resolve to the stock sandbox layout.
+type Config struct {
+	// Registry is the image push/pull coordinate as seen from both the
+	// Mac and the kind node (containerd mirror), e.g. "localhost:5050".
+	Registry string
+	// Domain is the sandbox DNS suffix; the app's URL host becomes
+	// "<app>.<Domain>".
+	Domain string
+	// GatewayRef is the Istio gateway the VirtualService binds to,
+	// "<namespace>/<name>".
+	GatewayRef string
+}
+
+func (c *Config) defaults() {
+	if c.Registry == "" {
+		c.Registry = "localhost:5050"
+	}
+	if c.Domain == "" {
+		c.Domain = "sandbox.app"
+	}
+	if c.GatewayRef == "" {
+		c.GatewayRef = "istio-ingress/sandbox-gateway"
+	}
+}
 
 // Skip explains why an app gets no chart.
 type Skip struct {
@@ -43,10 +63,8 @@ type Result struct {
 // a Dockerfile (the chart references the image the build pushes) and no
 // existing chart. Layout: k8s/chart for a single-app repo (the
 // documented recommended layout), k8s/charts/<name> for monorepos.
-func Ops(m *reposcan.Model, registry string) *Result {
-	if registry == "" {
-		registry = defaultRegistry
-	}
+func Ops(m *reposcan.Model, cfg Config) *Result {
+	cfg.defaults()
 	res := &Result{ChartDirs: map[string]string{}}
 
 	single := len(m.Apps) == 1
@@ -68,7 +86,7 @@ func Ops(m *reposcan.Model, registry string) *Result {
 		}
 		res.ChartDirs[app.Name] = dir
 
-		ops, err := chartOps(dir, app, registry)
+		ops, err := chartOps(dir, app, cfg)
 		if err != nil {
 			// Template rendering over our own constants only fails on a
 			// programming error; surface it as a skip rather than
@@ -87,6 +105,11 @@ type chartContext struct {
 	Description string
 	ImageRepo   string
 	Port        int
+	// Host + Gateway wire the chart's own VirtualService in
+	// values-sandbox.yaml, so GitOps owns the app's URL end to end and
+	// nothing has to hand-craft routing per app.
+	Host    string
+	Gateway string
 	// SecretName wires envFrom to the app's generated Secret; empty when
 	// the env scan found no secret-like variables.
 	SecretName string
@@ -95,12 +118,14 @@ type chartContext struct {
 	ConfigVars []string
 }
 
-func chartOps(dir string, app reposcan.App, registry string) ([]genwrite.Op, error) {
+func chartOps(dir string, app reposcan.App, cfg Config) ([]genwrite.Op, error) {
 	ctx := chartContext{
 		Name:        app.Name,
 		Description: description(app),
-		ImageRepo:   registry + "/" + app.Name,
+		ImageRepo:   cfg.Registry + "/" + app.Name,
 		Port:        app.Port,
+		Host:        app.Name + "." + cfg.Domain,
+		Gateway:     cfg.GatewayRef,
 	}
 	for _, ref := range app.Env {
 		if ref.Secret {
@@ -121,6 +146,7 @@ func chartOps(dir string, app reposcan.App, registry string) ([]genwrite.Op, err
 		{"templates/deployment.yaml", deploymentTmpl},
 		{"templates/service.yaml", serviceTmpl},
 		{"templates/serviceaccount.yaml", serviceAccountTmpl},
+		{"templates/virtualservice.yaml", virtualServiceTmpl},
 	}
 
 	reason := fmt.Sprintf("Helm chart for app %s (%s)", app.Name, describeRuntime(app))

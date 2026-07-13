@@ -108,7 +108,11 @@ chart(s) to the in-cluster Gitea, and wires URLs.
 		return 0
 	}
 
-	gen := chartgen.Ops(model, registryHostPort())
+	gen := chartgen.Ops(model, chartgen.Config{
+		Registry:   registryHostPort(),
+		Domain:     envOr("SANDBOX_DOMAIN", "sandbox.app"),
+		GatewayRef: envOr("ISTIO_INGRESS_NS", "istio-ingress") + "/sandbox-gateway",
+	})
 	ops := gen.Ops
 	secOps, secSkip := secretsgen.Ops(model.Root, model.Apps)
 	ops = append(ops, secOps...)

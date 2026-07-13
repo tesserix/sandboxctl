@@ -5879,7 +5879,21 @@ _route_app_service() {
     fi
     [[ -z "$svc_port" ]] && svc_port=80
     log "${tag} primary Service: svc/${svc}:${svc_port} (${pick_reason})"
-    add_app_route "$hostname" "$namespace" "$svc" "$svc_port"
+    # Scaffolded charts carry their own VirtualService (GitOps owns the
+    # URL); creating a second VS for the same host would make Istio's
+    # routing nondeterministic. If any chart-managed VS already claims
+    # the hostname, defer to it — and drop the imperative one older
+    # deploys created, so migrations converge on chart-managed routing.
+    local chart_vs
+    chart_vs="$(kc -n "$namespace" get virtualservices \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.hosts[*]}{"\n"}{end}' 2>/dev/null \
+      | awk -v h="$hostname" -v ours="sandboxctl-${hostname//./-}" '$1!=ours && index($0, h) {print $1; exit}')"
+    if [[ -n "$chart_vs" ]]; then
+      log "${tag} chart-managed VirtualService '${chart_vs}' routes ${hostname} — leaving routing to the chart"
+      remove_app_route "$hostname" "$namespace"
+    else
+      add_app_route "$hostname" "$namespace" "$svc" "$svc_port"
+    fi
     add_app_host  "$hostname"
     ok "${tag} routed https://${hostname}:${SANDBOX_HTTPS_PORT} → svc/${svc}:${svc_port}"
 
