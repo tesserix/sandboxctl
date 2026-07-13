@@ -216,8 +216,13 @@ GitOps owns the URL end to end and nothing needs hand-written routing
 (`deploy` detects the chart-managed route, skips its imperative one,
 and still handles `/etc/hosts` + the URL probe). Workers get no
 Service, and apps that reference secret-like variables are wired to
-their Secret via `envFrom`. A `values-sandbox.yaml` is emitted so `deploy` picks the
-chart up with zero flags, and `k8s/secrets.example.yaml` +
+their Secret via `envFrom`. Monorepos also get an **umbrella chart** at `k8s/chart`
+connecting every app chart as a `file://` dependency with per-app
+`enabled` toggles — `helm dependency build --skip-refresh k8s/chart &&
+helm install stack k8s/chart` brings the whole repo up anywhere, while
+sandboxctl's own deploy recognizes it by annotation and keeps deploying
+per-app (pipelines and URLs stay per-app). A `values-sandbox.yaml` is
+emitted so `deploy` picks the chart up with zero flags, and `k8s/secrets.example.yaml` +
 `.gitignore` handling is automatic (see [Secrets](#secrets)).
 
 **What it will never do.** Files you authored are never touched — not

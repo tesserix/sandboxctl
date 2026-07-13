@@ -1,6 +1,7 @@
 package chartgen
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -86,8 +87,10 @@ func TestMonorepoUsesPerAppChartDirs(t *testing.T) {
 	if res.ChartDirs["api"] != "k8s/charts/api" || res.ChartDirs["jobs"] != "k8s/charts/jobs" {
 		t.Fatalf("chart dirs = %v", res.ChartDirs)
 	}
-	if len(res.Ops) != 16 {
-		t.Fatalf("ops = %d, want 8 per app", len(res.Ops))
+	// 8 files per app + the umbrella (Chart.yaml, values, values-sandbox)
+	// + its .gitignore append.
+	if len(res.Ops) != 20 {
+		t.Fatalf("ops = %d, want 2×8 + 4 umbrella ops", len(res.Ops))
 	}
 }
 
@@ -122,6 +125,72 @@ func TestRegistryOverride(t *testing.T) {
 	values := string(opByPath(t, res.Ops, "k8s/charts/api/values.yaml").Body)
 	if !strings.Contains(values, "repository: localhost:6060/api") {
 		t.Fatalf("registry override ignored:\n%s", values)
+	}
+}
+
+func TestUmbrellaChartForMonorepos(t *testing.T) {
+	m := &reposcan.Model{Root: "/tmp/shop", Apps: []reposcan.App{httpApp(), workerApp()}}
+	res := Ops(m, Config{Domain: "sb.test"})
+
+	if res.UmbrellaDir != "k8s/chart" {
+		t.Fatalf("umbrella dir = %q", res.UmbrellaDir)
+	}
+	chart := string(opByPath(t, res.Ops, "k8s/chart/Chart.yaml").Body)
+	for _, want := range []string{
+		"name: shop",
+		`sandboxctl.io/umbrella: "true"`,
+		"repository: file://../charts/api",
+		"condition: api.enabled",
+		"repository: file://../charts/jobs",
+	} {
+		if !strings.Contains(chart, want) {
+			t.Fatalf("umbrella Chart.yaml missing %q:\n%s", want, chart)
+		}
+	}
+	values := string(opByPath(t, res.Ops, "k8s/chart/values.yaml").Body)
+	if !strings.Contains(values, "api:\n  enabled: true") || !strings.Contains(values, "jobs:\n  enabled: true") {
+		t.Fatalf("umbrella values missing toggles:\n%s", values)
+	}
+	sbx := string(opByPath(t, res.Ops, "k8s/chart/values-sandbox.yaml").Body)
+	if !strings.Contains(sbx, "host: api.sb.test") {
+		t.Fatalf("umbrella sandbox values missing api host:\n%s", sbx)
+	}
+	if strings.Contains(sbx, "host: jobs.") {
+		t.Fatalf("worker got a VS host in umbrella sandbox values:\n%s", sbx)
+	}
+	gi := opByPath(t, res.Ops, ".gitignore")
+	if len(gi.Append) != 1 || gi.Append[0] != "k8s/chart/charts/" {
+		t.Fatalf("gitignore op wrong: %+v", gi)
+	}
+}
+
+func TestNoUmbrellaForSingleAppOrOccupiedChartDir(t *testing.T) {
+	// Single app → chart lives at k8s/chart itself, no umbrella.
+	one := httpApp()
+	one.Path = "."
+	res := Ops(&reposcan.Model{Root: "/tmp/shop", Apps: []reposcan.App{one}}, Config{})
+	if res.UmbrellaDir != "" {
+		t.Fatalf("single-app repo got an umbrella at %q", res.UmbrellaDir)
+	}
+
+	// Monorepo with 2 charted apps BUT k8s/chart already holds a real
+	// (user) chart → umbrella must skip with a reason, not hijack it.
+	occupied := reposcan.App{Name: "legacy", Path: "apps/legacy",
+		Dockerfile: "apps/legacy/Dockerfile",
+		Existing:   reposcan.Existing{Chart: "k8s/chart"}}
+	res = Ops(&reposcan.Model{Root: "/tmp/shop",
+		Apps: []reposcan.App{occupied, httpApp(), workerApp()}}, Config{})
+	if res.UmbrellaDir != "" {
+		t.Fatalf("occupied k8s/chart still got an umbrella")
+	}
+	var skipped bool
+	for _, s := range res.Skips {
+		if s.App == "umbrella" && strings.Contains(s.Reason, "k8s/chart already holds") {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Fatalf("missing umbrella skip reason: %v", res.Skips)
 	}
 }
 
@@ -185,23 +254,6 @@ func TestHelmLintAndTemplate(t *testing.T) {
 		if strings.Contains(rendered, "kind: VirtualService") {
 			t.Fatalf("%s: default render carries a VirtualService:\n%s", app, rendered)
 		}
-
-		// With the sandbox values, http charts route; workers still don't.
-		sbx := exec.Command(helm, "template", app, chartPath, "-f", filepath.Join(chartPath, "values-sandbox.yaml"))
-		sbxOut, err := sbx.CombinedOutput()
-		if err != nil {
-			t.Fatalf("helm template -f values-sandbox %s failed:\n%s", app, sbxOut)
-		}
-		sbxRendered := string(sbxOut)
-		hasVS := strings.Contains(sbxRendered, "kind: VirtualService")
-		if app == "api" {
-			if !hasVS || !strings.Contains(sbxRendered, `"api.sandbox.app"`) {
-				t.Fatalf("api sandbox render missing VirtualService/host:\n%s", sbxRendered)
-			}
-		}
-		if app == "jobs" && hasVS {
-			t.Fatalf("worker sandbox render carries a VirtualService:\n%s", sbxRendered)
-		}
 		if !strings.Contains(rendered, "kind: Deployment") {
 			t.Fatalf("%s: no Deployment rendered:\n%s", app, rendered)
 		}
@@ -225,6 +277,50 @@ func TestHelmLintAndTemplate(t *testing.T) {
 			if strings.Contains(rendered, "envFrom") {
 				t.Fatalf("secretless worker rendered envFrom:\n%s", rendered)
 			}
+		}
+
+		// With the sandbox values, http charts route; workers still don't.
+		sbx := exec.Command(helm, "template", app, chartPath, "-f", filepath.Join(chartPath, "values-sandbox.yaml"))
+		sbxOut, err := sbx.CombinedOutput()
+		if err != nil {
+			t.Fatalf("helm template -f values-sandbox %s failed:\n%s", app, sbxOut)
+		}
+		sbxRendered := string(sbxOut)
+		hasVS := strings.Contains(sbxRendered, "kind: VirtualService")
+		if app == "api" {
+			if !hasVS || !strings.Contains(sbxRendered, `"api.sandbox.app"`) {
+				t.Fatalf("api sandbox render missing VirtualService/host:\n%s", sbxRendered)
+			}
+		}
+		if app == "jobs" && hasVS {
+			t.Fatalf("worker sandbox render carries a VirtualService:\n%s", sbxRendered)
+		}
+	}
+
+	// The umbrella: dependency build + lint + whole-stack render.
+	if res.UmbrellaDir == "" {
+		t.Fatal("monorepo fixture produced no umbrella")
+	}
+	umbrella := filepath.Join(root, filepath.FromSlash(res.UmbrellaDir))
+	depBuild := exec.Command(helm, "dependency", "build", "--skip-refresh", umbrella)
+	depBuild.Env = append(os.Environ(),
+		"HELM_REPOSITORY_CONFIG="+filepath.Join(t.TempDir(), "repositories.yaml"),
+		"HELM_REPOSITORY_CACHE="+t.TempDir())
+	if out, err := depBuild.CombinedOutput(); err != nil {
+		t.Fatalf("umbrella dependency build failed:\n%s", out)
+	}
+	if out, err := exec.Command(helm, "lint", umbrella).CombinedOutput(); err != nil {
+		t.Fatalf("umbrella lint failed:\n%s", out)
+	}
+	out, err := exec.Command(helm, "template", "stack", umbrella,
+		"-f", filepath.Join(umbrella, "values-sandbox.yaml")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("umbrella template failed:\n%s", out)
+	}
+	whole := string(out)
+	for _, want := range []string{"name: stack-api", "name: stack-jobs", "kind: VirtualService", `"api.sandbox.app"`} {
+		if !strings.Contains(whole, want) {
+			t.Fatalf("umbrella render missing %q:\n%s", want, whole)
 		}
 	}
 }
