@@ -2854,6 +2854,67 @@ EOF
   if declare -F tyk_present          >/dev/null && tyk_present;          then printf '  open https://%s:%s/hello    # Tyk gateway health\n' "$TYK_HOST" "$SANDBOX_HTTPS_PORT"; fi
   echo "  sandboxctl creds   # full login details"
   celebrate "sandbox is up"
+
+  [[ "${SANDBOXCTL_SKIP_ONBOARD_CHECK:-0}" == "1" ]] || _up_onboarding_check "$PWD"
+}
+
+# End-of-up onboarding check: is the directory the user launched from
+# already onboarded to the sandbox structure (a chart per buildable
+# app)? Prints the related commands either way; when the repo is not
+# onboarded, shows the exact command + a scaffold dry-run of what it
+# would create, and offers to run it on the spot. Also reachable as
+# `sandboxctl _onboard-check [dir]` (no cluster needed) so the check is
+# testable and re-runnable by hand.
+_up_onboarding_check() {
+  local dir="${1:-$PWD}"
+  command -v sandboxctl >/dev/null 2>&1 || return 0
+
+  local status_line status
+  status_line="$(sandboxctl _onboard-status "$dir" 2>/dev/null)" || return 0
+  status="${status_line%% *}"
+
+  echo
+  log "your app, next"
+  case "$status" in
+    onboarded)
+      ok "this repo is onboarded (${status_line#* })"
+      cat <<EOF
+  sandboxctl deploy      build + deploy it to the sandbox
+  sandboxctl scaffold    re-check generated files (safe: never clobbers your edits)
+EOF
+      ;;
+    needs-onboarding)
+      warn "this repo is not onboarded to the sandbox structure yet (${status_line#* })"
+      echo
+      echo "  Onboarding would run:   sandboxctl scaffold ${dir} --yes"
+      echo "  which generates the following (dry-run):"
+      echo
+      sandboxctl scaffold "$dir" --dry-run 2>/dev/null | sed 's/^/    /'
+      echo
+      if [[ ! -t 0 ]]; then
+        log "no TTY — run 'sandboxctl scaffold' yourself when ready"
+        return 0
+      fi
+      printf '  Onboard this repo now? [y/N] '
+      local answer=""
+      read -r answer
+      case "$answer" in
+        y|Y|yes|YES)
+          sandboxctl scaffold "$dir" --yes \
+            && ok "repo onboarded — 'sandboxctl deploy' (or 'bootstrap') runs it"
+          ;;
+        *) log "skipped — 'sandboxctl scaffold' any time you're ready" ;;
+      esac
+      ;;
+    *)
+      # Not a product repo (or nothing buildable) — just point the way.
+      cat <<EOF
+  cd <your-product-repo>, then:
+    sandboxctl scaffold    generate chart(s), secrets template + Kargo pipeline
+    sandboxctl bootstrap   build + deploy + https://<app>.${SANDBOX_DOMAIN}:${SANDBOX_HTTPS_PORT}
+EOF
+      ;;
+  esac
 }
 
 # `sandboxctl bootstrap` — one-shot wrapper for first-time users:
@@ -2957,7 +3018,7 @@ EOF
     _ensure_registry_reachable
   else
     log "bringing the sandbox platform up (first run takes ~5–8 min)"
-    cmd_up ${up_args[@]+"${up_args[@]}"}
+    SANDBOXCTL_SKIP_ONBOARD_CHECK=1 cmd_up ${up_args[@]+"${up_args[@]}"}
   fi
 
   # Deploy the product's chart. cmd_deploy is responsible for
@@ -3158,7 +3219,7 @@ EOF
   if (( rebuild )); then
     log "restart --rebuild: full down + up (this will take 5–8 min)"
     cmd_down
-    cmd_up ${up_args[@]+"${up_args[@]}"}
+    SANDBOXCTL_SKIP_ONBOARD_CHECK=1 cmd_up ${up_args[@]+"${up_args[@]}"}
     return
   fi
 
@@ -6000,6 +6061,7 @@ main() {
     trust-ca)           trust_root_ca ;;
     untrust-ca)         untrust_root_ca ;;
     up)                 shift; cmd_up "$@" ;;
+    _onboard-check)     shift; _up_onboarding_check "${1:-$PWD}" ;;
     down)               cmd_down ;;
     purge)              cmd_purge ;;
     status)             cmd_status ;;
