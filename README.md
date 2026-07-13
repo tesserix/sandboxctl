@@ -70,22 +70,50 @@ secrets template) from what it detects in your repo — see
 
 ### Command overview
 
+The same four groups `sandboxctl --help` prints. Run any command with
+`--help` for its full flags and behaviour.
+
+**Platform** — the sandbox itself
+
 | Command | What it does |
 |---|---|
-| `sandboxctl up` | create the kind cluster + install the platform (Argo CD, Kargo, Gitea, Istio, registry, PKI, …) |
-| `sandboxctl scaffold` | analyze the repo (monorepo-aware) and generate Helm chart(s), sandbox values, and the secrets template — skips what exists, asks before overwriting your edits |
-| `sandboxctl build` | build + push the repo's images to the in-cluster registry |
-| `sandboxctl deploy` | apply secrets, push chart(s) to Gitea, create Argo CD Applications, wire `https://<app>.sandbox.app` URLs (`--umbrella`: whole monorepo stack as one app) |
-| `sandboxctl install` | helm-install the chart stack directly — umbrella-aware, hermetic dependency build, secrets + URLs handled, no Gitea/Argo in the path |
-| `sandboxctl bootstrap` | `up` (if needed) + `deploy` in one shot |
-| `sandboxctl status` / `tui` | cluster + workload status, URLs |
-| `sandboxctl versions` | component doctor: pinned (chart→app) vs latest vs installed, with compatibility floors |
-| `sandboxctl doctor` | validate everything — host tools, runtime, ports, env hazards, cluster + component health, Mac plumbing — with the exact fix per failure |
-| `sandboxctl creds` | Argo CD + Kargo URLs and admin credentials |
-| `sandboxctl kubeconfig` | path of the sandbox-owned kubeconfig; `--export` for `eval`, `--merge` to opt-in merge into `~/.kube/config` |
-| `sandboxctl undeploy` / `down` / `purge` | remove an app / the cluster / everything |
+| `sandboxctl up` | create the kind cluster + install the platform (Argo CD, Kargo, Gitea, Istio, registry, PKI, …); `--with-*` flags add opt-in components |
+| `sandboxctl down` | remove the cluster + Mac plumbing (keeps `~/.sandboxctl`) |
+| `sandboxctl restart` | re-apply the installers on a running cluster (`--rebuild` recreates the cluster first) |
+| `sandboxctl purge` | `down` + delete `~/.sandboxctl` (asks first) |
+| `sandboxctl setup-podman` | one-time podman machine setup (`--cpus` / `--memory` / `--disk-size`) |
 
-Run any command with `--help` for its flags.
+**Your app** — from repo to running URL
+
+| Command | What it does |
+|---|---|
+| `sandboxctl scaffold` | analyze the repo (monorepo-aware) and generate Helm chart(s), the umbrella chart, sandbox values, secrets template, and the Kargo pipeline — image names resolved from the build manifest; skips what exists, asks before overwriting your edits |
+| `sandboxctl build` | build + push the repo's images to the in-cluster registry (`sandboxctl.yaml` manifest, or auto-derived from Dockerfiles) |
+| `sandboxctl deploy` | apply secrets, push chart(s) to Gitea, create Argo CD Applications, verify images against the registry, wire `https://<app>.sandbox.app` URLs; `--umbrella` deploys a monorepo's whole stack as one app |
+| `sandboxctl install` | helm-install the chart stack directly — umbrella-aware, hermetic dependency build, secrets + URLs handled, no Gitea/Argo in the path; `--dry-run` renders without a cluster |
+| `sandboxctl bootstrap` | `up` (if needed) + `deploy` in one shot |
+| `sandboxctl undeploy` | remove an app's Argo apps, Kargo pipeline, route, and `/etc/hosts` entry (`--name <app>`) |
+
+**Inspect** — what's running, and why not
+
+| Command | What it does |
+|---|---|
+| `sandboxctl status` / `tui` | cluster + workload status and URLs (`tui` is the live dashboard) |
+| `sandboxctl doctor` | validate everything — host tools, runtime, ports, env hazards, cluster + component health, Mac plumbing — with the exact fix per failure |
+| `sandboxctl validate` | curl every routed URL and print the HTTP codes |
+| `sandboxctl versions` | component doctor: pinned (chart→app) vs latest vs installed, with compatibility floors (`--offline`, `--json`) |
+| `sandboxctl creds` | Argo CD + Kargo URLs and admin credentials |
+| `sandboxctl argocd-ui` / `kargo-ui` | print the respective UI's URL + admin credentials |
+| `sandboxctl kubeconfig` | path of the sandbox-owned kubeconfig; `--export` for `eval`, `--merge` to opt-in merge into `~/.kube/config` |
+| `sandboxctl images` | registry contents: list / rm / prune / purge / gc |
+
+**Maintenance**
+
+| Command | What it does |
+|---|---|
+| `sandboxctl trust-ca` / `untrust-ca` | add/remove the sandbox root CA in the macOS System keychain (sudo) |
+| `sandboxctl prune` | diagnose + reclaim disk, asking before each step (`cleanup` is an alias) |
+| `sandboxctl version` | print sandboxctl version, commit, and build date |
 
 ## What's running after `sandboxctl up`
 
@@ -366,6 +394,8 @@ sandboxctl deploy --chart /abs/path/to/chart
 | `--name <name>` | Override the Argo App + URL name (default: `Chart.yaml`'s `name`) |
 | `--env <name>` | Namespace suffix only — URL stays `<name>.sandbox.app`. Default `dev`. |
 | `--no-build` | Skip the build step (registry already has the images) |
+| `--redeploy` | Skip the build AND re-push the chart + force an immediate Argo refresh — for chart/values-only iterations |
+| `--umbrella` | Deploy the whole monorepo stack as ONE Argo CD Application via the scaffold-generated umbrella chart (whole `k8s/` tree pushed so `file://` deps resolve; per-app URLs still wired) |
 | `--purge-old-tags` | Forwarded to the build step (see [Image management](#image-management)). `--no-purge-old-tags` overrides `SANDBOX_BUILD_PURGE_OLD_TAGS=1` from the env. |
 | `--build-cpus N` / `--build-memory SIZE` | Forwarded to the build step. Cap the podman build container so a hot Go/Rust compile can't starve kind. Default: half the Podman VM along each axis; `0` opts out. See [Image management](#image-management). |
 | `--build-runtime podman\|docker` / `--on-host` | Forwarded to the build step. Pick the build runtime; `--on-host` is shorthand for `--build-runtime docker`. |
