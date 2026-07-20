@@ -62,7 +62,7 @@ var Registry = []Component{
 		},
 	},
 	{
-		Name: "kargo", EnvVar: "KARGO_CHART_VERSION", Default: "1.10.8", App: "v1.10.8",
+		Name: "kargo", EnvVar: "KARGO_CHART_VERSION", Default: "1.10.9", App: "v1.10.8",
 		Floor: "1.3.0", FloorReason: "scaffold-generated promotion manifests use yaml-update (helm-update-image was removed in 1.3.0)",
 		RepoURL: "oci://ghcr.io/akuity/kargo-charts/kargo", Release: "kargo",
 		RenderArgs: []string{
