@@ -108,7 +108,7 @@ var Registry = []Component{
 		},
 	},
 	{
-		Name: "reflector", EnvVar: "REFLECTOR_CHART_VERSION", Default: "10.0.58", App: "10.0.58",
+		Name: "reflector", EnvVar: "REFLECTOR_CHART_VERSION", Default: "10.0.60", App: "10.0.58",
 		RepoURL: "https://emberstack.github.io/helm-charts", Chart: "reflector", Release: "reflector",
 		RenderArgs: []string{
 			"resources.requests.cpu=10m", "resources.requests.memory=32Mi", "resources.limits.memory=128Mi",
