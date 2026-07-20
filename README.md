@@ -869,7 +869,7 @@ Defaults work for most people. Override via env vars:
 | `SANDBOX_BUILD_MEMORY` | `auto` | cap podman build memory (e.g. `4g`, `1500m`). `auto` resolves to half the VM's RAM; `0` disables. Same as `--build-memory`. |
 | `SANDBOX_BUILD_RUNTIME` | (empty) | force `podman` or `docker` for the build leg. Default: docker if reachable, else podman. Same as `--build-runtime`. |
 | `ARGO_HEALTH_ATTEMPTS` | `3` | number of 180s windows `deploy` waits for an Argo Application to become Synced+Healthy (default covers up to 9 min for slow CRD-heavy syncs). |
-| `ARGOCD_CHART_VERSION` | `10.1.3` | argo-cd chart version (ships Argo CD `v3.4.5`); `latest` resolves at install time |
+| `ARGOCD_CHART_VERSION` | `10.1.4` | argo-cd chart version (ships Argo CD `v3.4.5`); `latest` resolves at install time |
 | `KARGO_CHART_VERSION` | `1.10.8` | kargo chart version (chart tracks the app version); `latest` resolves at install time; scaffold-generated manifests need ≥ `1.3.0` |
 | `REFLECTOR_CHART_VERSION` | `10.0.58` | emberstack/reflector chart version |
 | `CERT_MANAGER_CHART_VERSION` | `v1.21.0` | cert-manager chart version |
@@ -912,7 +912,7 @@ cert-manager   v1.21.0                v1.21.0                v1.21.0      ok
 
 - **PINNED** is the tool's tested default (or your env override, marked
   `(env)`); the chart→app mapping is spelled out because they differ
-  (argo-cd chart `10.1.3` ships Argo CD `v3.4.5`).
+  (argo-cd chart `10.1.4` ships Argo CD `v3.4.5`).
 - **LATEST** is resolved from the chart repos (`--offline` skips it);
   **INSTALLED** is read from the running cluster when reachable.
 - Compatibility floors are enforced: pinning Kargo below `1.3.0` (where

@@ -47,7 +47,7 @@ type Component struct {
 // Registry lists the components in display order.
 var Registry = []Component{
 	{
-		Name: "argo-cd", EnvVar: "ARGOCD_CHART_VERSION", Default: "10.1.3", App: "v3.4.5",
+		Name: "argo-cd", EnvVar: "ARGOCD_CHART_VERSION", Default: "10.1.4", App: "v3.4.5",
 		RepoURL: "https://argoproj.github.io/argo-helm", Chart: "argo-cd", Release: "argocd",
 		RenderArgs: []string{
 			`configs.params.server\.insecure=true`,
