@@ -875,7 +875,7 @@ Defaults work for most people. Override via env vars:
 | `CERT_MANAGER_CHART_VERSION` | `v1.21.0` | cert-manager chart version |
 | `ISTIO_CHART_VERSION` | `1.30.2` | Istio chart version |
 | `KAGENT_CHART_VERSION` | `0.9.11` | kagent chart version |
-| `GITEA_CHART_VERSION` | `12.6.0` | Gitea chart version (ships Gitea `1.26.1`) |
+| `GITEA_CHART_VERSION` | `12.7.0` | Gitea chart version (ships Gitea `1.26.1`) |
 | `ARCTL_VERSION` | `latest` | `arctl` release to install (`latest` or a tag like `v0.3.3`) |
 | `INSTALL_ARCTL` | `0` | install `arctl` during `up` (opt-in; `--with-arctl` or `INSTALL_ARCTL=1`) |
 | `SANDBOX_KEEP_ARCTL` | `0` | keep `arctl` on `down`/`purge` when set to `1` |
