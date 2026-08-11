@@ -941,6 +941,26 @@ cluster_node_containers() {
   "$SANDBOX_RUNTIME" ps -a --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME" --format '{{.Names}}'
 }
 
+# A runtime that isn't answering returns an empty container list, which is
+# indistinguishable from "this machine has no cluster" — and cluster_registered
+# is what decides whether `up` creates a cluster. ensure_runtime proves the
+# runtime healthy at startup, but a podman VM can restart moments later
+# (SIGKILLing every kind node), so re-prove it immediately before that
+# decision. Only bring_up_cluster needs this: everywhere else a false
+# negative skips work rather than creating colliding nodes.
+RUNTIME_ANSWER_RETRIES="${SANDBOX_RUNTIME_ANSWER_RETRIES:-10}"
+require_runtime_answering() {
+  local i
+  for ((i = 1; i <= RUNTIME_ANSWER_RETRIES; i++)); do
+    "$SANDBOX_RUNTIME" info >/dev/null 2>&1 && return 0
+    if (( i == 1 )); then
+      warn "${SANDBOX_RUNTIME} is not answering — waiting for it before reading cluster state"
+    fi
+    sleep 3
+  done
+  die "${SANDBOX_RUNTIME} did not answer within $((RUNTIME_ANSWER_RETRIES * 3))s — refusing to guess whether cluster '${CLUSTER_NAME}' exists. Check: ${SANDBOX_RUNTIME} info"
+}
+
 cluster_uses_legacy_extra_port_mappings() {
   # Older configs bound :80/:443/:30080/:30443 on the kind container. Those
   # don't work on macOS+rootful podman; force a recreate if detected.
@@ -1215,6 +1235,7 @@ EOF
 }
 
 bring_up_cluster() {
+  require_runtime_answering
   if cluster_registered; then
     if cluster_uses_legacy_extra_port_mappings; then
       die "cluster '$CLUSTER_NAME' was created with the old kind port mappings — run: sandboxctl restart"
@@ -1247,13 +1268,34 @@ bring_up_cluster() {
   local config_file
   config_file="$(kind_config_path)"
   log "creating kind cluster '$CLUSTER_NAME' (1 control-plane + ${SANDBOX_WORKER_COUNT} worker$([ "$SANDBOX_WORKER_COUNT" = "1" ] || echo "s"))"
-  with_spinner "kind create cluster (typically 1–3 min)" \
-    kind_pinned create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$config_file"
+  local create_log rc=0
+  create_log="$(mktemp "${SANDBOX_STATE_DIR:-$HOME/.sandboxctl}/spinner-logs/kind-create.XXXXXX.log" 2>/dev/null || mktemp)"
+  SPINNER_LOGFILE="$create_log" SPINNER_QUIET_FAIL=1 \
+    with_spinner "kind create cluster (typically 1–3 min)" \
+      kind_pinned create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$config_file" \
+      || rc=$?
   # Clean up the generated temp config — only the on-disk default is
   # preserved across runs (the temp file's only job was to feed kind).
   if [[ "$config_file" != "$KIND_CONFIG" ]]; then
     rm -f "$config_file"
   fi
+  if (( rc != 0 )); then
+    # kind saw nodes we didn't. Only reachable if the runtime's container
+    # list disagreed with kind's — adopt what is there instead of dying,
+    # since a collision proves the cluster exists.
+    if grep -q 'node(s) already exist for a cluster with the name' "$create_log"; then
+      warn "kind found existing nodes for '${CLUSTER_NAME}' — adopting them instead of creating"
+      rm -f "$create_log"
+      cluster_api_reachable || start_stopped_cluster
+      write_pinned_kubeconfig
+      configure_node_registry_mirror
+      return
+    fi
+    tail -20 "$create_log" >&2
+    rm -f "$create_log"
+    die "kind create cluster failed"
+  fi
+  rm -f "$create_log"
   write_pinned_kubeconfig
   configure_node_registry_mirror
 }
