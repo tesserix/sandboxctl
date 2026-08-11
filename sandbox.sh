@@ -4899,12 +4899,252 @@ remove_app_host() {
   sudo killall -HUP mDNSResponder 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# Cross-repo dependencies (`requires:` in sandboxctl.yaml)
+#
+# `depends_on` orders images inside one repo. `requires` orders whole
+# repos: repo A declares that it cannot run until repo B's chart is
+# deployed, and `sandboxctl deploy` on A builds + deploys B first —
+# unless B is already there, which is the point. Two repos requiring the
+# same dependency share the one deployment instead of standing up a
+# second copy.
+# ---------------------------------------------------------------------------
+
+REQUIRES_MAX_DEPTH="${SANDBOX_REQUIRES_MAX_DEPTH:-2}"
+REQUIRES_CACHE_DIR="${SANDBOX_REQUIRES_CACHE:-${SANDBOX_HOME:-$HOME/.sandboxctl}/requires}"
+REQUIRES_READY_TIMEOUT="${SANDBOX_REQUIRES_READY_TIMEOUT:-600}"
+
+# The sandboxctl binary to call back into for hidden subcommands.
+# $SANDBOXCTL_BIN is set by the Go wrapper to its own path, so a stale
+# `sandboxctl` earlier on PATH can't be asked for a subcommand it lacks.
+_sandboxctl_bin() {
+  if [[ -n "${SANDBOXCTL_BIN:-}" && -x "${SANDBOXCTL_BIN}" ]]; then
+    printf '%s\n' "$SANDBOXCTL_BIN"
+    return 0
+  fi
+  command -v sandboxctl 2>/dev/null
+}
+
+# Resolve one dependency to an absolute repo root on disk. Local `repo:`
+# paths resolve relative to the requiring repo; `git:` URLs are cloned
+# into the cache dir and re-checked-out at `ref` on every run.
+_require_resolve_root() {
+  local name="$1" repo="$2" git_url="$3" ref="$4" parent="$5" allow_external="$6"
+  if [[ -n "$git_url" ]]; then
+    local dest="${REQUIRES_CACHE_DIR}/${name}"
+    if [[ -d "$dest/.git" ]]; then
+      git -C "$dest" fetch -q --depth 1 origin "$ref" 2>/dev/null \
+        || { warn "[requires:${name}] fetch ${ref} failed — using the cached checkout"; }
+      git -C "$dest" checkout -q FETCH_HEAD 2>/dev/null || true
+    else
+      mkdir -p "$(dirname "$dest")"
+      git clone -q --depth 1 --branch "$ref" "$git_url" "$dest" \
+        || { warn "[requires:${name}] clone ${git_url}@${ref} failed"; return 1; }
+    fi
+    printf '%s\n' "$dest"
+    return 0
+  fi
+
+  local resolved
+  resolved="$(cd "$parent" 2>/dev/null && cd "$repo" 2>/dev/null && pwd)" || {
+    warn "[requires:${name}] repo path '${repo}' does not exist relative to ${parent}"
+    return 1
+  }
+  # A sibling checkout (../other-repo) is the intended shape. Anything
+  # further afield means deploy would build and apply a repo the user
+  # may not have in mind, so make that an explicit opt-in.
+  local siblings
+  siblings="$(dirname "$parent")"
+  if [[ "$resolved" != "$siblings"/* && "$resolved" != "$parent"/* ]]; then
+    if [[ "$allow_external" != "1" ]]; then
+      warn "[requires:${name}] ${resolved} is outside ${siblings} — pass --allow-external-repos to deploy it"
+      return 1
+    fi
+    warn "[requires:${name}] deploying external repo ${resolved} (--allow-external-repos)"
+  fi
+  printf '%s\n' "$resolved"
+}
+
+# A dependency is satisfied when its provided Service has ready
+# endpoints, or — with no `provides.service` to probe — when an Argo CD
+# Application of the same name is Synced and Healthy.
+_require_satisfied() {
+  local name="$1" svc="$2" ns="$3"
+  if [[ -n "$svc" && -n "$ns" ]]; then
+    local ips=""
+    ips="$(kc -n "$ns" get endpoints "$svc" \
+      -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
+    if [[ -z "$ips" ]]; then
+      ips="$(kc -n "$ns" get endpointslices -l "kubernetes.io/service-name=${svc}" \
+        -o jsonpath='{.items[*].endpoints[*].addresses[*]}' 2>/dev/null || true)"
+    fi
+    [[ -n "$ips" ]] && return 0
+    return 1
+  fi
+  local sync health
+  sync="$(kc -n "$ARGOCD_NS" get application "$name" \
+    -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+  health="$(kc -n "$ARGOCD_NS" get application "$name" \
+    -o jsonpath='{.status.health.status}' 2>/dev/null || true)"
+  [[ "$sync" == "Synced" && "$health" == "Healthy" ]]
+}
+
+# Read `requires:` out of <repo>/sandboxctl.yaml. Prints the rows
+# _parse-requires emits; empty output means nothing to do.
+_require_entries() {
+  local target="$1"
+  local manifest="${target}/sandboxctl.yaml"
+  [[ -f "$manifest" ]] || return 0
+  local sandboxctl_bin
+  sandboxctl_bin="$(_sandboxctl_bin || true)"
+  [[ -n "$sandboxctl_bin" ]] || return 0
+  "$sandboxctl_bin" _parse-requires "$manifest"
+}
+
+# Deploy every unsatisfied `requires:` entry of <target>, in declared
+# dependency order, before <target> itself is deployed. Recurses through
+# each dependency's own requires via a fresh `sandboxctl deploy`, which
+# keeps cmd_deploy non-reentrant — the depth cap and visited set below
+# are what stop a dependency loop from forking forever.
+_deploy_requires() {
+  local target="$1" env="$2" allow_external="$3" do_build="$4"
+  local entries
+  entries="$(_require_entries "$target")" || return 1
+  [[ -n "$entries" ]] || return 0
+
+  local depth="${SANDBOX_REQUIRES_DEPTH:-0}"
+  if (( depth >= REQUIRES_MAX_DEPTH )); then
+    warn "requires: depth limit ${REQUIRES_MAX_DEPTH} reached at ${target} — not resolving its dependencies (raise SANDBOX_REQUIRES_MAX_DEPTH)"
+    return 0
+  fi
+  local visited=":${SANDBOX_REQUIRES_VISITED:-}:"
+  local sandboxctl_bin
+  sandboxctl_bin="$(_sandboxctl_bin || true)"
+  [[ -n "$sandboxctl_bin" ]] || die "sandboxctl binary not on PATH — cannot resolve 'requires:' (run ./install.sh first)"
+
+  # Pipe-separated, not tab: bash collapses runs of IFS whitespace, which
+  # would shift every field after an omitted one (see requireSep in Go).
+  local name repo git_url ref chart values svc ns port needs root
+  while IFS='|' read -r name repo git_url ref chart values svc ns port needs; do
+    [[ -n "$name" ]] || continue
+    if _require_satisfied "$name" "$svc" "$ns"; then
+      log "[requires:${name}] already available — reusing it"
+      continue
+    fi
+    root="$(_require_resolve_root "$name" "$repo" "$git_url" "$ref" "$target" "$allow_external")" \
+      || die "requires: cannot resolve dependency '${name}' of ${target}"
+    if [[ "$visited" == *":${root}:"* ]]; then
+      warn "[requires:${name}] ${root} is already being deployed further up the chain — skipping to break the cycle"
+      continue
+    fi
+    if [[ -n "$chart" && ! -f "${root}/${chart}/Chart.yaml" ]]; then
+      die "requires[${name}]: no Chart.yaml at ${root}/${chart}"
+    fi
+
+    log "[requires:${name}] deploying ${root} first"
+    local -a dep_args=(deploy --repo "$root" --env "$env")
+    [[ -n "$chart" ]]  && dep_args+=(--chart "$chart")
+    [[ -n "$values" ]] && dep_args+=(--values "$values")
+    # --no-build/--redeploy on the parent means "use what is already in
+    # the registry" — a dependency the caller didn't ask to rebuild either.
+    (( do_build )) || dep_args+=(--no-build)
+    (( allow_external )) && dep_args+=(--allow-external-repos)
+    SANDBOX_REQUIRES_DEPTH="$((depth + 1))" \
+    SANDBOX_REQUIRES_VISITED="${SANDBOX_REQUIRES_VISITED:+${SANDBOX_REQUIRES_VISITED}:}${target}:${root}" \
+    SANDBOX_REQUIRED_BY="$(basename "$target")" \
+      "$sandboxctl_bin" "${dep_args[@]}" \
+      || die "requires[${name}]: deploy of ${root} failed — fix it, then re-run"
+
+    if [[ -n "$svc" && -n "$ns" ]]; then
+      log "[requires:${name}] waiting for ${svc}.${ns} endpoints"
+      local waited=0
+      until _require_satisfied "$name" "$svc" "$ns"; do
+        (( waited >= REQUIRES_READY_TIMEOUT )) && \
+          die "requires[${name}]: ${svc}.${ns} had no ready endpoints after ${REQUIRES_READY_TIMEOUT}s"
+        sleep 5; waited=$(( waited + 5 ))
+      done
+    fi
+    log "[requires:${name}] ready"
+  done <<< "$entries"
+}
+
+cmd_deps() {
+  local positional="" repo_flag="" graph=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)  repo_flag="$2"; shift 2 ;;
+      --graph) graph=1; shift ;;
+      -h|--help)
+        cat <<EOF
+sandboxctl deps [path] [--repo <dir>] [--graph]
+
+Print the repo's cross-repo dependencies — the \`requires:\` block of
+<repo>/sandboxctl.yaml — and whether each one is already satisfied in
+the running cluster.
+
+  --graph   walk each dependency's own requires: recursively
+
+A dependency counts as satisfied when its provides.service has ready
+endpoints (or, with no provides.service, when an Argo CD Application of
+the same name is Synced + Healthy). 'sandboxctl deploy' deploys exactly
+the ones reported missing, in the printed order, before the repo itself.
+
+Manifest shape:
+  requires:
+    - name: temporal-service
+      repo: ../temporal-service        # or: git: <url> / ref: <branch>
+      chart: k8s/charts/temporal-service
+      values: values-local.yaml
+      needs: [some-other-dependency]   # orders entries within this list
+      provides:
+        service: temporal-server-frontend.temporal-service:7233
+EOF
+        return 0 ;;
+      -*) die "unknown flag: $1" ;;
+      *)
+        if [[ -z "$positional" ]]; then positional="$1"; shift
+        else die "unexpected argument: $1"
+        fi ;;
+    esac
+  done
+  local target
+  target="$(_resolve_product_repo "$repo_flag" "$positional" deps)" || return 1
+  _deps_print "$target" 0 "$graph"
+}
+
+_deps_print() {
+  local target="$1" indent="$2" graph="$3"
+  local entries
+  entries="$(_require_entries "$target")" || return 1
+  local pad=""
+  (( indent > 0 )) && pad="$(printf '%*s' "$indent" '')"
+  if [[ -z "$entries" ]]; then
+    echo "${pad}${target}: no requires:"
+    return 0
+  fi
+  echo "${pad}${target}"
+  local name repo git_url ref chart values svc ns port needs status source
+  while IFS='|' read -r name repo git_url ref chart values svc ns port needs; do
+    [[ -n "$name" ]] || continue
+    if _require_satisfied "$name" "$svc" "$ns"; then status="satisfied"; else status="missing"; fi
+    source="${repo:-${git_url}@${ref}}"
+    printf '%s  - %-24s %-10s %s\n' "$pad" "$name" "$status" "$source"
+    (( graph )) || continue
+    # Same cap deploy uses, so `--graph` can't spin on a dependency loop.
+    (( indent >= REQUIRES_MAX_DEPTH * 4 )) && continue
+    local root
+    root="$(_require_resolve_root "$name" "$repo" "$git_url" "$ref" "$target" 1 2>/dev/null)" || continue
+    _deps_print "$root" "$(( indent + 4 ))" "$graph"
+  done <<< "$entries"
+}
+
 cmd_deploy() {
   # Usage: sandboxctl deploy [path] [--repo <dir>] [--env <name>] [--chart <dir>]
   #                          [--values <file>] [--name <name>] [--no-build] [--redeploy]
-  #                          [--umbrella]
+  #                          [--umbrella] [--skip-requires] [--allow-external-repos]
   local positional="" repo_flag="" env="dev" do_build=1 umbrella_mode=0
   local chart_override="" values_override="" name_override=""
+  local skip_requires=0 allow_external="${SANDBOX_ALLOW_EXTERNAL_REPOS:-0}"
   local purge_old_tags="${SANDBOX_BUILD_PURGE_OLD_TAGS:-0}"
   local redeploy=0
   local opt_build_cpus="${SANDBOX_BUILD_CPUS:-}"
@@ -4920,6 +5160,8 @@ cmd_deploy() {
       --no-build) do_build=0; shift ;;
       --redeploy) redeploy=1; do_build=0; shift ;;
       --umbrella) umbrella_mode=1; shift ;;
+      --skip-requires) skip_requires=1; shift ;;
+      --allow-external-repos) allow_external=1; shift ;;
       --purge-old-tags)    purge_old_tags=1; shift ;;
       --no-purge-old-tags) purge_old_tags=0; shift ;;
       --build-cpus)    opt_build_cpus="${2:-}"; shift 2 ;;
@@ -4995,6 +5237,16 @@ Mode flags:
                     chart-carried VirtualServices. Default (no flag)
                     deploys per-app charts with per-app Kargo pipelines.
 
+Cross-repo dependencies:
+  A \`requires:\` block in <repo>/sandboxctl.yaml names other repos this
+  one needs. Each entry that is not already answering in the cluster is
+  built + deployed first (see 'sandboxctl deps'); each one already there
+  is reused, so two repos requiring the same dependency share it rather
+  than standing up a second copy.
+  --skip-requires         deploy this repo only; assume dependencies are up
+  --allow-external-repos  permit a \`repo:\` path outside the sibling
+                          directory of <repo> (refused by default)
+
 Defaults:
   --env  dev   (namespace = <chart>; URL = <chart>.${SANDBOX_DOMAIN})
                # --env=staging puts the chart in <chart>-staging while
@@ -5014,6 +5266,11 @@ EOF
   require_running_cluster
   local target
   target="$(_resolve_product_repo "$repo_flag" "$positional" deploy)" || return 1
+
+  # Cross-repo dependencies first: anything this repo `requires:` that
+  # isn't already in the cluster gets built + deployed now, so the chart
+  # below comes up against a dependency that already answers.
+  (( skip_requires )) || _deploy_requires "$target" "$env" "$allow_external" "$do_build" || return 1
 
   local entries
   if (( umbrella_mode )); then
@@ -5857,6 +6114,16 @@ EOF
   ok "[${cname}] pipeline applied — registry → dev → staging (promote via 'sandboxctl kargo-ui')"
 }
 
+# Mark an Application that exists only because another repo `requires:`
+# it. These Applications carry prune + selfHeal, so the label is what
+# lets a human (or a later `undeploy`) tell "this repo owns it" from
+# "this is a shared dependency someone else pulled in".
+_label_provided_by() {
+  [[ -n "${SANDBOX_REQUIRED_BY:-}" ]] || return 0
+  kc -n "$ARGOCD_NS" label application "$1" \
+    "sandboxctl.io/provided-by=${SANDBOX_REQUIRED_BY}" --overwrite >/dev/null 2>&1 || true
+}
+
 _apply_argo_app() {
   local cname="$1" kind="$2" gitea_url="$3" values_file="$4" namespace="$5"
   local src_dir="${6:-}" deploy_manifest="${7:-}" chart_count="${8:-1}"
@@ -5892,6 +6159,7 @@ spec:
     automated: { prune: true, selfHeal: true }
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
 EOF
+    _label_provided_by "$cname"
     return 0
   fi
   if [[ "$kind" == "helm" ]]; then
@@ -5967,6 +6235,7 @@ spec:
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
 EOF
   fi
+  _label_provided_by "$cname"
 }
 
 # Force Argo CD to refresh + re-sync an Application immediately instead
@@ -6929,6 +7198,12 @@ usage:
                                      --redeploy skips the build, re-pushes the chart to Gitea, and forces
                                      Argo CD to hard-refresh so the existing image is reused with the
                                      new chart/values without waiting for the next reconcile poll.
+                                     A 'requires:' block in <repo>/sandboxctl.yaml names other repos this
+                                     one depends on; each is built + deployed first unless it is already
+                                     answering in the cluster. --skip-requires opts out.
+  sandbox.sh deps [path] [--repo <dir>] [--graph]
+                                     print the repo's cross-repo 'requires:' entries and whether each is
+                                     already satisfied; --graph walks each dependency's own requires
   sandbox.sh undeploy --name <appname> [--env <name>]
                                      remove the Argo Application, route, and hosts entry (namespace preserved)
   sandbox.sh bootstrap [path] [--repo <dir>] [up flags] [deploy flags]
@@ -6961,7 +7236,11 @@ env overrides:
   KARGO_TOKEN_SIGNING_KEY     pin Kargo JWT signing key (default: random per install)
   GITEA_CHART_VERSION         pin gitea helm chart version (default: 12.5.0)
   GITEA_ADMIN_USER            admin user created in Gitea (default: sandbox)
-  GITEA_ORG                   org chart repos are pushed under (default: sandbox)
+  GITEA_ORG                   org chart repos are pushed under (default: apps)
+  SANDBOX_REQUIRES_MAX_DEPTH  how deep 'requires:' chains are followed (default: 2)
+  SANDBOX_REQUIRES_CACHE      clone dir for git-sourced requires (default: ~/.sandboxctl/requires)
+  SANDBOX_REQUIRES_READY_TIMEOUT  seconds to wait for a dependency's Service endpoints (default: 600)
+  SANDBOX_ALLOW_EXTERNAL_REPOS    set to 1 to allow requires' repo: paths outside the sibling dir
   NATS_CHART_VERSION          pin nats helm chart version (default: 2.14.0)
   NATS_HOST                   user-facing NATS hostname (default: nats.\${SANDBOX_DOMAIN})
   NATS_JETSTREAM_SIZE         PVC size for JetStream file store (default: 2Gi)
@@ -7015,6 +7294,7 @@ main() {
     build)              shift; cmd_build "$@" ;;
     images)             shift; cmd_images "$@" ;;
     deploy)             shift; cmd_deploy "$@" ;;
+    deps)               shift; cmd_deps "$@" ;;
     install)            shift; cmd_install "$@" ;;
     undeploy)           shift; cmd_undeploy "$@" ;;
     bootstrap)          shift; cmd_bootstrap "$@" ;;

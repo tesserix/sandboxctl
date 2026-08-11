@@ -98,6 +98,7 @@ The same four groups `sandboxctl --help` prints. Run any command with
 
 | Command | What it does |
 |---|---|
+| `sandboxctl deps` | print the repo's cross-repo `requires:` entries and whether each is already satisfied in the cluster (`--graph` recurses) |
 | `sandboxctl status` / `tui` | cluster + workload status and URLs (`tui` is the live dashboard) |
 | `sandboxctl doctor` | validate everything — host tools, runtime, ports, env hazards, cluster + component health, Mac plumbing — with the exact fix per failure |
 | `sandboxctl validate` | curl every routed URL and print the HTTP codes |
@@ -399,6 +400,8 @@ sandboxctl deploy --chart /abs/path/to/chart
 | `--env <name>` | Namespace suffix only — URL stays `<name>.sandbox.app`. Default `dev`. |
 | `--no-build` | Skip the build step (registry already has the images) |
 | `--redeploy` | Skip the build AND re-push the chart + force an immediate Argo refresh — for chart/values-only iterations |
+| `--skip-requires` | Deploy this repo only — do not resolve its `requires:` block |
+| `--allow-external-repos` | Permit a `requires:` `repo:` path outside the sibling directory of `<repo>` |
 | `--umbrella` | Deploy the whole monorepo stack as ONE Argo CD Application via the scaffold-generated umbrella chart (whole `k8s/` tree pushed so `file://` deps resolve; per-app URLs still wired) |
 | `--purge-old-tags` | Forwarded to the build step (see [Image management](#image-management)). `--no-purge-old-tags` overrides `SANDBOX_BUILD_PURGE_OLD_TAGS=1` from the env. |
 | `--build-cpus N` / `--build-memory SIZE` | Forwarded to the build step. Cap the podman build container so a hot Go/Rust compile can't starve kind. Default: half the Podman VM along each axis; `0` opts out. See [Image management](#image-management). |
@@ -522,6 +525,52 @@ image:
 
 `sandboxctl build` runs the same pipeline standalone if you want to push
 images without deploying.
+
+## Cross-repo dependencies
+
+`depends_on` orders images inside one repo. `requires:` orders whole
+repos — for when your service can't start until a *different* repo's
+chart is up (a Temporal frontend, an auth service, a shared database):
+
+```yaml
+requires:
+  - name: temporal-service
+    repo: ../temporal-service            # sibling checkout; or: git + ref
+    chart: k8s/charts/temporal-service
+    values: values-local.yaml
+    provides:
+      service: temporal-server-frontend.temporal-service:7233
+```
+
+`sandboxctl deploy` now deploys `../temporal-service` first, waits for
+that Service to have ready endpoints, then deploys this repo.
+
+`provides.service` is what keeps it cheap: if the Service is already
+answering — because someone deployed that repo directly, or because
+another repo already pulled it in — the dependency is **reused**, not
+rebuilt and not duplicated. Two repos requiring the same dependency get
+one deployment between them; the Argo Application a dependency created
+is labelled `sandboxctl.io/provided-by=<requiring-repo>` so you can tell
+shared infrastructure from a repo's own apps.
+
+```sh
+sandboxctl deps                 # what this repo requires + what's already satisfied
+sandboxctl deps --graph         # recurse into each dependency's own requires
+sandboxctl deploy --skip-requires   # deploy this repo only
+```
+
+Details:
+
+- `repo:` resolves relative to the requiring repo. A path outside the
+  sibling directory needs `--allow-external-repos` — deploy shouldn't
+  silently build and apply a repo you'd forgotten was there.
+- `git: <url>` + `ref: <branch>` clones into `~/.sandboxctl/requires/<name>`
+  instead, for CI or a dependency you don't keep checked out.
+- `needs: [other-name]` orders entries within one `requires:` block.
+- Chains are followed 2 deep (`SANDBOX_REQUIRES_MAX_DEPTH`); a dependency
+  loop is detected and broken with a warning rather than forking forever.
+- Omit `provides.service` and the check falls back to "an Argo CD
+  Application of the same name is Synced + Healthy".
 
 ## Image management
 

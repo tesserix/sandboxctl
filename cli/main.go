@@ -66,6 +66,7 @@ var commandGroups = []commandGroup{
 		{"argocd-ui", "Argo CD URL + creds"},
 		{"kargo-ui", "Kargo URL + creds"},
 		{"kubeconfig", "sandbox kubeconfig path (--export | --merge)"},
+		{"deps", "cross-repo 'requires:' graph + whether each is already satisfied"},
 		{"images", "registry images: list / rm / prune / purge / gc"},
 		{"tui", "live status dashboard"},
 	}},
@@ -113,6 +114,7 @@ func known(sub string) bool {
 		"_tool-check",
 		"_ensure-tools",
 		"_parse-build-manifest",
+		"_parse-requires",
 		"_autogen-manifest",
 		"_chart-ingress-overrides",
 		"_chart-image-keys",
@@ -188,6 +190,9 @@ func main() {
 	if sub == "_parse-build-manifest" {
 		os.Exit(runParseBuildManifest(os.Args[2:]))
 	}
+	if sub == "_parse-requires" {
+		os.Exit(runParseRequires(os.Args[2:]))
+	}
 	if sub == "_autogen-manifest" {
 		os.Exit(runAutogenManifest(os.Args[2:]))
 	}
@@ -237,6 +242,13 @@ func runScript(args ...string) int {
 	}
 	cmd := exec.Command("bash", append([]string{script}, args...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	// sandbox.sh calls back into hidden subcommands (_parse-requires,
+	// _parse-build-manifest, …). Hand it *this* binary rather than
+	// letting it pick whatever `sandboxctl` is first on PATH — a stale
+	// PATH install would be asked for subcommands it doesn't have.
+	if exe, err := os.Executable(); err == nil {
+		cmd.Env = append(os.Environ(), "SANDBOXCTL_BIN="+exe)
+	}
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return ee.ExitCode()

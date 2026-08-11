@@ -324,27 +324,33 @@ func readDockerfileInstructions(path string) ([]string, error) {
 	return out, nil
 }
 
-// topoSortImages reorders imgs so each image's depends_on entries come
-// first. Stable: input order is preserved among nodes with no relative
-// dependency. Cycles produce a warning and the original order is kept
-// (cmd_build_from_manifest's validator will then surface the cycle as
-// a build-time error pointing at the offending pair).
-func topoSortImages(imgs []manifestImage) ([]manifestImage, []string) {
-	if len(imgs) <= 1 {
-		return imgs, nil
+// topoSortNodes returns the indices of names in dependency-first order:
+// every entry of deps[i] that resolves to a known name is emitted before
+// i. Stable: input order is preserved among nodes with no relative
+// dependency. Unknown dep names are ignored (the caller's own validator
+// reports them with better context). A cycle yields a warning and the
+// original index order, so callers degrade to "unsorted" rather than
+// dropping nodes.
+func topoSortNodes(names []string, deps [][]string) ([]int, []string) {
+	identity := make([]int, len(names))
+	for i := range names {
+		identity[i] = i
+	}
+	if len(names) <= 1 {
+		return identity, nil
 	}
 	idx := map[string]int{}
-	for i, img := range imgs {
-		idx[img.Name] = i
+	for i, n := range names {
+		idx[n] = i
 	}
 	const (
 		unseen   = 0
 		active   = 1
 		finished = 2
 	)
-	state := make([]int, len(imgs))
+	state := make([]int, len(names))
 	var (
-		out      []manifestImage
+		out      []int
 		warnings []string
 		visit    func(i int, stack []string) bool
 	)
@@ -352,30 +358,48 @@ func topoSortImages(imgs []manifestImage) ([]manifestImage, []string) {
 		switch state[i] {
 		case active:
 			warnings = append(warnings, fmt.Sprintf(
-				"dependency cycle: %s -> %s — leaving manifest order unchanged",
-				strings.Join(stack, " -> "), imgs[i].Name))
+				"dependency cycle: %s -> %s — leaving declared order unchanged",
+				strings.Join(stack, " -> "), names[i]))
 			return false
 		case finished:
 			return true
 		}
 		state[i] = active
-		for _, dep := range imgs[i].DependsOn {
+		for _, dep := range deps[i] {
 			j, ok := idx[dep]
 			if !ok {
 				continue
 			}
-			if !visit(j, append(stack, imgs[i].Name)) {
+			if !visit(j, append(stack, names[i])) {
 				return false
 			}
 		}
 		state[i] = finished
-		out = append(out, imgs[i])
+		out = append(out, i)
 		return true
 	}
-	for i := range imgs {
+	for i := range names {
 		if state[i] == unseen && !visit(i, nil) {
-			return imgs, warnings
+			return identity, warnings
 		}
+	}
+	return out, warnings
+}
+
+// topoSortImages reorders imgs so each image's depends_on entries come
+// first. Cycles produce a warning and the original order is kept
+// (cmd_build_from_manifest's validator will then surface the cycle as
+// a build-time error pointing at the offending pair).
+func topoSortImages(imgs []manifestImage) ([]manifestImage, []string) {
+	names := make([]string, len(imgs))
+	deps := make([][]string, len(imgs))
+	for i, img := range imgs {
+		names[i], deps[i] = img.Name, img.DependsOn
+	}
+	order, warnings := topoSortNodes(names, deps)
+	out := make([]manifestImage, 0, len(imgs))
+	for _, i := range order {
+		out = append(out, imgs[i])
 	}
 	return out, warnings
 }
