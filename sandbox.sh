@@ -594,9 +594,10 @@ kc()   { KUBECONFIG="$SANDBOX_KUBECONFIG" kubectl --context "$(kctx)" "$@"; }
 # add/update`, which write ~/.config/helm) may use bare helm.
 helmk() { KUBECONFIG="$SANDBOX_KUBECONFIG" helm --kube-context "$(kctx)" "$@"; }
 
-# kind_pinned runs `kind` with KUBECONFIG forced to the canonical
-# user kubeconfig, so create/delete operations always touch the same
-# file regardless of what the surrounding shell exported.
+# kind_pinned runs `kind` with KUBECONFIG forced to the sandbox-owned
+# kubeconfig, so create/delete operations always touch the same file
+# regardless of what the surrounding shell exported — and never write a
+# context into the user's own kubeconfig.
 kind_pinned() {
   mkdir -p "$(dirname "$SANDBOX_KUBECONFIG")"
   KUBECONFIG="$SANDBOX_KUBECONFIG" kind "$@"
@@ -1257,13 +1258,12 @@ bring_up_cluster() {
   configure_node_registry_mirror
 }
 
-# Materialize a kubeconfig the LaunchAgent can use. We force kind to
-# write the cluster's context to ~/.kube/config (see kind_pinned), so
-# the user's `kubectl` works in any new shell without an env-var dance.
-# But launchd jobs don't inherit $KUBECONFIG, so we ALSO pin a copy
-# under $SANDBOX_STATE_DIR for the port-forward agent — that path is
-# baked into the plist and immune to whatever the user later does to
-# their shell environment.
+# Materialize the sandbox-owned kubeconfig under $SANDBOX_STATE_DIR. It
+# is the only kubeconfig sandboxctl writes: launchd jobs don't inherit
+# $KUBECONFIG, so the port-forward agent needs a fixed path baked into
+# its plist, immune to whatever the user later does to their shell
+# environment. The user's own kubeconfig is never touched — point your
+# kubectl at the sandbox with `sandboxctl kubeconfig --export|--merge`.
 write_pinned_kubeconfig() {
   mkdir -p "$SANDBOX_STATE_DIR"
   if ! kind_pinned get kubeconfig --name "$CLUSTER_NAME" > "${SANDBOX_KUBECONFIG}.tmp" 2>/dev/null; then
@@ -2907,10 +2907,6 @@ EOF
   fi
 
   bring_up_cluster
-  # Set current-context in the canonical user kubeconfig so plain
-  # `kubectl` (no flags) targets the sandbox in any new shell. Pinning
-  # to ~/.kube/config matches where kind_pinned writes the context.
-  KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config use-context "$(kctx)" >/dev/null
   kc cluster-info >/dev/null
 
   load_or_generate_secrets
@@ -3476,7 +3472,6 @@ EOF
     start_stopped_cluster
   fi
   write_pinned_kubeconfig
-  KUBECONFIG="$SANDBOX_USER_KUBECONFIG" kubectl config use-context "$(kctx)" >/dev/null
   kc cluster-info >/dev/null
 
   load_or_generate_secrets
