@@ -1280,6 +1280,11 @@ write_pinned_kubeconfig() {
   fi
   chmod 600 "${SANDBOX_KUBECONFIG}.tmp"
   mv "${SANDBOX_KUBECONFIG}.tmp" "$SANDBOX_KUBECONFIG"
+  # `kubeconfig --export` makes a shell target the sandbox by pointing
+  # KUBECONFIG here, which resolves to whatever current-context this file
+  # names. Pin it so a flag-less `kubectl` in that shell can only ever
+  # reach the sandbox, never an ambient cluster.
+  KUBECONFIG="$SANDBOX_KUBECONFIG" kubectl config use-context "$(kctx)" >/dev/null 2>&1 || true
 }
 
 configure_node_registry_mirror() {
@@ -3025,6 +3030,10 @@ sandboxctl kubeconfig [--export|--merge]
   (no flag)   print the path of the sandbox-owned kubeconfig
   --export    print 'export KUBECONFIG=…' for eval:
                 eval "\$(sandboxctl kubeconfig --export)"
+              Scoped to that shell only. The file holds the sandbox
+              context and nothing else, so a flag-less kubectl there
+              cannot reach any other cluster. Your own kubeconfig and
+              its current-context are left untouched.
   --merge     merge the sandbox context into ${SANDBOX_USER_KUBECONFIG}
               (your current-context is preserved; a .bak-sandboxctl
               backup is written first)
