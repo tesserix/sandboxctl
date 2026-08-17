@@ -56,7 +56,7 @@ SANDBOX_WORKER_COUNT_MAX=3
 # model provider here — no Ollama, no API-key providers, no model pulls.
 # Users configure providers/models out-of-band after the install.
 KAGENT_NS="${KAGENT_NS:-kagent}"
-KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.11}"
+KAGENT_CHART_VERSION="${KAGENT_CHART_VERSION:-0.9.12}"
 
 # arctl — the agentregistry CLI (https://aregistry.ai). Installed onto the
 # *Mac* (not the cluster) by `up`/`bootstrap` when --with-arctl is passed,
