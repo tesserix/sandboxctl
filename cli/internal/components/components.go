@@ -115,7 +115,7 @@ var Registry = []Component{
 		},
 	},
 	{
-		Name: "reloader", EnvVar: "RELOADER_CHART_VERSION", Default: "2.2.14", App: "v1.4.19",
+		Name: "reloader", EnvVar: "RELOADER_CHART_VERSION", Default: "2.2.16", App: "v1.4.19",
 		RepoURL: "https://stakater.github.io/stakater-charts", Chart: "reloader", Release: "reloader",
 		RenderArgs: []string{
 			"reloader.deployment.resources.requests.cpu=10m",
