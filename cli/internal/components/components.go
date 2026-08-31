@@ -84,7 +84,7 @@ var Registry = []Component{
 		},
 	},
 	{
-		Name: "istio", EnvVar: "ISTIO_CHART_VERSION", Default: "1.30.2", App: "1.30.2",
+		Name: "istio", EnvVar: "ISTIO_CHART_VERSION", Default: "1.30.4", App: "1.30.2",
 		RepoURL: "https://istio-release.storage.googleapis.com/charts", Chart: "istiod", Release: "istiod",
 		RenderArgs: []string{
 			"profile=ambient",
