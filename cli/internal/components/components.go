@@ -92,7 +92,7 @@ var Registry = []Component{
 		},
 	},
 	{
-		Name: "gitea", EnvVar: "GITEA_CHART_VERSION", Default: "12.6.0", App: "1.26.1",
+		Name: "gitea", EnvVar: "GITEA_CHART_VERSION", Default: "12.7.0", App: "1.26.1",
 		RepoURL: "https://dl.gitea.com/charts/", Chart: "gitea", Release: "gitea",
 		RenderArgs: []string{
 			"gitea.admin.username=gitea-admin", "gitea.admin.password=dummy123456",
