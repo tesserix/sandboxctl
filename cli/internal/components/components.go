@@ -124,7 +124,7 @@ var Registry = []Component{
 		},
 	},
 	{
-		Name: "kagent", EnvVar: "KAGENT_CHART_VERSION", Default: "0.9.11", App: "0.9.11",
+		Name: "kagent", EnvVar: "KAGENT_CHART_VERSION", Default: "0.9.12", App: "0.9.11",
 		RepoURL: "oci://ghcr.io/kagent-dev/kagent/helm/kagent", Release: "kagent",
 	},
 }
