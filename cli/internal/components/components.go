@@ -74,7 +74,7 @@ var Registry = []Component{
 		},
 	},
 	{
-		Name: "cert-manager", EnvVar: "CERT_MANAGER_CHART_VERSION", Default: "v1.21.0", App: "v1.21.0",
+		Name: "cert-manager", EnvVar: "CERT_MANAGER_CHART_VERSION", Default: "v1.21.1", App: "v1.21.0",
 		RepoURL: "https://charts.jetstack.io", Chart: "cert-manager", Release: "cert-manager",
 		RenderArgs: []string{
 			"crds.enabled=true",
