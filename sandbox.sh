@@ -122,7 +122,7 @@ INSTALL_CNPG="${INSTALL_CNPG:-0}"
 # git creds. Chart pinned for reproducibility; rootless image + sqlite
 # keeps the install footprint tiny (one Pod + a 1Gi PVC).
 GITEA_NS="${GITEA_NS:-gitea}"
-GITEA_CHART_VERSION="${GITEA_CHART_VERSION:-12.6.0}"
+GITEA_CHART_VERSION="${GITEA_CHART_VERSION:-12.7.0}"
 GITEA_ADMIN_USER="${GITEA_ADMIN_USER:-sandbox}"
 # Org under which `sandboxctl deploy` pushes chart repos. Must NOT
 # collide with GITEA_ADMIN_USER — Gitea's API rejects org creation with
